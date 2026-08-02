@@ -3,9 +3,12 @@ FPCFLAGS ?= -Mobjfpc -Sh -O2 -XX -Xs -CX
 PREFIX ?= /usr/local
 DESTDIR ?=
 INSTALL_ROOKCC ?= 0
+# make optimized is redundant, i only did it for testing. dont use it in basic use. waste of time basically
+OPTIMIZED_FPCFLAGS ?= -Mobjfpc -Sh -O3 -Si -XX -Xs -CX
 
 BUILD_DIR := build
 UNIT_DIR := $(BUILD_DIR)/units
+OPTIMIZED_UNIT_DIR := $(BUILD_DIR)/units-optimized
 BIN := $(BUILD_DIR)/rcc
 NATIVE_DRIVER_TEST_UNIT_DIR := $(BUILD_DIR)/units-native-driver-test
 NATIVE_DRIVER_TEST_BIN := $(BUILD_DIR)/rcc-native-driver-test
@@ -13,20 +16,26 @@ SOURCES := $(wildcard src/*.pas)
 RESOURCE_DIR := $(DESTDIR)$(PREFIX)/share/rcc
 DOC_DIR := $(DESTDIR)$(PREFIX)/share/doc/rcc
 
-.PHONY: all test test-platform-support test-target-formats test-native-driver \
-	test-native-host test-c-differential test-cross-differential bench \
-	package package-check release-check install install-rookcc uninstall clean
+.PHONY: all optimized test test-platform-support test-target-formats \
+	test-native-driver test-native-host test-c-differential \
+	test-cross-differential bench package package-check release-check \
+	install install-rookcc uninstall clean
 
 all: $(BIN)
+
+optimized:
+	@mkdir -p "$(BUILD_DIR)"
+	@rm -rf "$(OPTIMIZED_UNIT_DIR)"
+	@mkdir -p "$(OPTIMIZED_UNIT_DIR)"
+	$(FPC) $(OPTIMIZED_FPCFLAGS) -Fu./src -FU"$(OPTIMIZED_UNIT_DIR)" \
+		-FE"$(BUILD_DIR)" -o"$(abspath $(BIN))" src/rcc.pas
+	@printf 'optimized rcc: %s (%s bytes)\n' "$(BIN)" \
+		"$$(wc -c < "$(BIN)")"
 
 test: test-platform-support test-c-differential test-cross-differential
 
 test-platform-support: test-target-formats test-native-driver test-native-host
 
-# Differential correctness: every program in tests/c must produce byte-identical
-# output under rcc and the reference compiler at every optimization level.
-# The corpus is a development tree extra and is not part of release archives,
-# so the target is a no-op when it is absent.
 test-c-differential: $(BIN)
 	@if [ -f tests/c_differential.py ]; then \
 	  python3 tests/c_differential.py "$(abspath $(BIN))"; \
@@ -34,10 +43,7 @@ test-c-differential: $(BIN)
 	  printf 'skipping C differential suite: tests/c_differential.py not present\n'; \
 	fi
 
-# Cross correctness: freestanding programs are built for every supported
-# architecture and executed (under qemu-user where the host cannot run them),
-# and all targets must agree with the reference compiler. Targets whose
-# emulator is absent are skipped rather than failing the run.
+
 test-cross-differential: $(BIN)
 	@if [ -f tests/cross_differential.py ]; then \
 	  python3 tests/cross_differential.py "$(abspath $(BIN))"; \
@@ -133,3 +139,5 @@ uninstall:
 
 clean:
 	rm -rf "$(BUILD_DIR)"
+
+	rm -f src/*.ppu src/*.o
