@@ -17,6 +17,7 @@ type
     DataOffset: QWord;
     DataAddress: QWord;
     EntryAddress: QWord;
+    SyscallTableOffset: QWord;
     FileSize: QWord;
   end;
 
@@ -25,7 +26,10 @@ function ComputeStaticELFLayout(const ATarget: TTargetDescriptor;
   ATextSize, ADataSize, AEntryOffset: QWord): TELFImageLayout;
 procedure WriteStaticELF64Executable(const AFileName: string;
   const ATarget: TTargetDescriptor; AText, AData: TByteBuffer;
-  AEntryOffset: QWord);
+  AEntryOffset: QWord); overload;
+procedure WriteStaticELF64Executable(const AFileName: string;
+  const ATarget: TTargetDescriptor; AText, AData: TByteBuffer;
+  AEntryOffset: QWord; const ASyscallSites: TTargetSyscallSiteArray); overload;
 procedure WriteELF64Relocatable(const AFileName: string;
   AObject: TObjectFile);
 
@@ -36,11 +40,11 @@ const
   ELFCLASS64 = 2;
   ELFDATA2LSB = 1;
   EV_CURRENT = 1;
-  ELFOSABI_SYSV = 0;
   ET_REL = 1;
   ET_EXEC = 2;
   PT_LOAD = 1;
   PT_GNU_STACK = $6474E551;
+  PT_OPENBSD_SYSCALLS = $65A3DBE9;
   PF_X = 1;
   PF_W = 2;
   PF_R = 4;
@@ -58,13 +62,15 @@ const
   SHF_TLS = $400;
   SHN_UNDEF = 0;
 
-procedure AddELFIdent(ABuffer: TByteBuffer);
+procedure AddELFIdent(ABuffer: TByteBuffer;
+  const ATarget: TTargetDescriptor);
 var
   I: LongInt;
 begin
   ABuffer.AddBytes([$7F, Ord('E'), Ord('L'), Ord('F'),
-    ELFCLASS64, ELFDATA2LSB, EV_CURRENT, ELFOSABI_SYSV]);
-  for I := 8 to EI_NIDENT - 1 do ABuffer.Add8(0);
+    ELFCLASS64, ELFDATA2LSB, EV_CURRENT, ATarget.ELFOSABI,
+    ATarget.ELFABIVersion]);
+  for I := 9 to EI_NIDENT - 1 do ABuffer.Add8(0);
 end;
 
 function AlignELF(AValue, AAlignment: QWord): QWord;
@@ -82,6 +88,8 @@ begin
   Result.ProgramHeaderOffset := 64;
   Result.ProgramHeaderCount := 2;
   if ADataSize <> 0 then Inc(Result.ProgramHeaderCount);
+  if ATarget.OperatingSystem = osOpenBSD then
+    Inc(Result.ProgramHeaderCount);
   Result.TextOffset := AlignELF(Result.HeaderSize +
     QWord(Result.ProgramHeaderCount) * 56, ATarget.PageSize);
   Result.TextAddress := ATarget.PreferredImageBase + Result.TextOffset;
@@ -99,6 +107,7 @@ begin
     Result.DataAddress := 0;
     Result.FileSize := Result.TextOffset + ATextSize;
   end;
+  Result.SyscallTableOffset := AlignELF(Result.FileSize, 4);
 end;
 
 procedure AddProgramHeader(ABuffer: TByteBuffer; AType, AFlags: LongWord;
@@ -118,20 +127,40 @@ procedure WriteStaticELF64Executable(const AFileName: string;
   const ATarget: TTargetDescriptor; AText, AData: TByteBuffer;
   AEntryOffset: QWord);
 var
+  EmptySites: TTargetSyscallSiteArray;
+begin
+  SetLength(EmptySites, 0);
+  WriteStaticELF64Executable(AFileName, ATarget, AText, AData,
+    AEntryOffset, EmptySites);
+end;
+
+procedure WriteStaticELF64Executable(const AFileName: string;
+  const ATarget: TTargetDescriptor; AText, AData: TByteBuffer;
+  AEntryOffset: QWord; const ASyscallSites: TTargetSyscallSiteArray);
+var
   Layout: TELFImageLayout;
   FileBuffer: TByteBuffer;
   DataSize: QWord;
+  I: LongInt;
+  SiteAddress: QWord;
 begin
   if AText = nil then
     raise ERCCError.Create('internal error: nil text buffer for ELF image');
+  if ATarget.ObjectFormat <> ofELF64 then
+    raise ERCCError.Create('internal error: ELF writer selected for ' +
+      ObjectFormatName(ATarget.ObjectFormat));
   if AEntryOffset >= QWord(AText.Size) then
     raise ERCCError.Create('internal error: ELF entry is outside text');
   if AData = nil then DataSize := 0 else DataSize := QWord(AData.Size);
+  if (ATarget.OperatingSystem = osOpenBSD) and
+     (Length(ASyscallSites) = 0) then
+    raise ERCCError.Create(
+      'internal error: OpenBSD executable has no syscall pinning sites');
   Layout := ComputeStaticELFLayout(ATarget, QWord(AText.Size),
     DataSize, AEntryOffset);
   FileBuffer := TByteBuffer.Create;
   try
-    AddELFIdent(FileBuffer);
+    AddELFIdent(FileBuffer, ATarget);
     FileBuffer.Add16(ET_EXEC);
     FileBuffer.Add16(ATarget.ELFMachine);
     FileBuffer.Add32(EV_CURRENT);
@@ -156,6 +185,11 @@ begin
         DataSize, DataSize, ATarget.PageSize);
     AddProgramHeader(FileBuffer, PT_GNU_STACK, PF_R or PF_W,
       0, 0, 0, 0, 0, 16);
+    if ATarget.OperatingSystem = osOpenBSD then
+      AddProgramHeader(FileBuffer, PT_OPENBSD_SYSCALLS, 0,
+        Layout.SyscallTableOffset, 0, 0,
+        QWord(Length(ASyscallSites)) * 8,
+        QWord(Length(ASyscallSites)) * 8, 4);
 
     while QWord(FileBuffer.Size) < Layout.TextOffset do FileBuffer.Add8(0);
     FileBuffer.Append(AText);
@@ -163,6 +197,26 @@ begin
     begin
       while QWord(FileBuffer.Size) < Layout.DataOffset do FileBuffer.Add8(0);
       FileBuffer.Append(AData);
+    end;
+    if ATarget.OperatingSystem = osOpenBSD then
+    begin
+      while QWord(FileBuffer.Size) < Layout.SyscallTableOffset do
+        FileBuffer.Add8(0);
+      for I := 0 to High(ASyscallSites) do
+      begin
+        if ASyscallSites[I].Number = 0 then
+          raise ERCCError.Create(
+            'internal error: invalid OpenBSD syscall pin number');
+        if ASyscallSites[I].TextOffset >= QWord(AText.Size) then
+          raise ERCCError.Create(
+            'internal error: OpenBSD syscall pin is outside text');
+        SiteAddress := Layout.TextAddress + ASyscallSites[I].TextOffset;
+        if SiteAddress > High(LongWord) then
+          raise ERCCError.Create(
+            'internal error: OpenBSD syscall pin address exceeds 32 bits');
+        FileBuffer.Add32(LongWord(SiteAddress));
+        FileBuffer.Add32(ASyscallSites[I].Number);
+      end;
     end;
     FileBuffer.SaveToFile(AFileName);
     if fpChmod(PChar(AFileName), &755) <> 0 then
@@ -316,6 +370,9 @@ var
 begin
   if AObject = nil then
     raise ERCCError.Create('internal error: nil object passed to ELF writer');
+  if AObject.Target.ObjectFormat <> ofELF64 then
+    raise ERCCError.Create('internal error: ELF object writer selected for ' +
+      ObjectFormatName(AObject.Target.ObjectFormat));
   AObject.Validate;
   OriginalSectionCount := Length(AObject.Sections);
   SetLength(RelocationBuffers, 0);
@@ -408,7 +465,7 @@ begin
     if FirstGlobal = Length(AObject.Symbols) + 1 then
       FirstGlobal := Length(AObject.Symbols) + 1;
 
-    AddELFIdent(FileBuffer);
+    AddELFIdent(FileBuffer, AObject.Target);
     FileBuffer.Add16(ET_REL);
     FileBuffer.Add16(AObject.Target.ELFMachine);
     FileBuffer.Add32(EV_CURRENT);

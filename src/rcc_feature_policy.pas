@@ -58,13 +58,6 @@ begin
   if AFreestanding then AddDefine(Result, '__STDC_HOSTED__', '0')
   else AddDefine(Result, '__STDC_HOSTED__', '1');
 
-  AddDefine(Result, '__linux__');
-  AddDefine(Result, '__linux');
-  AddDefine(Result, 'linux');
-  AddDefine(Result, '__unix__');
-  AddDefine(Result, '__unix');
-  AddDefine(Result, '__ELF__');
-
   AddDefine(Result, '__BYTE_ORDER__', '1234');
   AddDefine(Result, '__ORDER_LITTLE_ENDIAN__', '1234');
   AddDefine(Result, '__ORDER_BIG_ENDIAN__', '4321');

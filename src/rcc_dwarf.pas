@@ -161,7 +161,7 @@ begin
   AddAttribute(Abbrev, DWAtExternal, DWFormFlag);
   Abbrev.AddBytes([0, 0, 0]);
 
-  ProducerOffset := AddDebugString(DebugStr, 'RookCC 1.0.0');
+  ProducerOffset := AddDebugString(DebugStr, 'RookCC 1.1.0');
   SourceOffset := AddDebugString(DebugStr, Source);
   DirectoryOffset := AddDebugString(DebugStr, GetCurrentDir);
   SetLength(FunctionNameOffsets, Length(AFunctions));

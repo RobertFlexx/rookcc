@@ -136,13 +136,13 @@ begin
     [boExecutable, boObject, boAssemblyListing],
     [bfIntegerScalar, bfPointer, bfAggregate, bfFloatingPoint, bfVariadic,
      bfFunctionPointer, bfPIC, bfDynamicLink, bfInlineAssembly, bfDebugInfo],
-    'supported SysV AMD64 backend with PIC/DWARF objects and direct ELF output');
+    'supported x86-64 backend with ELF executables and ELF/Mach-O objects');
   AddBackend(Result, 'aarch64-integer', archAArch64, bmExperimental,
     [boExecutable, boObject], [bfIntegerScalar],
-    'freestanding AAPCS64 integer locals/globals, calls, and ELF backend');
+    'freestanding AAPCS64 integer locals/globals and ELF/Mach-O objects');
   AddBackend(Result, 'riscv64-integer', archRISCV64, bmExperimental,
     [boExecutable, boObject], [bfIntegerScalar],
-    'freestanding RV64IM integer locals/globals, calls, and ELF backend');
+    'freestanding RV64IM integer locals/globals, calls, and BSD/Linux ELF');
 end;
 
 function FindBackend(AArchitecture: TArchitecture;

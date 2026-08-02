@@ -67,6 +67,10 @@ type
     orkGOT,
     orkPLT,
     orkTLS,
+    orkPage21,
+    orkPageOffset12,
+    orkGOTPage21,
+    orkGOTPageOffset12,
     orkArchitectureSpecific
   );
 
@@ -435,6 +439,10 @@ begin
     orkGOT: Result := 'got';
     orkPLT: Result := 'plt';
     orkTLS: Result := 'tls';
+    orkPage21: Result := 'page21';
+    orkPageOffset12: Result := 'pageoff12';
+    orkGOTPage21: Result := 'got-page21';
+    orkGOTPageOffset12: Result := 'got-pageoff12';
     orkArchitectureSpecific: Result := 'arch';
   else
     Result := 'unknown';

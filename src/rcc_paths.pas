@@ -113,19 +113,24 @@ end;
 
 procedure AddDefaultIncludePaths(var AOptions: TCompilerOptions);
 var
-  ResourceDir, EnvPaths, SysrootPath, Root, MultiArch: string;
+  ResourceDir, ResourceInclude, TargetResourceInclude, EnvPaths,
+  SysrootPath, Root, MultiArch: string;
+  Target: TTargetDescriptor;
 begin
   if AOptions.NoStdInc then Exit;
+  Target := GetTargetOrRaise(AOptions.TargetTriple);
+  MultiArch := TargetMultiArchName(Target);
   ResourceDir := DiscoverResourceDirectory(AOptions.ResourceDir,
     AOptions.Sysroot);
   if ResourceDir <> '' then
   begin
     AOptions.ResourceDir := ResourceDir;
-    AppendUniquePath(AOptions.SystemIncludePaths,
-      IncludeTrailingPathDelimiter(ResourceDir) + 'include');
+    ResourceInclude := IncludeTrailingPathDelimiter(ResourceDir) + 'include';
+    TargetResourceInclude := IncludeTrailingPathDelimiter(ResourceDir) +
+      'targets' + PathDelim + Target.Triple + PathDelim + 'include';
+    if DirectoryExists(TargetResourceInclude) then
+      AppendUniquePath(AOptions.SystemIncludePaths, TargetResourceInclude);
   end;
-
-  MultiArch := TargetMultiArchName(GetTargetOrRaise(AOptions.TargetTriple));
 
   if AOptions.Sysroot <> '' then
   begin
@@ -137,13 +142,23 @@ begin
     AppendUniquePath(AOptions.SystemIncludePaths,
       Root + '/usr/include/' + MultiArch);
     AppendUniquePath(AOptions.SystemIncludePaths, Root + '/usr/include');
+    { The compiler shims are a fallback when a target sysroot does not provide
+      the requested header.  Keeping them after sysroot headers prevents Linux
+      ABI declarations from shadowing BSD or Darwin platform headers. }
+    if ResourceDir <> '' then
+      AppendUniquePath(AOptions.SystemIncludePaths, ResourceInclude);
   end
-  else if MultiArch = 'x86_64-linux-gnu' then
+  else
   begin
-    AppendUniquePath(AOptions.SystemIncludePaths, '/usr/local/include');
-    AppendUniquePath(AOptions.SystemIncludePaths,
-      '/usr/include/x86_64-linux-gnu');
-    AppendUniquePath(AOptions.SystemIncludePaths, '/usr/include');
+    if ResourceDir <> '' then
+      AppendUniquePath(AOptions.SystemIncludePaths, ResourceInclude);
+    if MultiArch = 'x86_64-linux-gnu' then
+    begin
+      AppendUniquePath(AOptions.SystemIncludePaths, '/usr/local/include');
+      AppendUniquePath(AOptions.SystemIncludePaths,
+        '/usr/include/x86_64-linux-gnu');
+      AppendUniquePath(AOptions.SystemIncludePaths, '/usr/include');
+    end;
   end;
 
   EnvPaths := GetEnvironmentVariable('CPATH');

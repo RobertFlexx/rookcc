@@ -303,7 +303,7 @@ begin
     Result.LibraryRoot := '';
     Result.CRTObjectRoot := '';
   end;
-  Result.DynamicLoader := ATarget.LinuxInterpreter;
+  Result.DynamicLoader := ATarget.DefaultDynamicLoader;
 end;
 
 function ResolveShimHeader(const ALayout: TSysrootLayout;

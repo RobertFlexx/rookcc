@@ -43,12 +43,13 @@ begin
   Result.SupportsPIC := TargetHasCapability(D, tcPositionIndependent);
   Result.SupportsObjects := TargetHasCapability(D, tcRelocatableObject);
   Result.SupportsDynamicLinking := TargetHasCapability(D, tcDynamicELF);
-  case D.Architecture of
-    archX86_64: Result.Maturity := 'supported';
-    archAArch64, archRISCV64: Result.Maturity := 'experimental';
+  if (D.Architecture = archX86_64) and
+     (D.OperatingSystem = osLinux) then
+    Result.Maturity := 'supported'
+  else if D.Architecture in [archX86_64, archAArch64, archRISCV64] then
+    Result.Maturity := 'experimental'
   else
     Result.Maturity := 'unavailable';
-  end;
 end;
 
 function NativeTarget: TTargetInfo;

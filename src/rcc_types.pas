@@ -399,6 +399,7 @@ procedure RaiseCompileError(const APos: TSourcePos; const AMessage: string);
 function TypesEqual(const A, B: TCType): Boolean;
 function CTypeSize(const AType: TCType): Int64;
 function CTypeAlign(const AType: TCType): LongInt;
+procedure ConfigureCTypeLongDoubleLayout(ASize, AAlignment: LongInt);
 function IsArithmeticType(const AType: TCType): Boolean;
 function IsIntegerType(const AType: TCType): Boolean;
 function IsScalarType(const AType: TCType): Boolean;
@@ -407,6 +408,20 @@ function CStandardVersion(AStandard: TCStandard): string;
 function IsGNUStandard(AStandard: TCStandard): Boolean;
 
 implementation
+
+var
+  ActiveLongDoubleSize: LongInt = 16;
+  ActiveLongDoubleAlignment: LongInt = 16;
+
+procedure ConfigureCTypeLongDoubleLayout(ASize, AAlignment: LongInt);
+begin
+  if not (ASize in [8, 16]) then
+    raise ERCCError.Create('internal error: unsupported long double size');
+  if (AAlignment <= 0) or ((AAlignment and (AAlignment - 1)) <> 0) then
+    raise ERCCError.Create('internal error: invalid long double alignment');
+  ActiveLongDoubleSize := ASize;
+  ActiveLongDoubleAlignment := AAlignment;
+end;
 
 constructor TExpr.Create(AKind: TExprKind; const APos: TSourcePos);
 begin
@@ -769,7 +784,7 @@ begin
     ctLongLong: Result := 8;
     ctFloat: Result := 4;
     ctDouble: Result := 8;
-    ctLongDouble: Result := 16;
+    ctLongDouble: Result := ActiveLongDoubleSize;
     ctPointer: Result := 8;
     ctArray:
       begin
@@ -797,7 +812,7 @@ begin
     ctShort: Result := 2;
     ctInt, ctFloat, ctEnum: Result := 4;
     ctLong, ctLongLong, ctDouble, ctPointer: Result := 8;
-    ctLongDouble: Result := 16;
+    ctLongDouble: Result := ActiveLongDoubleAlignment;
     ctArray:
       begin
         ElementType := ArrayElementType(AType);

@@ -1,17 +1,17 @@
-
 <img width="1728" height="866" alt="rookcc" src="https://github.com/user-attachments/assets/7afbe89e-0d6a-45ae-b8a9-e92c26041ada" />
 
-rookcc is a small c compiler for linux and the command is rcc
+rookcc is a small c compiler with native linux bsd and macos cross target
+output and the command is rcc
 
 the compiler is written in free pascal and builds into one native program
 
-once built rcc does its own preprocessing parsing type checking optimization machine code encoding object writing executable writing archive reading and shared library resolution
+once built rcc does its own preprocessing parsing type checking optimization machine code encoding and object writing. its x86 64 linux backend also writes and links executables directly
 
-it does not start gcc clang an assembler or a linker
+when the selected target exactly matches the host architecture and operating system rcc also behaves as a normal compiler driver. on macos bsd and non x86 linux hosts it invokes the platform compiler driver only for the final sdk startup file and system library link. it never sends c source to that driver. full support for other advertised targets (riscv, aarch64, bsd, macos) is spotty, and experimental, but i can proudly say linux c development is pretty stable.
 
-free pascal is only needed to build rcc from source
+free pascal is only needed to build rcc from source. apple command line tools are required for native hosted macos executable links; bsd and non x86 linux hosted links use the system cc driver
 
-programs linked to libc or another shared library still use the normal linux loader and the libraries selected by the program
+programs linked to libc or another shared library use the normal loader and system libraries of their target operating system
 
 building
 
@@ -20,6 +20,20 @@ building
 or
 
     ./scripts/build.sh
+
+run the portable format driver and native host release checks with
+
+    make test
+
+the native host check compiles links and executes a formatted libc program, so release builds should run it on every advertised host architecture and operating system
+
+validate reproducible source archives and their extracted build with
+
+    make package-check
+
+after the native host matrix has passed create release archives with
+
+    make package
 
 installing for the current user
 
@@ -44,16 +58,14 @@ basic use
     rcc --emit-ir -O2 hello.c -o hello.rir
     rcc -c source.c -o source.o
 
+the default target is detected from the architecture and operating system that rcc was built on. a matching native build is therefore one command on linux macos freebsd openbsd and netbsd
+
+    rcc example.c -o example
+    ./example
+
 shared libraries use the usual l option
 
     rcc numbers.c -lm -o numbers
-
-the editor in this tree declares its wide ncurses library in the source
-
-    rcc repltxt.c -O2 --gnu-source -o repltxt
-    ./repltxt --help
-
-wide ncurses keeps some data in libtinfow and rcc follows that dependency itself so a separate ltinfow option is not needed
 
 programs can declare an rcc library dependency while staying quiet on other compilers
 
@@ -77,7 +89,19 @@ targets
 
 x86 64 linux is the complete hosted target and writes executables and relocatable objects directly
 
-aarch64 linux and riscv64 linux are experimental freestanding integer targets for executable and object output
+aarch64 linux and riscv64 linux are experimental integer targets. on a matching native host rcc uses the system cc driver for the final hosted executable link; cross target executable output remains freestanding
+
+freebsd openbsd and netbsd have elf64 object and freestanding static executable targets for x86 64 aarch64 and riscv64. on a matching bsd host `rcc source.c -o program` performs the final hosted system link automatically. openbsd freestanding executables include the syscall pinning program segment required by current kernels
+
+macos has mach o 64 bit relocatable object targets for x86 64 and arm64. on a matching mac `rcc source.c -o program` invokes apple clang for the final sdk and libsystem link and produces a native executable
+
+when targeting macos from linux or another non matching host produce an object with `-c` and finish the link with an apple sdk toolchain. rcc does not pretend that an apple sdk is bundled and macos does not execute elf files
+
+    rcc --target x86_64-freebsd -ffreestanding tiny.c -o tiny.freebsd
+    rcc --target aarch64-openbsd -ffreestanding tiny.c -o tiny.openbsd
+    rcc --target arm64-macos -c source.c -o source.macho.o
+
+set `RCC_PLATFORM_LINKER` to an executable path or command name to override the native final link driver. this override is never used for cross target output or for `-c`
 
 use these commands for the exact installed target surface
 
@@ -89,13 +113,19 @@ current limits
 
 x86 64 pic relocatable objects work but pie executables and shared object output are still outside the current release
 
-the cross targets do not yet provide hosted libc linking and are not replacements for the hosted x86 64 path
+cross bsd and non-x86 linux executable targets are freestanding and static. use `-c` plus a target sysroot linker for cross hosted libc programs. when `--sysroot` is present its platform headers take precedence over the bundled generic shims
+
+cross macos executable linking remains outside rcc because sdk selection dyld metadata and code signing belong to the apple platform link step. native macos builds delegate that step automatically
 
 long double tls unwind tables and full statement level debug locations are not advertised
 
-small patches are easiest to review when they include a focused c regression and keep the compiler independent from other c toolchains
+small patches are easiest to review when they include a focused c regression and keep c parsing optimization and machine code generation inside rcc
 
 the license is mit
+
+## SUPPORT/CONTRIBUTIONS NEEDED!
+
+im maintaining this huge project **myself**, and i can only do so much so fast.
 
 
 originally made with 3 people over the span of years for an educational reason.

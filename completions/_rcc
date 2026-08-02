@@ -17,7 +17,7 @@ _arguments \
   '-U[undefine macro]:name:' \
   '-L[add library directory]:directory:_directories' \
   '-l[link shared library or archive]:library:' \
-  '--target=[select target]:target:(x86_64 aarch64 riscv64)' \
+  '--target=[select target]:target:(x86_64 aarch64 riscv64 x86_64-freebsd aarch64-freebsd riscv64-freebsd x86_64-openbsd aarch64-openbsd riscv64-openbsd x86_64-netbsd aarch64-netbsd riscv64-netbsd x86_64-macos arm64-macos)' \
   '--sysroot=[select sysroot]:directory:_directories' \
   '--resource-dir=[select resource tree]:directory:_directories' \
   '--print-targets[list targets]' \

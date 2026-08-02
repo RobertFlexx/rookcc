@@ -138,7 +138,7 @@ begin
   OutputKind := lokExecutable;
   OutputFile := 'a.out';
   EntrySymbol := '_start';
-  Interpreter := ATarget.LinuxInterpreter;
+  Interpreter := ATarget.DefaultDynamicLoader;
   Soname := '';
   SetLength(Inputs, 0);
   SetLength(SearchDirectories, 0);
@@ -287,7 +287,7 @@ begin
   if not AOptions.Freestanding then
   begin
     Result.AddNeededLibrary(ATarget.DefaultLibC);
-    Result.Interpreter := ATarget.LinuxInterpreter;
+    Result.Interpreter := ATarget.DefaultDynamicLoader;
   end
   else Result.Interpreter := '';
 end;

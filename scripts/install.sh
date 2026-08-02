@@ -14,6 +14,7 @@ usage: scripts/install.sh [--prefix dir] [--no-rookcc]
 build and install the standalone rookcc compiler
 free pascal is only required for building from source
 the installed rcc binary does not invoke it
+matching native hosted links may use the operating system compiler driver
 USAGE
 }
 

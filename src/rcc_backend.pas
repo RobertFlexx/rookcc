@@ -5,7 +5,8 @@ unit rcc_backend;
 interface
 
 uses
-  Classes, SysUtils, rcc_types, rcc_runtime_catalog, rcc_buffer, rcc_elf64, rcc_typeops;
+  Classes, SysUtils, rcc_types, rcc_runtime_catalog, rcc_buffer, rcc_elf64,
+  rcc_typeops, rcc_arch;
 
 type
   TBackendStats = record
@@ -100,6 +101,7 @@ type
   private
     FProgram: TProgram;
       FOptions: TCompilerOptions;
+      FTarget: TTargetDescriptor;
       FText: TByteBuffer;
       FData: TByteBuffer;
       FLabels: array of TLabelInfo;
@@ -136,6 +138,7 @@ type
       FUserLabels: array of TNamedLabel;
       FListing: TStringList;
       FStats: TBackendStats;
+      FSyscallSites: TTargetSyscallSiteArray;
 
     function AlignUp(V, A: QWord): QWord;
     function NewLabel: LongInt;
@@ -175,6 +178,7 @@ type
     procedure LoadExternalInputs;
     procedure PrepareExternalRelocations;
     procedure ResolveExternalRelocations(ATextVA, ADataVA: QWord);
+    procedure EmitDirectSyscall(const AName: string);
 
     procedure EmitMovRaxImm(V: Int64);
     procedure EmitMovR8Imm(V: QWord);
@@ -338,8 +342,9 @@ type
 implementation
 
 uses
-  rcc_arch, rcc_library_resolver, rcc_abi, rcc_elf_reader,
-  rcc_object_model, rcc_elf_image, rcc_dwarf, rcc_elf_debug;
+  rcc_library_resolver, rcc_abi, rcc_elf_reader,
+  rcc_object_model, rcc_elf_image, rcc_object_writer, rcc_dwarf,
+  rcc_elf_debug;
 
 const
   ELF_STB_GLOBAL = Byte(1);
@@ -371,6 +376,7 @@ begin
   inherited Create;
   FProgram := AProgram;
   FOptions := AOptions;
+  FTarget := GetTargetOrRaise(AOptions.TargetTriple);
   FText := TByteBuffer.Create;
   FData := TByteBuffer.Create;
   FListing := TStringList.Create;
@@ -392,6 +398,25 @@ end;
 function TX64Backend.AlignUp(V, A: QWord): QWord;
 begin
   Result := (V + A - 1) and not (A - 1);
+end;
+
+procedure TX64Backend.EmitDirectSyscall(const AName: string);
+var
+  Target: TTargetDescriptor;
+  Number: LongWord;
+  N: LongInt;
+begin
+  Target := GetTargetOrRaise(FOptions.TargetTriple);
+  if not TargetSyscallNumber(Target, AName, Number) then
+    raise ERCCError.Create('error: direct ' + AName +
+      ' syscall runtime is unavailable for ' + Target.Triple);
+  FText.Add8($B8);
+  FText.Add32(Number);
+  N := Length(FSyscallSites);
+  SetLength(FSyscallSites, N + 1);
+  FSyscallSites[N].TextOffset := QWord(FText.Size);
+  FSyscallSites[N].Number := Number;
+  FText.AddBytes([$0F, $05]);
 end;
 
 function TX64Backend.NewLabel: LongInt;
@@ -2467,9 +2492,8 @@ begin
   end
   else
   begin
-    FText.AddBytes([$B8, $3C, $00, $00, $00]);
-    FText.AddBytes([$0F, $05]);
-    FListing.Add('  mov eax, 60');
+    EmitDirectSyscall('exit');
+    FListing.Add('  mov eax, target_exit_syscall');
     FListing.Add('  syscall');
   end;
   FText.AddBytes([$0F, $0B]);
@@ -2480,7 +2504,8 @@ procedure TX64Backend.EmitRuntimeRead;
 var L: LongInt;
 begin
   L := FindNamedLabel(FRuntime, 'read'); BindTextLabel(L);
-  FText.AddBytes([$31, $C0, $0F, $05, $C3]);
+  EmitDirectSyscall('read');
+  FText.Add8($C3);
   Inc(FStats.RuntimeFunctions);
 end;
 
@@ -2488,7 +2513,8 @@ procedure TX64Backend.EmitRuntimeWrite;
 var L: LongInt;
 begin
   L := FindNamedLabel(FRuntime, 'write'); BindTextLabel(L);
-  FText.AddBytes([$B8, $01, $00, $00, $00, $0F, $05, $C3]);
+  EmitDirectSyscall('write');
+  FText.Add8($C3);
   Inc(FStats.RuntimeFunctions);
 end;
 
@@ -2496,7 +2522,8 @@ procedure TX64Backend.EmitRuntimeClose;
 var L: LongInt;
 begin
   L := FindNamedLabel(FRuntime, 'close'); BindTextLabel(L);
-  FText.AddBytes([$B8, $03, $00, $00, $00, $0F, $05, $C3]);
+  EmitDirectSyscall('close');
+  FText.Add8($C3);
   Inc(FStats.RuntimeFunctions);
 end;
 
@@ -2504,7 +2531,8 @@ procedure TX64Backend.EmitRuntimeOpen;
 var L: LongInt;
 begin
   L := FindNamedLabel(FRuntime, 'open'); BindTextLabel(L);
-  FText.AddBytes([$B8, $02, $00, $00, $00, $0F, $05, $C3]);
+  EmitDirectSyscall('open');
+  FText.Add8($C3);
   Inc(FStats.RuntimeFunctions);
 end;
 
@@ -2512,7 +2540,8 @@ procedure TX64Backend.EmitRuntimeLseek;
 var L: LongInt;
 begin
   L := FindNamedLabel(FRuntime, 'lseek'); BindTextLabel(L);
-  FText.AddBytes([$B8, $08, $00, $00, $00, $0F, $05, $C3]);
+  EmitDirectSyscall('lseek');
+  FText.Add8($C3);
   Inc(FStats.RuntimeFunctions);
 end;
 
@@ -2520,7 +2549,8 @@ procedure TX64Backend.EmitRuntimeGetPid;
 var L: LongInt;
 begin
   L := FindNamedLabel(FRuntime, 'getpid'); BindTextLabel(L);
-  FText.AddBytes([$B8, $27, $00, $00, $00, $0F, $05, $C3]);
+  EmitDirectSyscall('getpid');
+  FText.Add8($C3);
   Inc(FStats.RuntimeFunctions);
 end;
 
@@ -2536,7 +2566,8 @@ procedure TX64Backend.EmitRuntimeAccess;
 var L: LongInt;
 begin
   L := FindNamedLabel(FRuntime, 'access'); BindTextLabel(L);
-  FText.AddBytes([$B8, $15, $00, $00, $00, $0F, $05, $C3]);
+  EmitDirectSyscall('access');
+  FText.Add8($C3);
   Inc(FStats.RuntimeFunctions);
 end;
 
@@ -2544,7 +2575,8 @@ procedure TX64Backend.EmitRuntimeTime;
 var L: LongInt;
 begin
   L := FindNamedLabel(FRuntime, 'time'); BindTextLabel(L);
-  FText.AddBytes([$B8, $C9, $00, $00, $00, $0F, $05, $C3]);
+  EmitDirectSyscall('time');
+  FText.Add8($C3);
   Inc(FStats.RuntimeFunctions);
 end;
 
@@ -2562,7 +2594,10 @@ begin
     FText.AddBytes([$0F, $0B]);
   end
   else
-    FText.AddBytes([$B8, $3C, $00, $00, $00, $0F, $05, $0F, $0B]);
+  begin
+    EmitDirectSyscall('exit');
+    FText.AddBytes([$0F, $0B]);
+  end;
   Inc(FStats.RuntimeFunctions);
 end;
 
@@ -2571,7 +2606,8 @@ var L: LongInt;
 begin
   L := FindNamedLabel(FRuntime, 'abort'); BindTextLabel(L);
   FText.AddBytes([$BF, $86, $00, $00, $00]);
-  FText.AddBytes([$B8, $3C, $00, $00, $00, $0F, $05, $0F, $0B]);
+  EmitDirectSyscall('exit');
+  FText.AddBytes([$0F, $0B]);
   Inc(FStats.RuntimeFunctions);
 end;
 
@@ -2624,13 +2660,11 @@ begin
   FText.AddBytes([$48, $89, $C2]);
   FText.Add8($5E);
   FText.AddBytes([$BF, $01, $00, $00, $00]);
-  FText.AddBytes([$B8, $01, $00, $00, $00]);
-  FText.AddBytes([$0F, $05]);
+  EmitDirectSyscall('write');
   EmitLeaRsiData(NewlineLabel);
   FText.AddBytes([$BA, $01, $00, $00, $00]);
   FText.AddBytes([$BF, $01, $00, $00, $00]);
-  FText.AddBytes([$B8, $01, $00, $00, $00]);
-  FText.AddBytes([$0F, $05]);
+  EmitDirectSyscall('write');
   FText.AddBytes([$31, $C0, $C3]);
   Inc(FStats.RuntimeFunctions);
 end;
@@ -2644,8 +2678,7 @@ begin
   FText.AddBytes([$48, $89, $E6]);
   FText.AddBytes([$BA, $01, $00, $00, $00]);
   FText.AddBytes([$BF, $01, $00, $00, $00]);
-  FText.AddBytes([$B8, $01, $00, $00, $00]);
-  FText.AddBytes([$0F, $05]);
+  EmitDirectSyscall('write');
   FText.AddBytes([$48, $83, $C4, $08, $C3]);
   Inc(FStats.RuntimeFunctions);
 end;
@@ -2660,7 +2693,7 @@ begin
   FText.AddBytes([$31, $FF]);
   FText.AddBytes([$48, $89, $E6]);
   FText.AddBytes([$BA, $01, $00, $00, $00]);
-  FText.AddBytes([$31, $C0, $0F, $05]);
+  EmitDirectSyscall('read');
   FText.AddBytes([$48, $83, $F8, $01]);
   EmitJcc($85, EofLabel);
   FText.AddBytes([$0F, $B6, $04, $24]);
@@ -2712,7 +2745,7 @@ begin
   BindTextLabel(WriteLabel);
   FText.AddBytes([$BF, $01, $00, $00, $00]);
   FText.AddBytes([$48, $89, $CA]);
-  FText.AddBytes([$B8, $01, $00, $00, $00, $0F, $05]);
+  EmitDirectSyscall('write');
   FText.AddBytes([$C9, $C3]);
   Inc(FStats.RuntimeFunctions);
 end;
@@ -2728,7 +2761,8 @@ begin
   FText.AddBytes([$48, $89, $C2]);
   FText.Add8($5E);
   FText.AddBytes([$BF, $01, $00, $00, $00]);
-  FText.AddBytes([$B8, $01, $00, $00, $00, $0F, $05, $C3]);
+  EmitDirectSyscall('write');
+  FText.Add8($C3);
   Inc(FStats.RuntimeFunctions);
 end;
 
@@ -2764,7 +2798,7 @@ begin
   BindTextLabel(WriteLabel);
   FText.AddBytes([$BF, $01, $00, $00, $00]);
   FText.AddBytes([$48, $89, $CA]);
-  FText.AddBytes([$B8, $01, $00, $00, $00, $0F, $05]);
+  EmitDirectSyscall('write');
   FText.AddBytes([$C9, $C3]);
   Inc(FStats.RuntimeFunctions);
 end;
@@ -2786,7 +2820,8 @@ begin
   FText.AddBytes([$41, $BA, $22, $00, $00, $00]);
   FText.AddBytes([$49, $C7, $C0, $FF, $FF, $FF, $FF]);
   FText.AddBytes([$45, $31, $C9]);
-  FText.AddBytes([$B8, $09, $00, $00, $00, $0F, $05, $59]);
+  EmitDirectSyscall('mmap');
+  FText.Add8($59);
   FText.AddBytes([$48, $3D, $01, $F0, $FF, $FF]);
   EmitJcc($83, FailLabel);
   FText.AddBytes([$48, $89, $08, $48, $83, $C0, $10, $C3]);
@@ -2900,7 +2935,7 @@ begin
   FText.AddBytes([$48, $85, $FF]);
   EmitJcc($84, DoneLabel);
   FText.AddBytes([$48, $83, $EF, $10, $48, $8B, $37]);
-  FText.AddBytes([$B8, $0B, $00, $00, $00, $0F, $05]);
+  EmitDirectSyscall('munmap');
   BindTextLabel(DoneLabel);
   FText.AddBytes([$31, $C0, $C3]);
   Inc(FStats.RuntimeFunctions);
@@ -3201,8 +3236,8 @@ begin
   FText.AddBytes([$48, $85, $FF]);
   EmitJcc($85, OkLabel);
   FText.AddBytes([$BF, $86, $00, $00, $00]);
-  FText.AddBytes([$B8, $3C, $00, $00, $00]);
-  FText.AddBytes([$0F, $05, $0F, $0B]);
+  EmitDirectSyscall('exit');
+  FText.AddBytes([$0F, $0B]);
   BindTextLabel(OkLabel);
   FText.AddBytes([$31, $C0, $C3]);
   Inc(FStats.RuntimeFunctions);
@@ -4549,7 +4584,7 @@ begin
       ParameterTypes[I] := MakeType(ctDouble);
   end;
   Layout := BuildFunctionABILayout(ReturnType, ParameterTypes,
-    Variadic, NativeTargetDescriptor);
+    Variadic, FTarget);
   try
     SetLength(StageOffsets, Length(E.Args));
     for I := 0 to High(E.Args) do
@@ -4748,8 +4783,7 @@ begin
     Exit;
   end;
 
-  Location := ClassifyCTypeForABI(FCurrentReturnType,
-    NativeTargetDescriptor);
+  Location := ClassifyCTypeForABI(FCurrentReturnType, FTarget);
   FText.AddBytes([$48, $89, $C1]);
   IntegerIndex := 0;
   SSEIndex := 0;
@@ -4887,7 +4921,7 @@ begin
 
   RequestedType := E.CType;
   IsAggregate := IsAggregateType(RequestedType);
-  Location := ClassifyCTypeForABI(RequestedType, NativeTargetDescriptor);
+  Location := ClassifyCTypeForABI(RequestedType, FTarget);
   ReserveTemporary(8, 8, StateOffset);
   GenExpr(E.Args[0]);
   EmitStoreLocal(StateOffset);
@@ -6365,7 +6399,7 @@ begin
   SetLength(ParameterTypes, Length(F.Params));
   for I := 0 to High(F.Params) do ParameterTypes[I] := F.Params[I].CType;
   Layout := BuildFunctionABILayout(F.ReturnType, ParameterTypes,
-    F.IsVariadic, NativeTargetDescriptor);
+    F.IsVariadic, FTarget);
   try
   FixedStackEnd := 0;
   for I := 0 to High(F.Params) do
@@ -6829,7 +6863,7 @@ begin
     Obj.Section(TextIndex).Data.Append(FText);
     Obj.Section(DataIndex).Data.Append(FData);
     Obj.Validate;
-    WriteELF64Relocatable(AFileName, Obj);
+    WriteRelocatableObject(AFileName, Obj);
     FStats.TextBytes := FText.Size;
     FStats.DataBytes := FData.Size;
   finally
@@ -6936,13 +6970,35 @@ var
   end;
 begin
   DebugObject := nil;
+  Target := GetTargetOrRaise(FOptions.TargetTriple);
   Layout := ComputeELFExecutableLayout(QWord(FText.Size), QWord(FData.Size),
     QWord(FLabels[FEntryLabel].Offset));
   ResolveFixups(Layout.TextVA, Layout.DataVA);
   ResolveExternalRelocations(Layout.TextVA, Layout.DataVA);
 
-  Target := GetTargetOrRaise(FOptions.TargetTriple);
   try
+    if Target.OperatingSystem <> osLinux then
+    begin
+      if Target.ObjectFormat <> ofELF64 then
+        raise ERCCError.Create(
+          'internal error: x86 ELF executable writer selected for ' +
+          ObjectFormatName(Target.ObjectFormat));
+      if (Length(FImports) <> 0) or (Length(FOptions.Libraries) <> 0) or
+         (Length(FOptions.ObjectFiles) <> 0) then
+        raise ERCCError.Create(
+          'error: BSD direct executable output is currently static and ' +
+          'freestanding; emit an object with -c to use a target system linker');
+      if FOptions.DebugInfo then BuildExecutableDebugObject;
+      WriteStaticELF64Executable(AFileName, Target, FText, FData,
+        QWord(FLabels[FEntryLabel].Offset), FSyscallSites);
+      if DebugObject <> nil then
+        AppendELF64DebugSections(AFileName, DebugObject,
+          Layout.TextOffset, Layout.TextVA, QWord(FText.Size),
+          Layout.DataOffset, Layout.DataVA, QWord(FData.Size));
+      FStats.TextBytes := FText.Size;
+      FStats.DataBytes := FData.Size;
+      Exit;
+    end;
     MultiArch := TargetMultiArchName(Target);
     if FOptions.StaticLink then
     begin

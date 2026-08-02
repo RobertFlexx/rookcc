@@ -1,13 +1,16 @@
-.TH rcc 1 "august 2026" "rookcc 1.0.0" "user commands"
+.TH rcc 1 "august 2026" "rookcc 1.1.0" "user commands"
 .SH name
 rcc \- standalone native c compiler
 .SH use
 .B rcc
 .RI [ options ] " file.c ..."
 .SH description
-rcc preprocesses parses checks optimizes and writes native output in one program
+rcc preprocesses parses checks optimizes and writes target machine code itself
 
-it does not start another compiler assembler or linker
+for a target matching the host architecture and operating system rcc produces a
+runnable executable in one command. x86 64 linux is linked internally. native
+macos bsd and non x86 linux hosted executables use the platform compiler driver
+only for the final sdk startup file and system library link
 .SH options
 .TP
 .BI -o " file"
@@ -20,7 +23,7 @@ preprocess only
 write a machine code listing when the target supports it
 .TP
 .B -c
-write an elf relocatable object
+write a target elf or mach-o relocatable object
 .TP
 .B -run
 compile and run a temporary native executable
@@ -35,7 +38,7 @@ write verified target independent ir
 select c90 c99 c11 c17 c23 gnu99 gnu11 gnu17 gnu23 or rcc
 .TP
 .BI --target= target
-select x86_64 aarch64 or riscv64
+select an architecture and linux freebsd openbsd netbsd or macos target
 .TP
 .BI --sysroot= dir
 use a target sysroot
@@ -47,7 +50,7 @@ select optimization policy
 control the preprocessor
 .TP
 .BR -L , " -l" , " -R" , " -Wl,-rpath,dir"
-control native elf library and archive resolution
+control native platform library and archive resolution
 .TP
 .B #pragma rcc link name
 request a shared library from the source file
@@ -56,7 +59,7 @@ request a shared library from the source file
 write an executable without a program interpreter
 .TP
 .B -fPIC
-with \fB-c\fR write an x86 64 pic object
+with \fB-c\fR write an x86 64 or mach-o pic object
 .TP
 .B -g
 write dwarf 4 function line and symbol data for x86 64 output
@@ -79,5 +82,22 @@ show complete help
 gnu modes accept asm __asm and __asm__ with operands constraints clobbers volatile and asm goto
 
 supported templates are encoded by the x86 64 backend
+.SH target formats
+freebsd openbsd and netbsd targets write elf64 relocatable objects and
+freestanding static executables for x86 64 aarch64 and riscv64
+
+openbsd executables include a PT_OPENBSD_SYSCALLS pin table
+
+macos x86 64 and arm64 targets write native mach-o objects with \fB-c\fR
+
+when target and host match rcc automatically invokes the native platform driver
+and \fBrcc source.c -o program\fR produces a runnable hosted executable
+
+cross macos hosted programs require \fB-c\fR followed by an apple sdk toolchain
+link because rcc does not bundle an apple sdk and macos does not execute elf
+.SH environment
+.TP
+.B RCC_PLATFORM_LINKER
+override the compiler driver used only for a matching native hosted final link
 .SH files
 the default resource tree is /usr/local/share/rcc

@@ -7,13 +7,46 @@ INSTALL_ROOKCC ?= 0
 BUILD_DIR := build
 UNIT_DIR := $(BUILD_DIR)/units
 BIN := $(BUILD_DIR)/rcc
+NATIVE_DRIVER_TEST_UNIT_DIR := $(BUILD_DIR)/units-native-driver-test
+NATIVE_DRIVER_TEST_BIN := $(BUILD_DIR)/rcc-native-driver-test
 SOURCES := $(wildcard src/*.pas)
 RESOURCE_DIR := $(DESTDIR)$(PREFIX)/share/rcc
 DOC_DIR := $(DESTDIR)$(PREFIX)/share/doc/rcc
 
-.PHONY: all install install-rookcc uninstall clean
+.PHONY: all test test-platform-support test-target-formats test-native-driver \
+	test-native-host package package-check release-check install install-rookcc \
+	uninstall clean
 
 all: $(BIN)
+
+test: test-platform-support
+
+test-platform-support: test-target-formats test-native-driver test-native-host
+
+release-check: test package-check
+
+package:
+	./scripts/package.sh
+
+package-check:
+	./scripts/package_test.sh
+
+test-target-formats: $(BIN)
+	python3 tests/target_format_matrix.py "$(abspath $(BIN))" \
+		"$(abspath $(BUILD_DIR))/target-format-tests"
+
+test-native-driver: $(NATIVE_DRIVER_TEST_BIN)
+	python3 tests/native_linker_driver_contract.py \
+		"$(abspath $(NATIVE_DRIVER_TEST_BIN))"
+
+test-native-host: $(BIN)
+	python3 tests/native_host_smoke.py "$(abspath $(BIN))"
+
+$(NATIVE_DRIVER_TEST_BIN): $(SOURCES) VERSION
+	@mkdir -p "$(BUILD_DIR)" "$(NATIVE_DRIVER_TEST_UNIT_DIR)"
+	$(FPC) $(FPCFLAGS) -dRCC_DRIVER_TESTING -Fu./src \
+		-FU"$(NATIVE_DRIVER_TEST_UNIT_DIR)" -FE"$(BUILD_DIR)" \
+		-o"$(abspath $(NATIVE_DRIVER_TEST_BIN))" src/rcc.pas
 
 $(BIN): $(SOURCES) VERSION
 	@mkdir -p "$(BUILD_DIR)" "$(UNIT_DIR)"

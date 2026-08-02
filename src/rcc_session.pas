@@ -15,7 +15,8 @@ uses
   Classes, SysUtils, rcc_frontend, rcc_opt, rcc_backend,
   rcc_verify, rcc_build, rcc_target, rcc_diag, rcc_feature_policy,
   rcc_sema, rcc_arch, rcc_cross_backend, rcc_pass_manager, rcc_ir,
-  rcc_ir_verify, rcc_ir_metrics, rcc_platform, rcc_gnu_tokens;
+  rcc_ir_verify, rcc_ir_metrics, rcc_platform, rcc_gnu_tokens,
+  rcc_native_linker;
 
 procedure AppendString(var AValues: rcc_types.TStringArray; const AValue: string);
 var
@@ -173,48 +174,99 @@ end;
 
 procedure ValidateDriverCapabilities(const AOptions: TCompilerOptions;
   const ATarget: TTargetDescriptor);
+var
+  NativeLink: Boolean;
 begin
-  if AOptions.PositionIndependent and not
-     ((ATarget.Architecture = archX86_64) and
-      (AOptions.EmitMode = emObject)) then
+  NativeLink := NeedsNativePlatformLink(AOptions, ATarget);
+  if (AOptions.EmitMode = emExecutable) and
+     not TargetHasCapability(ATarget, tcExecutable) and not NativeLink then
+  begin
+    if ATarget.ObjectFormat = ofMachO64 then
+    begin
+      if TargetMatchesNativeHost(ATarget) then
+        raise ERCCError.Create(
+          'error: native macOS executable linking is a hosted operation; ' +
+          'remove -ffreestanding or emit a Mach-O object with -c')
+      else
+        raise ERCCError.Create(
+          'error: cross-target macOS executable linking requires an Apple SDK; ' +
+          'emit a Mach-O object with -c, then link it on macOS or with a ' +
+          'configured cross toolchain');
+    end;
+    raise ERCCError.Create('error: target does not support executable output');
+  end;
+  if (AOptions.EmitMode = emObject) and
+     not TargetHasCapability(ATarget, tcRelocatableObject) then
+    raise ERCCError.Create('error: target does not support relocatable objects');
+  if AOptions.RunAfterCompile and not TargetMatchesNativeHost(ATarget) then
     raise ERCCError.Create(
-      'error: PIC is supported for x86-64 relocatable objects; ' +
+      'error: -run requires a target matching the host architecture and OS; cross-target ' +
+      'outputs must be copied to or emulated on their target system');
+  if AOptions.PositionIndependent and not
+     (((AOptions.EmitMode = emObject) or NativeLink) and
+      ((ATarget.Architecture = archX86_64) or
+       (ATarget.ObjectFormat = ofMachO64))) then
+    raise ERCCError.Create(
+      'error: PIC is supported for x86-64 and Mach-O relocatable objects; ' +
       'PIE executable output is unavailable, so use -c or remove ' +
       '-fPIC/-fPIE/-pie');
+  if (AOptions.DynamicLinker <> '') and
+     not TargetHasCapability(ATarget, tcDynamicELF) and not NativeLink then
+    raise ERCCError.Create(
+      'error: dynamic-linker options are unavailable for ' +
+      ATarget.Triple + '; use a target linker after emitting an object with -c');
+  if (Length(AOptions.RPaths) <> 0) and
+     not TargetHasCapability(ATarget, tcDynamicELF) and not NativeLink then
+    raise ERCCError.Create(
+      'error: runpath options are unavailable for ' + ATarget.Triple +
+      '; use a target linker after emitting an object with -c');
+  if AOptions.BindNow and (ATarget.ObjectFormat = ofMachO64) then
+    raise ERCCError.Create(
+      'error: ELF -z now linking is unavailable for Mach-O targets');
   if AOptions.DebugInfo and not
      ((ATarget.Architecture = archX86_64) and
+      (ATarget.ObjectFormat = ofELF64) and
       (AOptions.EmitMode in [emObject, emExecutable])) then
     raise ERCCError.Create(
-      'error: -g emits DWARF for x86-64 objects and executables; ' +
-      'cross-target debug data and unwind tables are unavailable');
+      'error: -g currently emits ELF DWARF for x86-64 objects and ' +
+      'executables; Mach-O and cross-architecture debug data are unavailable');
   if AOptions.SharedOutput then
     raise ERCCError.Create(
       'error: -shared output is unsupported; rcc links native ELF shared libraries into x86-64 executables');
-  if (Length(AOptions.Libraries) > 0) and
-     (ATarget.Architecture <> archX86_64) then
+  if AOptions.StaticLink and NativeLink and
+     (ATarget.OperatingSystem = osDarwin) then
     raise ERCCError.Create(
-      'error: external shared-library linking is supported only ' +
-      'for the native x86-64 ELF backend; use a target sysroot with ' +
-      'freestanding cross output');
-  if (Length(AOptions.ObjectFiles) > 0) and
-     (ATarget.Architecture <> archX86_64) then
+      'error: native macOS does not provide a static system executable link; ' +
+      'remove -static');
+  if (Length(AOptions.Libraries) > 0) and not NativeLink and
+     not ((ATarget.Architecture = archX86_64) and
+       (ATarget.OperatingSystem = osLinux)) then
     raise ERCCError.Create(
-      'error: relocatable-object and archive inputs currently require the x86-64 linker');
+      'error: cross-target library linking requires a target linker; ' +
+      'emit an object with -c and link it with the target sysroot');
+  if (Length(AOptions.ObjectFiles) > 0) and not NativeLink and
+     not ((ATarget.Architecture = archX86_64) and
+       (ATarget.OperatingSystem = osLinux)) then
+    raise ERCCError.Create(
+      'error: cross-target object and archive linking requires a target linker; ' +
+      'use -c for source compilation and finish the link on the target system');
   if (Length(AOptions.ObjectFiles) > 0) and
      (AOptions.EmitMode <> emExecutable) then
     raise ERCCError.Create(
       'error: relocatable-object and archive inputs require executable output');
-  if (ATarget.Architecture <> archX86_64) and
+  if not TargetHasCapability(ATarget, tcHostedLibC) and
      not AOptions.Freestanding and
-     (AOptions.EmitMode in [emExecutable, emObject, emAssembly]) then
+     (AOptions.EmitMode = emExecutable) and not NativeLink then
     raise ERCCError.Create(
-      'error: ' + ArchitectureName(ATarget.Architecture) +
-      ' currently provides freestanding integer output; add -ffreestanding');
-  if (ATarget.Architecture <> archX86_64) and
+      'error: hosted cross-target executable linking is unavailable for ' +
+      ATarget.Triple + '; use -c with a target linker, or add -ffreestanding ' +
+      'for a static syscall-only executable');
+  if ((ATarget.Architecture <> archX86_64) or
+      (ATarget.ObjectFormat = ofMachO64)) and
      (AOptions.EmitMode = emAssembly) then
     raise ERCCError.Create(
-      'error: cross-target textual listings are unavailable; ' +
-      'emit an ELF executable or relocatable object');
+      'error: this target does not provide a textual machine-code listing; ' +
+      'emit an executable or relocatable object');
 end;
 
 procedure PrintDryRun(const AOptions: TCompilerOptions;
@@ -231,10 +283,15 @@ begin
   WriteLn('  frontend: internal preprocessor -> lexer -> parser -> semantic analysis');
   WriteLn('  middle:   typed AST -> linear IR -> CFG -> optimization -> liveness');
   if ATarget.Architecture = archX86_64 then
-    WriteLn('  backend:  legacy x86-64 encoder + ELF64 writer (broadest path)')
+    WriteLn('  backend:  legacy x86-64 encoder + ',
+      ObjectFormatName(ATarget.ObjectFormat), ' writer (broadest path)')
   else
     WriteLn('  backend:  ', ArchitectureName(ATarget.Architecture),
-      ' integer encoder -> generic ELF64 writer');
+      ' integer encoder -> ', ObjectFormatName(ATarget.ObjectFormat),
+      ' writer');
+  if NeedsNativePlatformLink(AOptions, ATarget) then
+    WriteLn('  linker:   native platform driver ',
+      NativePlatformLinkerName(ATarget));
   WriteLn('  output:   ', AOptions.OutputFile);
   for I := 0 to High(AOptions.Inputs) do
     WriteLn('  input:    ', AOptions.Inputs[I]);
@@ -274,11 +331,18 @@ var
   IRModule: TIRModule;
   IRMetrics: TIRModuleMetrics;
   NeedFormalIR: Boolean;
-  BackendOptions: TCompilerOptions;
+  BackendOptions, LinkOptions: TCompilerOptions;
+  NativeLink: Boolean;
+  GeneratedObjectFile, CodegenOutputFile: string;
 begin
   Result := 1;
   TargetDescriptor := GetTargetOrRaise(AOptions.TargetTriple);
+  ConfigureCTypeLongDoubleLayout(
+    TargetDescriptor.DataLayout.LongDoubleBits div 8,
+    TargetDescriptor.DataLayout.LongDoubleAlign);
   ValidateDriverCapabilities(AOptions, TargetDescriptor);
+  NativeLink := NeedsNativePlatformLink(AOptions, TargetDescriptor);
+  GeneratedObjectFile := '';
   if AOptions.DryRun then
   begin
     PrintDryRun(AOptions, TargetDescriptor);
@@ -443,15 +507,25 @@ begin
       BackendOptions.Libraries[I] := AOptions.Libraries[I];
     for I := 0 to High(SourceLibraries) do
       AppendUniqueString(BackendOptions.Libraries, SourceLibraries[I]);
-    if (AOptions.EmitMode = emObject) and
+    LinkOptions := BackendOptions;
+    CodegenOutputFile := AOptions.OutputFile;
+    if NativeLink then
+    begin
+      GeneratedObjectFile := GetTempFileName(GetTempDir(False), 'rcc');
+      BackendOptions.EmitMode := emObject;
+      CodegenOutputFile := GeneratedObjectFile;
+      if AOptions.Verbose then
+        WriteLn(StdErr, 'object ', GeneratedObjectFile);
+    end;
+    if (BackendOptions.EmitMode = emObject) and
        (TargetDescriptor.Architecture <> archX86_64) then
       GenerateCrossTargetObject(ProgramAll, TargetDescriptor,
-        AOptions.OutputFile, CrossStats)
+        CodegenOutputFile, CrossStats)
     else if TargetDescriptor.Architecture = archX86_64 then
     begin
       Backend := TX64Backend.Create(ProgramAll, BackendOptions);
       try
-        Backend.Generate(AOptions.OutputFile);
+        Backend.Generate(CodegenOutputFile);
         BackendStats := Backend.Stats;
       finally
         Backend.Free;
@@ -459,7 +533,9 @@ begin
     end
     else
       GenerateCrossTargetExecutable(ProgramAll, TargetDescriptor,
-        AOptions.OutputFile, CrossStats);
+        CodegenOutputFile, CrossStats);
+    if NativeLink then
+      LinkNativeExecutable(LinkOptions, TargetDescriptor, GeneratedObjectFile);
     BackTime := GetTickCount64;
 
     if AOptions.Verbose then WriteLn(StdErr, 'write  ', AOptions.OutputFile);
@@ -498,6 +574,8 @@ begin
     end;
     Result := 0;
   finally
+    if (GeneratedObjectFile <> '') and FileExists(GeneratedObjectFile) then
+      DeleteFile(GeneratedObjectFile);
     PassManager.Free;
     OutputLines.Free;
     ProgramAll.Free;

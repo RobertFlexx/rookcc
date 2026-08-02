@@ -36,11 +36,13 @@ begin
   WriteLn('  rcc hello.c -O2 -o hello');
   WriteLn('  rcc -run hello.c arg1 arg2');
   WriteLn('  rcc --target aarch64 -ffreestanding tiny.c -o tiny.aarch64');
+  WriteLn('  rcc --target x86_64-freebsd -ffreestanding tiny.c -o tiny.freebsd');
+  WriteLn('  rcc --target arm64-macos -c source.c -o source.macho.o');
   WriteLn('  rcc --emit-ir -O2 source.c -o source.rir');
   WriteLn;
   WriteLn('OUTPUT');
   WriteLn('  -o FILE                    write output to FILE (default: a.out)');
-  WriteLn('  -c                         emit an ELF relocatable object');
+  WriteLn('  -c                         emit a target ELF or Mach-O relocatable object');
   WriteLn('  -run, --run FILE [ARGS]    compile and execute FILE with arguments');
   WriteLn('  -E                         preprocess only');
   WriteLn('  -S                         emit target machine-code listing when available');
@@ -58,7 +60,7 @@ begin
   WriteLn('  -ffreestanding             disable hosted assumptions');
   WriteLn;
   WriteLn('TARGETS');
-  WriteLn('  --target ARCH|TRIPLE       x86_64, aarch64/arm64/arm, or riscv64');
+  WriteLn('  --target ARCH|TRIPLE       select architecture and Linux/BSD/macOS target');
   WriteLn('  --target-arm               alias for --target aarch64');
   WriteLn('  --target-riscv64           alias for --target riscv64');
   WriteLn('  -march=CPU                 select a CPU within the target');
@@ -69,7 +71,7 @@ begin
   WriteLn('  -print-multiarch           print the GNU multiarch directory name');
   WriteLn('  -print-sysroot             print the configured target sysroot');
   WriteLn('  --print-backends           list backend scope and maturity');
-  WriteLn('  -fPIC -c                   emit a PIC x86-64 relocatable object');
+  WriteLn('  -fPIC -c                   emit a PIC x86-64 or Mach-O object');
   WriteLn('  -g                         emit DWARF 4 x86-64 debug data and symbols');
   WriteLn;
   WriteLn('PREPROCESSOR');
@@ -87,9 +89,11 @@ begin
   WriteLn('  @FILE                      read options from a response file');
   WriteLn;
   WriteLn('LINKING');
+  WriteLn('  native matching targets    link a runnable executable through the host driver');
+  WriteLn('  cross hosted targets       use -c, then link with the target SDK/toolchain');
   WriteLn('  -L DIR, -LDIR              add a shared-library search directory');
-  WriteLn('  -l NAME, -lNAME            link libNAME.so using its ELF SONAME');
-  WriteLn('  PATH/libNAME.so            link an explicit ELF shared object');
+  WriteLn('  -l NAME, -lNAME            link a named platform library or archive');
+  WriteLn('  PATH/libNAME.so|.dylib     link an explicit platform shared library');
   WriteLn('  -Wl,-rpath,DIR             embed a runtime library search path');
   WriteLn('  -Wl,--dynamic-linker,FILE  select the ELF program interpreter');
   WriteLn('  -R DIR                     embed a runtime library search path');
@@ -124,8 +128,8 @@ begin
   WriteLn('  -h, --help                 show this help');
   WriteLn;
   WriteLn('ABOUT');
-  WriteLn('  rcc is a standalone native C compiler with an internal frontend, optimizer,');
-  WriteLn('  machine-code encoder, ELF writer, and shared-library resolver.');
+  WriteLn('  rcc has an internal C frontend, optimizer, machine-code encoders, and');
+  WriteLn('  ELF/Mach-O writers. Matching native targets can use the host final linker.');
 end;
 
 procedure AppendString(var AValues: rcc_types.TStringArray; const AValue: string);
@@ -151,11 +155,13 @@ end;
 
 function IsSharedLibraryPath(const AValue: string): Boolean;
 var
-  Base, LowerBase: string;
+  Base, LowerBase, Extension: string;
   Marker: LongInt;
 begin
   Base := ExtractFileName(AValue);
   LowerBase := LowerCase(Base);
+  Extension := LowerCase(ExtractFileExt(LowerBase));
+  if (Extension = '.dylib') or (Extension = '.tbd') then Exit(True);
   Marker := Pos('.so', LowerBase);
   Result := (Marker > 0) and
     ((Marker + 2 = Length(LowerBase)) or
@@ -188,7 +194,7 @@ begin
   AOptions.Sysroot := '';
   AOptions.ResourceDir := '';
   AOptions.DynamicLinker := '';
-  AOptions.TargetTriple := RCCTargetTriple;
+  AOptions.TargetTriple := NativeTargetDescriptor.Triple;
   AOptions.TargetCPU := 'generic';
   AOptions.TargetFeatures := '';
   AOptions.OptimizationLevel := 1;

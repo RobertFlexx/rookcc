@@ -11,7 +11,14 @@
 /examples/*.out
 /tests/tmp/
 tests/
+!tests/
+tests/*
+!tests/target_format_matrix.py
+!tests/native_linker_driver_contract.py
+!tests/native_host_smoke.py
 
 /scripts/*
 !/scripts/build.sh
 !/scripts/install.sh
+!/scripts/package.sh
+!/scripts/package_test.sh

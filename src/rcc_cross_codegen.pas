@@ -26,7 +26,7 @@ procedure GenerateCrossIntegerObject(AProgram: TProgram;
 implementation
 
 uses
-  rcc_typeops, rcc_elf_image, rcc_object_model;
+  rcc_typeops, rcc_elf_image, rcc_object_model, rcc_object_writer;
 
 type
   TCrossFixupKind = (
@@ -65,13 +65,24 @@ type
   TCrossGlobal = record
     Name: string;
     Offset: LongInt;
+    Size: LongInt;
     CType: TCType;
     IsStatic: Boolean;
+  end;
+
+  TCrossStringLiteral = record
+    Value: string;
+    GlobalIndex: LongInt;
   end;
 
   TCrossGlobalFixup = record
     PatchOffset: LongInt;
     GlobalIndex: LongInt;
+  end;
+
+  TCrossExternalCall = record
+    Name: string;
+    PatchOffset: LongInt;
   end;
 
   TCrossIntegerBackend = class
@@ -85,7 +96,10 @@ type
     FFunctions: array of TCrossNamedLabel;
     FLocals: array of TCrossLocal;
     FGlobals: array of TCrossGlobal;
+    FStrings: array of TCrossStringLiteral;
     FGlobalFixups: array of TCrossGlobalFixup;
+    FExternalCalls: array of TCrossExternalCall;
+    FSyscallSites: TTargetSyscallSiteArray;
     FBreakLabels: array of LongInt;
     FContinueLabels: array of LongInt;
     FScopeDepth: LongInt;
@@ -106,6 +120,7 @@ type
     procedure ReserveFunctionLabels;
     procedure ResolveFixups;
     procedure AllocateGlobals;
+    function AddStringLiteral(const AValue: string): LongInt;
     function FindGlobal(const AName: string; out AIndex: LongInt;
       out AType: TCType): Boolean;
     procedure EmitGlobalAddress(AGlobalIndex: LongInt);
@@ -138,6 +153,7 @@ type
     procedure EmitJumpIfZero(ALabel: LongInt);
     procedure EmitJumpIfNonZero(ALabel: LongInt);
     procedure EmitCall(ALabel: LongInt);
+    procedure EmitExternalCall(const AName: string);
     procedure GenExpr(AExpression: TExpr);
     procedure GenAssignment(AExpression: TExpr);
     procedure GenIncDec(AExpression: TExpr; ADelta: LongInt;
@@ -256,6 +272,7 @@ begin
     SetLength(FGlobals, N + 1);
     FGlobals[N].Name := Global.Name;
     FGlobals[N].Offset := FData.Size;
+    FGlobals[N].Size := Size;
     FGlobals[N].CType := Global.CType;
     FGlobals[N].IsStatic := Global.IsStatic;
     Value := 0;
@@ -267,6 +284,30 @@ begin
     for J := 0 to Size - 1 do
       FData.Add8(Byte(QWord(Value) shr (J * 8)));
   end;
+end;
+
+function TCrossIntegerBackend.AddStringLiteral(
+  const AValue: string): LongInt;
+var
+  I, N, GlobalIndex: LongInt;
+begin
+  for I := 0 to High(FStrings) do
+    if FStrings[I].Value = AValue then
+      Exit(FStrings[I].GlobalIndex);
+  GlobalIndex := Length(FGlobals);
+  SetLength(FGlobals, GlobalIndex + 1);
+  FGlobals[GlobalIndex].Name := '__rcc_string_' +
+    IntToStr(Length(FStrings));
+  FGlobals[GlobalIndex].Offset := FData.Size;
+  FGlobals[GlobalIndex].Size := Length(AValue) + 1;
+  FGlobals[GlobalIndex].CType := MakeType(ctChar);
+  FGlobals[GlobalIndex].IsStatic := True;
+  FData.AddStringZ(AValue);
+  N := Length(FStrings);
+  SetLength(FStrings, N + 1);
+  FStrings[N].Value := AValue;
+  FStrings[N].GlobalIndex := GlobalIndex;
+  Result := GlobalIndex;
 end;
 
 function TCrossIntegerBackend.FindGlobal(const AName: string;
@@ -295,10 +336,20 @@ begin
   P := FText.Size;
   if FTarget.Architecture = archAArch64 then
   begin
-    EmitWord($D2800000);
-    EmitWord($F2A00000);
-    EmitWord($F2C00000);
-    EmitWord($F2E00000);
+    if FObjectMode and (FTarget.ObjectFormat = ofMachO64) then
+    begin
+      { Darwin uses the normal page/page-offset address materialization pair.
+        The Mach-O writer attaches ARM64_RELOC_PAGE21 and PAGEOFF12. }
+      EmitWord($90000000); { adrp x0, symbol@PAGE }
+      EmitWord($91000000); { add  x0, x0, symbol@PAGEOFF }
+    end
+    else
+    begin
+      EmitWord($D2800000);
+      EmitWord($F2A00000);
+      EmitWord($F2C00000);
+      EmitWord($F2E00000);
+    end;
   end
   else
   begin
@@ -929,6 +980,23 @@ begin
   begin EmitWord(EncodeRISCVJAL(1, 0)); AddFixup(P, ALabel, cfRISCVCall); end;
 end;
 
+procedure TCrossIntegerBackend.EmitExternalCall(const AName: string);
+var
+  N: LongInt;
+begin
+  if not FObjectMode then
+    raise ERCCError.Create(
+      'internal error: external cross call requested for an executable');
+  N := Length(FExternalCalls);
+  SetLength(FExternalCalls, N + 1);
+  FExternalCalls[N].Name := AName;
+  FExternalCalls[N].PatchOffset := FText.Size;
+  if FTarget.Architecture = archAArch64 then
+    EmitWord($94000000)
+  else
+    EmitWord(EncodeRISCVJAL(1, 0));
+end;
+
 procedure TCrossIntegerBackend.GenAssignment(AExpression: TExpr);
 var
   Offset, GlobalIndex: LongInt;
@@ -1015,12 +1083,21 @@ end;
 
 procedure TCrossIntegerBackend.GenExpr(AExpression: TExpr);
 var
-  I, Offset, GlobalIndex, FalseLabel, EndLabel, FunctionLabel: LongInt;
+  I, Offset, GlobalIndex, FalseLabel, EndLabel, FunctionLabel,
+    FixedArgumentCount, VariadicArgumentCount, SourceOffset,
+    DestinationOffset: LongInt;
   LocalType, OperationType: TCType;
-  UnsignedOperation: Boolean;
+  UnsignedOperation, DarwinVariadicCall: Boolean;
+  FunctionDeclaration: TFunction;
 begin
   if AExpression = nil then
   begin EmitLoadImmediate(0); Exit; end;
+  if AExpression.Kind = ekString then
+  begin
+    GlobalIndex := AddStringLiteral(AExpression.Text);
+    EmitGlobalAddress(GlobalIndex);
+    Exit;
+  end;
   RequireScalar(AExpression.CType, AExpression.Pos, 'cross-target expression');
   case AExpression.Kind of
     ekInteger: EmitLoadImmediate(AExpression.IntValue);
@@ -1114,20 +1191,64 @@ begin
         if AExpression.Text = '' then
           RaiseCompileError(AExpression.Pos,
             'cross-target function-pointer calls require the native x86 backend');
-        if Length(AExpression.Args) > 8 then
-          RaiseCompileError(AExpression.Pos,
-            'cross-target integer calls support up to eight register arguments');
+        FunctionDeclaration := FProgram.FindFunction(AExpression.Text);
+        DarwinVariadicCall :=
+          (FTarget.Architecture = archAArch64) and
+          (FTarget.OperatingSystem = osDarwin) and
+          (FunctionDeclaration <> nil) and FunctionDeclaration.IsVariadic;
+        if DarwinVariadicCall then
+        begin
+          FixedArgumentCount := Length(FunctionDeclaration.Params);
+          if FixedArgumentCount > 8 then
+            RaiseCompileError(AExpression.Pos,
+              'Darwin arm64 calls support up to eight fixed register arguments');
+          if FixedArgumentCount > Length(AExpression.Args) then
+            RaiseCompileError(AExpression.Pos,
+              'Darwin arm64 variadic call is missing a fixed argument');
+          if Length(AExpression.Args) > 32 then
+            RaiseCompileError(AExpression.Pos,
+              'Darwin arm64 variadic calls support up to 32 scalar arguments');
+        end
+        else
+        begin
+          FixedArgumentCount := Length(AExpression.Args);
+          if FixedArgumentCount > 8 then
+            RaiseCompileError(AExpression.Pos,
+              'cross-target integer calls support up to eight register arguments');
+        end;
         for I := High(AExpression.Args) downto 0 do
         begin
           GenExpr(AExpression.Args[I]);
           EmitPushResult;
         end;
-        for I := 0 to High(AExpression.Args) do EmitPopArgument(I);
+        for I := 0 to FixedArgumentCount - 1 do EmitPopArgument(I);
+        VariadicArgumentCount := Length(AExpression.Args) - FixedArgumentCount;
+        if DarwinVariadicCall and (VariadicArgumentCount > 1) then
+          for I := 1 to VariadicArgumentCount - 1 do
+          begin
+            { Apple arm64 places every variadic argument in consecutive stack
+              slots.  Expressions are initially staged in 16-byte slots so
+              SP remains aligned; compact them in place with x9 as scratch. }
+            SourceOffset := I * 16;
+            DestinationOffset := I * 8;
+            EmitWord($F94003E0 or
+              (LongWord(SourceOffset div 8) shl 10) or 9);
+            EmitWord($F90003E0 or
+              (LongWord(DestinationOffset div 8) shl 10) or 9);
+          end;
         FunctionLabel := FindFunctionLabel(AExpression.Text);
         if FunctionLabel < 0 then
-          RaiseCompileError(AExpression.Pos,
-            'undefined cross-target function ''' + AExpression.Text + '''');
-        EmitCall(FunctionLabel);
+        begin
+          if FObjectMode then EmitExternalCall(AExpression.Text)
+          else
+            RaiseCompileError(AExpression.Pos,
+              'undefined cross-target function ''' + AExpression.Text + '''');
+        end
+        else
+          EmitCall(FunctionLabel);
+        if DarwinVariadicCall and (VariadicArgumentCount > 0) then
+          EmitWord($910003FF or
+            (LongWord(VariadicArgumentCount * 16) shl 10));
         EmitNormalize(AExpression.CType);
       end;
     ekConditional:
@@ -1356,20 +1477,52 @@ end;
 
 procedure TCrossIntegerBackend.EmitStartup;
 var
-  MainLabel: LongInt;
+  MainLabel, SyscallRegister, N: LongInt;
+  SyscallNumber: LongWord;
 begin
   MainLabel := FindFunctionLabel('main');
   if MainLabel < 0 then
     raise ERCCError.Create('error: no main function was defined');
   EmitCall(MainLabel);
+  if not TargetSyscallNumber(FTarget, 'exit', SyscallNumber) then
+    raise ERCCError.Create('error: target has no direct exit system call ABI');
   if FTarget.Architecture = archAArch64 then
   begin
-    EmitWord($D2800BA8);
-    EmitWord($D4000001);
+    if FTarget.OperatingSystem = osNetBSD then
+    begin
+      N := Length(FSyscallSites);
+      SetLength(FSyscallSites, N + 1);
+      FSyscallSites[N].TextOffset := QWord(FText.Size);
+      FSyscallSites[N].Number := SyscallNumber;
+      EmitWord($D4000001 or ((SyscallNumber and $FFFF) shl 5));
+    end
+    else
+    begin
+      if SyscallNumber > $FFFF then
+        raise ERCCError.Create('error: AArch64 syscall number is too large');
+      EmitWord($D2800008 or (SyscallNumber shl 5));
+      N := Length(FSyscallSites);
+      SetLength(FSyscallSites, N + 1);
+      FSyscallSites[N].TextOffset := QWord(FText.Size);
+      FSyscallSites[N].Number := SyscallNumber;
+      EmitWord($D4000001);
+    end;
   end
   else
   begin
-    EmitWord(EncodeRISCVI(93, 0, 0, 17, $13));
+    case FTarget.OperatingSystem of
+      osLinux: SyscallRegister := 17;
+      osFreeBSD, osOpenBSD: SyscallRegister := 5;
+      osNetBSD: SyscallRegister := 31;
+    else
+      raise ERCCError.Create('error: target has no RISC-V syscall ABI');
+    end;
+    EmitWord(EncodeRISCVI(LongInt(SyscallNumber), 0, 0,
+      SyscallRegister, $13));
+    N := Length(FSyscallSites);
+    SetLength(FSyscallSites, N + 1);
+    FSyscallSites[N].TextOffset := QWord(FText.Size);
+    FSyscallSites[N].Number := SyscallNumber;
     EmitWord($00000073);
   end;
 end;
@@ -1405,7 +1558,7 @@ procedure TCrossIntegerBackend.WriteObject(const AFileName: string);
 var
   Obj: TObjectFile;
   TextIndex, DataIndex, DataSectionSymbol,
-    I, L, GlobalIndex: LongInt;
+    I, L, GlobalIndex, ExternalSymbol: LongInt;
   Binding: TObjectSymbolBinding;
 begin
   Obj := TObjectFile.Create(FTarget);
@@ -1431,7 +1584,7 @@ begin
       if FGlobals[I].IsStatic then
         Obj.AddSymbol(FGlobals[I].Name, osbLocal, ostObject, osvDefault,
           DataIndex, QWord(FGlobals[I].Offset),
-          QWord(StorageSize(FGlobals[I].CType)), True);
+          QWord(FGlobals[I].Size), True);
     Binding := osbGlobal;
     for I := 0 to High(FProgram.Functions) do
       if not FProgram.Functions[I].IsPrototype and
@@ -1446,11 +1599,25 @@ begin
       if not FGlobals[I].IsStatic then
         Obj.AddSymbol(FGlobals[I].Name, Binding, ostObject, osvDefault,
           DataIndex, QWord(FGlobals[I].Offset),
-          QWord(StorageSize(FGlobals[I].CType)), True);
+          QWord(FGlobals[I].Size), True);
     for I := 0 to High(FGlobalFixups) do
     begin
       GlobalIndex := FGlobalFixups[I].GlobalIndex;
-      if FTarget.Architecture = archAArch64 then
+      if (FTarget.Architecture = archAArch64) and
+         (FTarget.ObjectFormat = ofMachO64) then
+      begin
+        L := Obj.FindSymbol(FGlobals[GlobalIndex].Name);
+        if L < 0 then
+          raise ERCCError.Create(
+            'internal error: Mach-O global symbol was not emitted');
+        Obj.AddRelocation(TextIndex,
+          QWord(FGlobalFixups[I].PatchOffset), L,
+          orkPage21, 0, 0);
+        Obj.AddRelocation(TextIndex,
+          QWord(FGlobalFixups[I].PatchOffset + 4), L,
+          orkPageOffset12, 0, 0);
+      end
+      else if FTarget.Architecture = archAArch64 then
       begin
         Obj.AddRelocation(TextIndex,
           QWord(FGlobalFixups[I].PatchOffset), DataSectionSymbol,
@@ -1475,10 +1642,21 @@ begin
           orkArchitectureSpecific, 27, FGlobals[GlobalIndex].Offset);
       end;
     end;
+    for I := 0 to High(FExternalCalls) do
+    begin
+      ExternalSymbol := Obj.RequireUndefinedSymbol(FExternalCalls[I].Name,
+        ostFunction);
+      if FTarget.Architecture = archAArch64 then
+        Obj.AddRelocation(TextIndex, QWord(FExternalCalls[I].PatchOffset),
+          ExternalSymbol, orkCall, 283, 0)
+      else
+        Obj.AddRelocation(TextIndex, QWord(FExternalCalls[I].PatchOffset),
+          ExternalSymbol, orkCall, 17, 0);
+    end;
     Obj.Section(TextIndex).Data.Append(FText);
     Obj.Section(DataIndex).Data.Append(FData);
     Obj.Validate;
-    WriteELF64Relocatable(AFileName, Obj);
+    WriteRelocatableObject(AFileName, Obj);
   finally
     Obj.Free;
   end;
@@ -1499,7 +1677,8 @@ begin
   Layout := ComputeStaticELFLayout(FTarget, QWord(FText.Size),
     QWord(FData.Size), 0);
   ResolveGlobalFixups(Layout.DataAddress);
-  WriteStaticELF64Executable(AFileName, FTarget, FText, FData, 0);
+  WriteStaticELF64Executable(AFileName, FTarget, FText, FData, 0,
+    FSyscallSites);
   AStats.TextBytes := FText.Size;
   AStats.DataBytes := FData.Size;
   AStats.FunctionsEmitted := FFunctionsEmitted + 1;
