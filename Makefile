@@ -21,15 +21,21 @@ $(BIN): $(SOURCES) VERSION
 		-o"$(abspath $(BIN))" src/rcc.pas
 
 install: $(BIN)
-	install -Dm755 "$(BIN)" "$(DESTDIR)$(PREFIX)/bin/rcc"
-	install -Dm644 VERSION "$(RESOURCE_DIR)/VERSION"
+	install -d "$(DESTDIR)$(PREFIX)/bin"
+	install -m755 "$(BIN)" "$(DESTDIR)$(PREFIX)/bin/rcc"
+	install -d "$(RESOURCE_DIR)"
+	install -m644 VERSION "$(RESOURCE_DIR)/VERSION"
 	install -d "$(RESOURCE_DIR)/include"
 	cp -a include/. "$(RESOURCE_DIR)/include/"
 	find "$(RESOURCE_DIR)/include" -type f -exec chmod 0644 {} +
-	install -Dm644 man/rcc.1 "$(DESTDIR)$(PREFIX)/share/man/man1/rcc.1"
-	install -Dm644 completions/_rcc "$(DESTDIR)$(PREFIX)/share/zsh/site-functions/_rcc"
-	install -Dm644 completions/rcc.bash "$(DESTDIR)$(PREFIX)/share/bash-completion/completions/rcc"
-	install -Dm644 completions/rcc.fish "$(DESTDIR)$(PREFIX)/share/fish/vendor_completions.d/rcc.fish"
+	install -d "$(DESTDIR)$(PREFIX)/share/man/man1"
+	install -m644 man/rcc.1 "$(DESTDIR)$(PREFIX)/share/man/man1/rcc.1"
+	install -d "$(DESTDIR)$(PREFIX)/share/zsh/site-functions"
+	install -m644 completions/_rcc "$(DESTDIR)$(PREFIX)/share/zsh/site-functions/_rcc"
+	install -d "$(DESTDIR)$(PREFIX)/share/bash-completion/completions"
+	install -m644 completions/rcc.bash "$(DESTDIR)$(PREFIX)/share/bash-completion/completions/rcc"
+	install -d "$(DESTDIR)$(PREFIX)/share/fish/vendor_completions.d"
+	install -m644 completions/rcc.fish "$(DESTDIR)$(PREFIX)/share/fish/vendor_completions.d/rcc.fish"
 	install -d "$(DOC_DIR)"
 	install -m644 README.md LICENSE "$(DOC_DIR)/"
 	@if [ "$(INSTALL_ROOKCC)" = "1" ]; then \

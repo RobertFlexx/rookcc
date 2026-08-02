@@ -1,6 +1,8 @@
 #!/usr/bin/env sh
 set -eu
 
+cd "$(dirname "$0")/.."
+
 if [ "$(id -u)" -eq 0 ]; then default_prefix=/usr/local; else default_prefix=$HOME/.local; fi
 prefix=${PREFIX:-$default_prefix}
 install_rookcc=${INSTALL_ROOKCC:-1}
@@ -27,6 +29,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 command -v fpc >/dev/null 2>&1 || { echo 'error: free pascal is required to build rookcc from source' >&2; exit 127; }
+command -v make >/dev/null 2>&1 || { echo 'error: make is required to build rookcc from source' >&2; exit 127; }
 make
 make PREFIX="$prefix" INSTALL_ROOKCC="$install_rookcc" install
 case :$PATH: in *:"$prefix/bin":*) ;; *) printf '\nadd this to your shell profile\n  export PATH="%s/bin:$PATH"\n' "$prefix" ;; esac
