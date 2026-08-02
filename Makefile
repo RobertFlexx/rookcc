@@ -25,18 +25,32 @@ test-platform-support: test-target-formats test-native-driver test-native-host
 
 # Differential correctness: every program in tests/c must produce byte-identical
 # output under rcc and the reference compiler at every optimization level.
+# The corpus is a development tree extra and is not part of release archives,
+# so the target is a no-op when it is absent.
 test-c-differential: $(BIN)
-	python3 tests/c_differential.py "$(abspath $(BIN))"
+	@if [ -f tests/c_differential.py ]; then \
+	  python3 tests/c_differential.py "$(abspath $(BIN))"; \
+	else \
+	  printf 'skipping C differential suite: tests/c_differential.py not present\n'; \
+	fi
 
 # Cross correctness: freestanding programs are built for every supported
 # architecture and executed (under qemu-user where the host cannot run them),
 # and all targets must agree with the reference compiler. Targets whose
 # emulator is absent are skipped rather than failing the run.
 test-cross-differential: $(BIN)
-	python3 tests/cross_differential.py "$(abspath $(BIN))"
+	@if [ -f tests/cross_differential.py ]; then \
+	  python3 tests/cross_differential.py "$(abspath $(BIN))"; \
+	else \
+	  printf 'skipping cross differential suite: tests/cross_differential.py not present\n'; \
+	fi
 
 bench: $(BIN)
-	python3 bench/compare.py --rcc "$(abspath $(BIN))"
+	@if [ -f bench/compare.py ]; then \
+	  python3 bench/compare.py --rcc "$(abspath $(BIN))"; \
+	else \
+	  printf 'skipping benchmarks: bench/compare.py not present\n'; \
+	fi
 
 release-check: test package-check
 
