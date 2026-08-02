@@ -45,6 +45,8 @@ type
   TPreprocessor = class
   private
     FMacros: TMacroArray;
+    FMacroIndex: array of LongInt;
+    FMacroIndexDirty: Boolean;
     FIncludePaths: array of string;
     FConditions: array of TCondition;
     FIncludeDepth: LongInt;
@@ -58,6 +60,8 @@ type
     procedure AddLinkLibrary(const AName, AFileName: string; ALine: LongInt);
     procedure ProcessPragma(const AText, AFileName: string; ALine: LongInt);
     function FindMacro(const AName: string): LongInt;
+    procedure RebuildMacroIndex;
+    procedure MarkMacroIndexDirty;
     procedure DefineMacro(const AName, AValue: string);
     procedure DefineFunctionMacro(const AName, AValue: string;
       const AParamNames: array of string; AVariadic: Boolean);
@@ -70,7 +74,8 @@ type
       AAngled: Boolean): string;
     function IsBuiltinHeader(const AName: string): Boolean;
     function BuiltinHeaderText(const AName: string): string;
-    function ProcessFileInternal(const AFileName: string): string;
+    procedure ProcessFileInternal(const AFileName: string;
+      AOutput: TStringList);
   public
     constructor Create(const AIncludePaths, ADefines, AUndefines: array of string;
       AStandard: TCStandard);
@@ -86,6 +91,8 @@ type
     FIndex: LongInt;
     FLine: LongInt;
     FColumn: LongInt;
+    FTokenCount: LongInt;
+    FTokenCapacity: LongInt;
     function Current: Char;
     function Peek(AOffset: LongInt = 1): Char;
     procedure Advance;
@@ -118,6 +125,9 @@ type
     FOwnedFunctionParameterLists: array of PFunctionParameterList;
     FSwitchLabels: array of Int64;
     FSwitchHasDefault: Boolean;
+    { Records whether the storage class of the most recently parsed declaration
+      specifier list included `static`. }
+    FLastTypeWasStatic: Boolean;
     FInSwitch: LongInt;
     FBreakableDepth: LongInt;
     FContinueableDepth: LongInt;
@@ -403,13 +413,63 @@ begin
   AddLinkLibrary(LibraryName, AFileName, ALine);
 end;
 
+procedure TPreprocessor.MarkMacroIndexDirty;
+begin
+  FMacroIndexDirty := True;
+end;
+
+procedure TPreprocessor.RebuildMacroIndex;
+var
+  N, I: LongInt;
+
+  procedure QSort(ALo, AHi: LongInt);
+  var
+    I, J, Pivot, T: LongInt;
+    PN: string;
+  begin
+    I := ALo;
+    J := AHi;
+    Pivot := FMacroIndex[(ALo + AHi) shr 1];
+    PN := FMacros[Pivot].Name;
+    repeat
+      while FMacros[FMacroIndex[I]].Name < PN do Inc(I);
+      while FMacros[FMacroIndex[J]].Name > PN do Dec(J);
+      if I <= J then
+      begin
+        T := FMacroIndex[I];
+        FMacroIndex[I] := FMacroIndex[J];
+        FMacroIndex[J] := T;
+        Inc(I);
+        Dec(J);
+      end;
+    until I > J;
+    if ALo < J then QSort(ALo, J);
+    if I < AHi then QSort(I, AHi);
+  end;
+
+begin
+  N := Length(FMacros);
+  SetLength(FMacroIndex, N);
+  for I := 0 to N - 1 do FMacroIndex[I] := I;
+  if N > 1 then QSort(0, N - 1);
+  FMacroIndexDirty := False;
+end;
+
 function TPreprocessor.FindMacro(const AName: string): LongInt;
 var
-  I: LongInt;
+  Lo, Hi, Mid, Idx: LongInt;
 begin
-  for I := High(FMacros) downto 0 do
-    if FMacros[I].Name = AName then
-      Exit(I);
+  if FMacroIndexDirty then RebuildMacroIndex;
+  Lo := 0;
+  Hi := High(FMacroIndex);
+  while Lo <= Hi do
+  begin
+    Mid := (Lo + Hi) shr 1;
+    Idx := FMacroIndex[Mid];
+    if FMacros[Idx].Name = AName then Exit(Idx);
+    if FMacros[Idx].Name < AName then Lo := Mid + 1
+    else Hi := Mid - 1;
+  end;
   Result := -1;
 end;
 
@@ -434,6 +494,7 @@ begin
   FMacros[N].IsFunctionLike := False;
   SetLength(FMacros[N].ParamNames, 0);
   FMacros[N].HasVariadic := False;
+  MarkMacroIndexDirty;
 end;
 
 procedure TPreprocessor.DefineFunctionMacro(const AName, AValue: string;
@@ -449,6 +510,7 @@ begin
     SetLength(FMacros, N + 1);
     MacroIndex := N;
     FMacros[MacroIndex].Name := AName;
+    MarkMacroIndexDirty;
   end;
   FMacros[MacroIndex].Value := AValue;
   FMacros[MacroIndex].IsFunctionLike := True;
@@ -468,6 +530,7 @@ begin
   for J := I to High(FMacros) - 1 do
     FMacros[J] := FMacros[J + 1];
   SetLength(FMacros, Length(FMacros) - 1);
+  MarkMacroIndexDirty;
 end;
 
 function TPreprocessor.ExpandMacrosOnce(const ALine: string): string;
@@ -1277,7 +1340,8 @@ begin
   Result := '';
 end;
 
-function TPreprocessor.ProcessFileInternal(const AFileName: string): string;
+procedure TPreprocessor.ProcessFileInternal(const AFileName: string;
+  AOutput: TStringList);
 var
   Lines: TStringList;
   I, P, Q, N, SourceLine: LongInt;
@@ -1290,7 +1354,7 @@ var
   IsFuncLike, HasVariadic: Boolean;
 begin
   NormalizedFileName := ExpandFileName(AFileName);
-  if IsPragmaOnceFile(NormalizedFileName) then Exit('');
+  if IsPragmaOnceFile(NormalizedFileName) then Exit;
   AddDependency(NormalizedFileName);
   if FIncludeDepth >= 64 then
     raise ERCCError.Create('error: include nesting exceeds 64 files');
@@ -1298,7 +1362,6 @@ begin
   Lines := TStringList.Create;
   try
     Lines.LoadFromFile(NormalizedFileName);
-    Result := '';
     CurrentDir := ExtractFileDir(NormalizedFileName);
     InBlockComment := False;
     I := 0;
@@ -1522,13 +1585,13 @@ begin
           Resolved := ResolveInclude(IncludeName, CurrentDir, Angled);
           if (Resolved = '') and Angled and IsBuiltinHeader(IncludeName) then
           begin
-            Result := Result + BuiltinHeaderText(IncludeName) + LineEnding;
+            AOutput.Add(BuiltinHeaderText(IncludeName));
             Continue;
           end;
           if Resolved = '' then
             raise ERCCError.CreateFmt('%s: error: include file not found: %s',
               [AFileName, IncludeName]);
-          Result := Result + ProcessFileInternal(Resolved) + LineEnding;
+          ProcessFileInternal(Resolved, AOutput);
           Continue;
         end;
         if Directive = 'error' then
@@ -1544,38 +1607,37 @@ begin
         end;
         Continue;
       end;
-      if IsActive then
-      begin
-        ExpandedLine := ExpandMacros(Line);
-        while FMacroNeedsContinuation do
-        begin
-          if I >= Lines.Count then
-            raise ERCCError.CreateFmt(
-              '%s:%d: error: unterminated function-like macro invocation',
-              [AFileName, SourceLine]);
-          ContinuedLine := Lines[I];
-          while (Length(ContinuedLine) > 0) and
-            (ContinuedLine[Length(ContinuedLine)] = '\') and
-            (I + 1 < Lines.Count) do
+if IsActive then
           begin
-            Delete(ContinuedLine, Length(ContinuedLine), 1);
-            Inc(I);
-            ContinuedLine := ContinuedLine + Lines[I];
+            ExpandedLine := ExpandMacros(Line);
+            while FMacroNeedsContinuation do
+            begin
+              if I >= Lines.Count then
+                raise ERCCError.CreateFmt(
+                  '%s:%d: error: unterminated function-like macro invocation',
+                  [AFileName, SourceLine]);
+              ContinuedLine := Lines[I];
+              while (Length(ContinuedLine) > 0) and
+                (ContinuedLine[Length(ContinuedLine)] = '\') and
+                (I + 1 < Lines.Count) do
+              begin
+                Delete(ContinuedLine, Length(ContinuedLine), 1);
+                Inc(I);
+                ContinuedLine := ContinuedLine + Lines[I];
+              end;
+              Inc(I);
+              ContinuedLine := StripPreprocessingComments(ContinuedLine,
+                InBlockComment);
+              Rest := TrimLeft(ContinuedLine);
+              if (Rest <> '') and (Rest[1] = '#') then
+                raise ERCCError.CreateFmt(
+                  '%s:%d: error: preprocessing directive inside macro invocation',
+                  [AFileName, I]);
+              Line := Line + LineEnding + ContinuedLine;
+              ExpandedLine := ExpandMacros(Line);
+            end;
+            AOutput.Add('#line ' + IntToStr(SourceLine) + LineEnding + ExpandedLine);
           end;
-          Inc(I);
-          ContinuedLine := StripPreprocessingComments(ContinuedLine,
-            InBlockComment);
-          Rest := TrimLeft(ContinuedLine);
-          if (Rest <> '') and (Rest[1] = '#') then
-            raise ERCCError.CreateFmt(
-              '%s:%d: error: preprocessing directive inside macro invocation',
-              [AFileName, I]);
-          Line := Line + LineEnding + ContinuedLine;
-          ExpandedLine := ExpandMacros(Line);
-        end;
-        Result := Result + '#line ' + IntToStr(SourceLine) + LineEnding +
-          ExpandedLine + LineEnding;
-      end;
     end;
     if InBlockComment then
       raise ERCCError.Create(AFileName + ': error: unterminated block comment');
@@ -1586,9 +1648,17 @@ begin
 end;
 
 function TPreprocessor.ProcessFile(const AFileName: string): string;
+var
+  Output: TStringList;
 begin
   SetLength(FConditions, 0);
-  Result := ProcessFileInternal(ExpandFileName(AFileName));
+  Output := TStringList.Create;
+  try
+    ProcessFileInternal(ExpandFileName(AFileName), Output);
+    Result := Output.Text;
+  finally
+    Output.Free;
+  end;
   if Length(FConditions) <> 0 then
     raise ERCCError.Create(AFileName + ': error: unterminated conditional directive');
 end;
@@ -1983,16 +2053,19 @@ end;
 procedure TLexer.AddToken(var ATokens: TTokenArray; AKind: TTokenKind;
   const AText: string; AValue: Int64; AFloatValue: Double;
   const APos: TSourcePos);
-var
-  N: LongInt;
 begin
-  N := Length(ATokens);
-  SetLength(ATokens, N + 1);
-  ATokens[N].Kind := AKind;
-  ATokens[N].Text := AText;
-  ATokens[N].IntValue := AValue;
-  ATokens[N].FloatValue := AFloatValue;
-  ATokens[N].Pos := APos;
+  if FTokenCount >= FTokenCapacity then
+  begin
+    if FTokenCapacity = 0 then FTokenCapacity := 4096
+    else FTokenCapacity := FTokenCapacity * 2;
+    SetLength(ATokens, FTokenCapacity);
+  end;
+  ATokens[FTokenCount].Kind := AKind;
+  ATokens[FTokenCount].Text := AText;
+  ATokens[FTokenCount].IntValue := AValue;
+  ATokens[FTokenCount].FloatValue := AFloatValue;
+  ATokens[FTokenCount].Pos := APos;
+  Inc(FTokenCount);
 end;
 
 function TLexer.Tokenize: TTokenArray;
@@ -2017,6 +2090,8 @@ var
 
 begin
   SetLength(Result, 0);
+  FTokenCount := 0;
+  FTokenCapacity := 0;
   while True do
   begin
     SkipWhitespaceAndComments;
@@ -2129,6 +2204,7 @@ begin
       RaiseCompileError(P, 'unexpected character ''' + C + '''');
     end;
   end;
+  SetLength(Result, FTokenCount);
 end;
 
 
@@ -2716,11 +2792,13 @@ var
   ArrayLength: Int64;
   ElementType, ReturnValueType, ParamType: TCType;
   Expr: TExpr;
-  PointerDepth, FunctionPointerDepth, N: LongInt;
+  PointerDepth, FunctionPointerDepth, GroupedPointerDepth, N: LongInt;
   ParamName: string;
   ParamWasTypedef: Boolean;
   ParamList: PFunctionParameterList;
   FunctionVariadic: Boolean;
+  Dimensions: array of Int64;
+  DimensionCount, DimensionIndex: LongInt;
 begin
   AName := '';
   PointerDepth := CType.PointerDepth;
@@ -2733,6 +2811,7 @@ begin
 
 
 
+  GroupedPointerDepth := 0;
   if Match(tkLParen) then
   begin
     if Match(tkStar) then
@@ -2780,13 +2859,17 @@ begin
         CType.ParamTypes := ParamList;
         CType.ParamCount := Length(ParamList^.Items);
         CType.IsVariadic := FunctionVariadic;
-      end
-      else
-        Inc(CType.PointerDepth, FunctionPointerDepth);
-      Exit(True);
+        Exit(True);
+      end;
+      { In `int (*m)[3]` the grouped pointer applies to whatever the suffix
+        below builds, so the pointer level is added after the dimensions. }
+      GroupedPointerDepth := FunctionPointerDepth;
+    end
+    else
+    begin
+      ParseDeclarator(CType, AName);
+      Expect(tkRParen);
     end;
-    ParseDeclarator(CType, AName);
-    Expect(tkRParen);
   end
   else if At(tkIdentifier) then
   begin
@@ -2794,6 +2877,11 @@ begin
     Inc(FIndex);
   end;
 
+  { `int a[4][5]` is an array of 4 arrays of 5 ints, so the dimensions have to
+    be applied innermost-first: collect them left to right, then wrap in
+    reverse. }
+  DimensionCount := 0;
+  SetLength(Dimensions, 0);
   while Match(tkLBracket) do
   begin
     ArrayLength := 0;
@@ -2811,9 +2899,17 @@ begin
         RaiseCompileError(Current.Pos, 'array bound must not be negative');
     end;
     Expect(tkRBracket);
-    ElementType := CType;
-    CType := MakeArrayType(ElementType, ArrayLength);
+    if DimensionCount >= Length(Dimensions) then
+      SetLength(Dimensions, (DimensionCount + 1) * 2);
+    Dimensions[DimensionCount] := ArrayLength;
+    Inc(DimensionCount);
   end;
+  for DimensionIndex := DimensionCount - 1 downto 0 do
+  begin
+    ElementType := CType;
+    CType := MakeArrayType(ElementType, Dimensions[DimensionIndex]);
+  end;
+  Inc(CType.PointerDepth, GroupedPointerDepth);
 
   Result := True;
 end;
@@ -2875,6 +2971,7 @@ var
   end;
 begin
   AWasTypedef := False;
+  FLastTypeWasStatic := False;
   UnsignedSeen := False;
   SignedSeen := False;
   BaseSeen := False;
@@ -2897,7 +2994,10 @@ begin
       kwRestrict, kwExtern, kwAuto, kwRegister:
         Inc(FIndex);
       kwStatic:
-        Inc(FIndex);
+        begin
+          FLastTypeWasStatic := True;
+          Inc(FIndex);
+        end;
       kwInline:
         Inc(FIndex);
       kwTypedef:
@@ -3083,12 +3183,51 @@ begin
   if UnsignedSeen then Result.IsUnsigned := True;
 end;
 
+{ Trailing part of an abstract declarator, as used by sizeof, alignof and
+  casts: pointer stars followed by array bounds, e.g. `int *[4]`. }
 procedure TParser.ParsePointerTail(var CType: TCType);
+var
+  Dimensions: array of Int64;
+  DimensionCount, DimensionIndex: LongInt;
+  ArrayLength: Int64;
+  Expr: TExpr;
+  ElementType: TCType;
 begin
   while Match(tkStar) do
   begin
     Inc(CType.PointerDepth);
     while Current.Kind in [kwConst, kwVolatile, kwRestrict] do Inc(FIndex);
+  end;
+
+  DimensionCount := 0;
+  SetLength(Dimensions, 0);
+  while At(tkLBracket) do
+  begin
+    Inc(FIndex);
+    ArrayLength := 0;
+    if not At(tkRBracket) then
+    begin
+      Expr := ParseConditional;
+      try
+        if not EvaluateParserIntegerConstant(Expr, ArrayLength) then
+          RaiseCompileError(Expr.Pos,
+            'array bound must be an integer constant expression');
+      finally
+        Expr.Free;
+      end;
+      if ArrayLength < 0 then
+        RaiseCompileError(Current.Pos, 'array bound must not be negative');
+    end;
+    Expect(tkRBracket);
+    if DimensionCount >= Length(Dimensions) then
+      SetLength(Dimensions, (DimensionCount + 1) * 2);
+    Dimensions[DimensionCount] := ArrayLength;
+    Inc(DimensionCount);
+  end;
+  for DimensionIndex := DimensionCount - 1 downto 0 do
+  begin
+    ElementType := CType;
+    CType := MakeArrayType(ElementType, Dimensions[DimensionIndex]);
   end;
 end;
 
@@ -3404,6 +3543,7 @@ var
   CompoundExpr: TExpr;
   IntegerConstantValue: Int64;
   N: LongInt;
+  DesignatorName: string;
 begin
   Tok := Current;
   if At(kwGeneric) then Exit(ParseGenericSelection);
@@ -3472,7 +3612,16 @@ begin
     Result := TExpr.Create(ekCompoundLit, Tok.Pos);
     while not At(tkRBrace) and not At(tkEOF) do
     begin
-      CompoundExpr := ParseAssignment;
+      if Match(tkDot) then
+      begin
+        { Designated member initializer; sema resolves the name and reorders. }
+        DesignatorName := Expect(tkIdentifier, 'initializer member').Text;
+        Expect(tkAssign);
+        CompoundExpr := ParseAssignment;
+        CompoundExpr.Designator := DesignatorName;
+      end
+      else
+        CompoundExpr := ParseAssignment;
       N := Length(Result.Args);
       SetLength(Result.Args, N + 1);
       Result.Args[N] := CompoundExpr;
@@ -3973,7 +4122,7 @@ end;
 function TParser.ParseDeclarationStatement(AConsumeSemicolon: Boolean): TStmt;
 var
   Pos: TSourcePos;
-  WasTypedef: Boolean;
+  WasTypedef, DeclarationIsStatic: Boolean;
   BaseType, DeclType, ElementType: TCType;
   DeclName: string;
   Container, Decl: TStmt;
@@ -3998,7 +4147,7 @@ var
         MemberName := Expect(tkIdentifier, 'initializer member').Text;
         Expect(tkAssign);
         Item := ParseAssignment;
-        Item.Text := '.' + MemberName;
+        Item.Designator := MemberName;
       end
       else
         Item := ParseAssignment;
@@ -4014,6 +4163,7 @@ var
 begin
   Pos := Current.Pos;
   BaseType := ParseType(WasTypedef);
+  DeclarationIsStatic := FLastTypeWasStatic;
   Container := TStmt.Create(skBlock, Pos);
   Container.IsDeclarationGroup := True;
   try
@@ -4034,6 +4184,7 @@ begin
         Decl := TStmt.Create(skDecl, Pos);
         Decl.Name := DeclName;
         Decl.CType := DeclType;
+        Decl.IsStatic := DeclarationIsStatic;
         AddDeclaredType(DeclName, DeclType, FScopeDepth, False);
         Decl.Expr := ParseInitializer(DeclType);
 

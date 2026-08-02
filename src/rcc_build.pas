@@ -5,7 +5,7 @@ unit rcc_build;
 interface
 
 const
-  RCCVersion = '1.1.0';
+  RCCVersion = '1.2.0';
 {$if defined(CPUX86_64)}
   RCCBuildArchitecture = 'x86_64';
 {$elseif defined(CPUAARCH64) or defined(CPUARM64)}
@@ -47,7 +47,7 @@ implementation
 
 function RCCVersionNumber: LongWord;
 begin
-  Result := 101000;
+  Result := 102000;
 end;
 
 function RCCVersionText: string;

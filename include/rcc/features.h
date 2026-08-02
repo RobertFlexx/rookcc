@@ -1,7 +1,7 @@
 #ifndef _RCC_FEATURES_H
 #define _RCC_FEATURES_H 1
 
-#define __RCC_HEADER_VERSION__ 101000
+#define __RCC_HEADER_VERSION__ 102000
 #ifdef _GNU_SOURCE
 # define __RCC_USE_GNU 1
 # define __RCC_USE_MISC 1
@@ -24,8 +24,21 @@
 # endif
 #endif
 
+/* With no feature-test macro selected, and outside strict ISO mode, expose the
+   default set the platform headers normally offer. Ordinary programs include
+   <unistd.h> and expect the POSIX declarations to be there. */
+#if !defined(_GNU_SOURCE) && !defined(_RCC_SOURCE) && \
+    !defined(_DEFAULT_SOURCE) && !defined(_POSIX_SOURCE) && \
+    !defined(_POSIX_C_SOURCE) && !defined(_XOPEN_SOURCE) && \
+    !defined(__STRICT_ANSI__)
+# define _DEFAULT_SOURCE 1
+#endif
+
 #ifdef _DEFAULT_SOURCE
 # define __RCC_USE_MISC 1
+# ifndef _POSIX_C_SOURCE
+#  define _POSIX_C_SOURCE 200809L
+# endif
 #endif
 
 #ifdef _POSIX_SOURCE

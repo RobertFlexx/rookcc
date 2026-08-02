@@ -13,6 +13,9 @@ type
   TByteBuffer = class
   private
     FData: array of Byte;
+    FUsed: LongInt;
+    FCapacity: LongInt;
+    procedure Grow(ANeeded: LongInt);
   public
     function Size: LongInt;
     function ByteAt(AIndex: LongInt): Byte;
@@ -28,6 +31,8 @@ type
     procedure Patch16(AOffset: LongInt; V: Word);
     procedure Patch32(AOffset: LongInt; V: LongInt);
     procedure Patch64(AOffset: LongInt; V: QWord);
+    procedure DeleteBytes(AOffset, ACount: LongInt);
+    procedure InsertBytes(AOffset: LongInt; const A: array of Byte);
     procedure PadTo(ABoundary: LongInt);
     procedure Append(Other: TByteBuffer);
     procedure LoadFromFile(const AFileName: string);
@@ -36,30 +41,42 @@ type
 
 implementation
 
+procedure TByteBuffer.Grow(ANeeded: LongInt);
+var
+  NewCapacity: LongInt;
+begin
+  if FCapacity - FUsed >= ANeeded then Exit;
+  NewCapacity := FCapacity;
+  if NewCapacity < 256 then NewCapacity := 256;
+  while NewCapacity - FUsed < ANeeded do NewCapacity := NewCapacity * 2;
+  SetLength(FData, NewCapacity);
+  FCapacity := NewCapacity;
+end;
+
 function TByteBuffer.Size: LongInt;
 begin
-  Result := Length(FData);
+  Result := FUsed;
 end;
 
 function TByteBuffer.ByteAt(AIndex: LongInt): Byte;
 begin
-  if (AIndex < 0) or (AIndex >= Length(FData)) then
+  if (AIndex < 0) or (AIndex >= FUsed) then
     raise ERCCError.Create('internal error: byte index outside buffer');
   Result := FData[AIndex];
 end;
 
 procedure TByteBuffer.Clear;
 begin
+  FUsed := 0;
+  FCapacity := 0;
   SetLength(FData, 0);
 end;
 
 procedure TByteBuffer.Add8(V: Byte);
-var
-  N: LongInt;
 begin
-  N := Length(FData);
-  SetLength(FData, N + 1);
-  FData[N] := V;
+  Grow(1);
+  FData[FUsed] := V;
+  Inc(FUsed);
 end;
 
 procedure TByteBuffer.Add16(V: Word);
@@ -89,29 +106,35 @@ end;
 
 procedure TByteBuffer.AddBytes(const A: array of Byte);
 var
-  I: LongInt;
+  I, N: LongInt;
 begin
-  for I := Low(A) to High(A) do Add8(A[I]);
+  N := Length(A);
+  Grow(N);
+  for I := 0 to N - 1 do FData[FUsed + I] := A[I];
+  Inc(FUsed, N);
 end;
 
 procedure TByteBuffer.AddStringZ(const S: string);
 var
-  I: LongInt;
+  I, N: LongInt;
 begin
-  for I := 1 to Length(S) do Add8(Byte(Ord(S[I])));
-  Add8(0);
+  N := Length(S);
+  Grow(N + 1);
+  for I := 1 to N do FData[FUsed + I - 1] := Byte(Ord(S[I]));
+  FData[FUsed + N] := 0;
+  Inc(FUsed, N + 1);
 end;
 
 procedure TByteBuffer.Patch8(AOffset: LongInt; V: Byte);
 begin
-  if (AOffset < 0) or (AOffset >= Length(FData)) then
+  if (AOffset < 0) or (AOffset >= FUsed) then
     raise ERCCError.Create('internal error: patch offset outside code buffer');
   FData[AOffset] := V;
 end;
 
 procedure TByteBuffer.Patch16(AOffset: LongInt; V: Word);
 begin
-  if (AOffset < 0) or (AOffset + 1 >= Length(FData)) then
+  if (AOffset < 0) or (AOffset + 1 >= FUsed) then
     raise ERCCError.Create('internal error: patch offset outside code buffer');
   FData[AOffset] := Byte(V);
   FData[AOffset + 1] := Byte(V shr 8);
@@ -119,7 +142,7 @@ end;
 
 procedure TByteBuffer.Patch32(AOffset: LongInt; V: LongInt);
 begin
-  if (AOffset < 0) or (AOffset + 3 >= Length(FData)) then
+  if (AOffset < 0) or (AOffset + 3 >= FUsed) then
     raise ERCCError.Create('internal error: patch offset outside code buffer');
   FData[AOffset] := Byte(LongWord(V));
   FData[AOffset + 1] := Byte(LongWord(V) shr 8);
@@ -129,7 +152,7 @@ end;
 
 procedure TByteBuffer.Patch64(AOffset: LongInt; V: QWord);
 begin
-  if (AOffset < 0) or (AOffset + 7 >= Length(FData)) then
+  if (AOffset < 0) or (AOffset + 7 >= FUsed) then
     raise ERCCError.Create('internal error: patch offset outside code buffer');
   FData[AOffset] := Byte(V);
   FData[AOffset + 1] := Byte(V shr 8);
@@ -141,19 +164,50 @@ begin
   FData[AOffset + 7] := Byte(V shr 56);
 end;
 
+procedure TByteBuffer.DeleteBytes(AOffset, ACount: LongInt);
+var
+  I: LongInt;
+begin
+  if ACount = 0 then Exit;
+  if (AOffset < 0) or (ACount < 0) or (AOffset + ACount > FUsed) then
+    raise ERCCError.Create('internal error: delete range outside code buffer');
+  for I := AOffset to FUsed - ACount - 1 do
+    FData[I] := FData[I + ACount];
+  Dec(FUsed, ACount);
+end;
+
+procedure TByteBuffer.InsertBytes(AOffset: LongInt; const A: array of Byte);
+var
+  I, Count: LongInt;
+begin
+  Count := Length(A);
+  if Count = 0 then Exit;
+  if (AOffset < 0) or (AOffset > FUsed) then
+    raise ERCCError.Create('internal error: insert offset outside code buffer');
+  Grow(Count);
+  for I := FUsed - 1 downto AOffset do
+    FData[I + Count] := FData[I];
+  for I := 0 to Count - 1 do
+    FData[AOffset + I] := A[I];
+  Inc(FUsed, Count);
+end;
+
 procedure TByteBuffer.PadTo(ABoundary: LongInt);
 begin
   if ABoundary <= 0 then
     raise ERCCError.Create('internal error: invalid byte-buffer alignment');
-  while (Length(FData) mod ABoundary) <> 0 do Add8(0);
+  while (FUsed mod ABoundary) <> 0 do Add8(0);
 end;
 
 procedure TByteBuffer.Append(Other: TByteBuffer);
 var
-  I: LongInt;
+  I, N: LongInt;
 begin
   if Other = nil then Exit;
-  for I := 0 to Other.Size - 1 do Add8(Other.FData[I]);
+  N := Other.FUsed;
+  Grow(N);
+  for I := 0 to N - 1 do FData[FUsed + I] := Other.FData[I];
+  Inc(FUsed, N);
 end;
 
 procedure TByteBuffer.LoadFromFile(const AFileName: string);
@@ -163,7 +217,9 @@ begin
   Stream := TFileStream.Create(AFileName, fmOpenRead);
   try
     SetLength(FData, Stream.Size);
-    if Length(FData) > 0 then Stream.ReadBuffer(FData[0], Length(FData));
+    FUsed := Stream.Size;
+    FCapacity := Stream.Size;
+    if FUsed > 0 then Stream.ReadBuffer(FData[0], FUsed);
   finally
     Stream.Free;
   end;
@@ -175,8 +231,8 @@ var
 begin
   Stream := TFileStream.Create(AFileName, fmCreate);
   try
-    if Length(FData) > 0 then
-      Stream.WriteBuffer(FData[0], Length(FData));
+    if FUsed > 0 then
+      Stream.WriteBuffer(FData[0], FUsed);
   finally
     Stream.Free;
   end;

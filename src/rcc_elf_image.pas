@@ -29,13 +29,15 @@ procedure WriteStaticELF64Executable(const AFileName: string;
   AEntryOffset: QWord); overload;
 procedure WriteStaticELF64Executable(const AFileName: string;
   const ATarget: TTargetDescriptor; AText, AData: TByteBuffer;
-  AEntryOffset: QWord; const ASyscallSites: TTargetSyscallSiteArray); overload;
+  AEntryOffset: QWord; const ASyscallSites: TTargetSyscallSiteArray;
+  ABssSize: QWord = 0); overload;
 procedure WriteELF64Relocatable(const AFileName: string;
   AObject: TObjectFile);
 
 implementation
 
 const
+  RCCELFImageBssAlignment = QWord(16);
   EI_NIDENT = 16;
   ELFCLASS64 = 2;
   ELFDATA2LSB = 1;
@@ -136,11 +138,12 @@ end;
 
 procedure WriteStaticELF64Executable(const AFileName: string;
   const ATarget: TTargetDescriptor; AText, AData: TByteBuffer;
-  AEntryOffset: QWord; const ASyscallSites: TTargetSyscallSiteArray);
+  AEntryOffset: QWord; const ASyscallSites: TTargetSyscallSiteArray;
+  ABssSize: QWord);
 var
   Layout: TELFImageLayout;
   FileBuffer: TByteBuffer;
-  DataSize: QWord;
+  DataSize, DataMemorySize: QWord;
   I: LongInt;
   SiteAddress: QWord;
 begin
@@ -152,12 +155,23 @@ begin
   if AEntryOffset >= QWord(AText.Size) then
     raise ERCCError.Create('internal error: ELF entry is outside text');
   if AData = nil then DataSize := 0 else DataSize := QWord(AData.Size);
+  if ABssSize <> 0 then
+    DataMemorySize := AlignELF(DataSize, RCCELFImageBssAlignment) + ABssSize
+  else
+    DataMemorySize := DataSize;
   if (ATarget.OperatingSystem = osOpenBSD) and
      (Length(ASyscallSites) = 0) then
     raise ERCCError.Create(
       'internal error: OpenBSD executable has no syscall pinning sites');
+  { The layout is sized from the memory image so a pure zero-fill segment still
+    gets a program header, but the file only ever holds the initialized part. }
   Layout := ComputeStaticELFLayout(ATarget, QWord(AText.Size),
-    DataSize, AEntryOffset);
+    DataMemorySize, AEntryOffset);
+  if DataSize <> 0 then
+    Layout.FileSize := Layout.DataOffset + DataSize
+  else
+    Layout.FileSize := Layout.TextOffset + QWord(AText.Size);
+  Layout.SyscallTableOffset := AlignELF(Layout.FileSize, 4);
   FileBuffer := TByteBuffer.Create;
   try
     AddELFIdent(FileBuffer, ATarget);
@@ -179,10 +193,10 @@ begin
       0, ATarget.PreferredImageBase, ATarget.PreferredImageBase,
       Layout.TextOffset + QWord(AText.Size),
       Layout.TextOffset + QWord(AText.Size), ATarget.PageSize);
-    if DataSize <> 0 then
+    if DataMemorySize <> 0 then
       AddProgramHeader(FileBuffer, PT_LOAD, PF_R or PF_W,
         Layout.DataOffset, Layout.DataAddress, Layout.DataAddress,
-        DataSize, DataSize, ATarget.PageSize);
+        DataSize, DataMemorySize, ATarget.PageSize);
     AddProgramHeader(FileBuffer, PT_GNU_STACK, PF_R or PF_W,
       0, 0, 0, 0, 0, 16);
     if ATarget.OperatingSystem = osOpenBSD then
@@ -198,6 +212,7 @@ begin
       while QWord(FileBuffer.Size) < Layout.DataOffset do FileBuffer.Add8(0);
       FileBuffer.Append(AData);
     end;
+    { The zero-fill tail is described by the segment's memory size only. }
     if ATarget.OperatingSystem = osOpenBSD then
     begin
       while QWord(FileBuffer.Size) < Layout.SyscallTableOffset do

@@ -136,25 +136,26 @@ var
   I, N: LongInt;
 begin
   ADestination.MoveTypeStorageFrom(ASource);
+  N := Length(ADestination.Functions);
+  SetLength(ADestination.Functions, N + Length(ASource.Functions));
   for I := 0 to High(ASource.Functions) do
   begin
-    N := Length(ADestination.Functions);
-    SetLength(ADestination.Functions, N + 1);
-    ADestination.Functions[N] := ASource.Functions[I];
+    ADestination.Functions[N + I] := ASource.Functions[I];
     ASource.Functions[I] := nil;
   end;
+  N := Length(ADestination.Globals);
+  SetLength(ADestination.Globals, N + Length(ASource.Globals));
   for I := 0 to High(ASource.Globals) do
   begin
-    N := Length(ADestination.Globals);
-    SetLength(ADestination.Globals, N + 1);
-    ADestination.Globals[N] := ASource.Globals[I];
+    ADestination.Globals[N + I] := ASource.Globals[I];
     ASource.Globals[I] := nil;
   end;
+  N := Length(ADestination.StaticAssertions);
+  SetLength(ADestination.StaticAssertions,
+    N + Length(ASource.StaticAssertions));
   for I := 0 to High(ASource.StaticAssertions) do
   begin
-    N := Length(ADestination.StaticAssertions);
-    SetLength(ADestination.StaticAssertions, N + 1);
-    ADestination.StaticAssertions[N] := ASource.StaticAssertions[I];
+    ADestination.StaticAssertions[N + I] := ASource.StaticAssertions[I];
     ASource.StaticAssertions[I] := nil;
   end;
 end;
@@ -334,6 +335,7 @@ var
   BackendOptions, LinkOptions: TCompilerOptions;
   NativeLink: Boolean;
   GeneratedObjectFile, CodegenOutputFile: string;
+  PreprocTime, LexTime, ParseTime, VerifyUnitTime, MergeTime: QWord;
 begin
   Result := 1;
   TargetDescriptor := GetTargetOrRaise(AOptions.TargetTriple);
@@ -369,6 +371,11 @@ begin
     AOptions.ShowStats;
 
   StartTime := GetTickCount64;
+  PreprocTime := StartTime;
+  LexTime := StartTime;
+  ParseTime := StartTime;
+  VerifyUnitTime := StartTime;
+  MergeTime := StartTime;
   Includes := CombinedIncludePaths(AOptions);
   EffectiveDefines := BuildPredefinedMacros(AOptions.Standard,
     AOptions.Freestanding);
@@ -408,6 +415,7 @@ begin
         Continue;
       end;
 
+      PreprocTime := GetTickCount64;
       Lexer := TLexer.Create(Source, AOptions.Inputs[I]);
       try
         Tokens := Lexer.Tokenize;
@@ -415,6 +423,7 @@ begin
       finally
         Lexer.Free;
       end;
+      LexTime := GetTickCount64;
 
       if AOptions.EmitMode = emTokens then
       begin
@@ -424,12 +433,15 @@ begin
 
       Parser := TParser.Create(Tokens);
       try
+        ParseTime := GetTickCount64;
         UnitProgram := Parser.ParseProgram;
       finally
         Parser.Free;
       end;
       try
+        VerifyUnitTime := GetTickCount64;
         VerifyProgram(UnitProgram, 'frontend');
+        MergeTime := GetTickCount64;
         MergeProgram(ProgramAll, UnitProgram);
       finally
         UnitProgram.Free;
@@ -543,6 +555,11 @@ begin
     begin
       WriteLn(StdErr, 'stats');
       WriteLn(StdErr, '  frontend:       ', FrontTime - StartTime, ' ms');
+      WriteLn(StdErr, '    preprocess:   ', PreprocTime - StartTime, ' ms');
+      WriteLn(StdErr, '    lex:          ', LexTime - PreprocTime, ' ms');
+      WriteLn(StdErr, '    parse:        ', VerifyUnitTime - ParseTime, ' ms');
+      WriteLn(StdErr, '    verify:       ', MergeTime - VerifyUnitTime, ' ms');
+      WriteLn(StdErr, '    merge:        ', FrontTime - MergeTime, ' ms');
       WriteLn(StdErr, '  verification:   ', VerifyTime - FrontTime, ' ms');
       WriteLn(StdErr, '  optimization:   ', OptTime - VerifyTime, ' ms');
       WriteLn(StdErr, '  formal IR:      ', IRTime - OptTime, ' ms');
@@ -554,6 +571,10 @@ begin
       WriteLn(StdErr, '  opt passes:     ', OptStats.PassesRun);
       WriteLn(StdErr, '  expr visited:   ', OptStats.ExpressionsVisited);
       WriteLn(StdErr, '  stmt visited:   ', OptStats.StatementsVisited);
+      WriteLn(StdErr, '  constants prop: ', OptStats.ConstantsPropagated);
+      WriteLn(StdErr, '  loops unrolled: ', OptStats.LoopsUnrolled);
+      WriteLn(StdErr, '  strength red:   ', OptStats.StrengthReductions);
+      WriteLn(StdErr, '  hoisted exprs:  ', OptStats.ExpressionsHoisted);
       WriteLn(StdErr, '  IR functions:   ', Length(IRMetrics.Functions));
       WriteLn(StdErr, '  IR blocks:      ', IRMetrics.TotalBlocks);
       WriteLn(StdErr, '  IR instructions:', IRMetrics.TotalInstructions:8);

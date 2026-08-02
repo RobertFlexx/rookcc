@@ -2,6 +2,9 @@
 #define _STRING_H 1
 #include <rcc/features.h>
 #include <rcc/_types.h>
+#ifndef NULL
+#define NULL ((void *)0)
+#endif
 void *memcpy(void *destination, const void *source, size_t count);
 void *memmove(void *destination, const void *source, size_t count);
 void *memset(void *destination, int value, size_t count);

@@ -119,6 +119,9 @@ type
     ElementConst: Boolean;
     ElementPointerDepth: LongInt;
     ElementStructInfo: PStructMembers;
+    { Full element type for arrays. The flattened Element* fields above cannot
+      describe an array of arrays, so nested dimensions live here. }
+    ElementRef: Pointer;
   end;
   PCType = ^TCType;
 
@@ -213,6 +216,9 @@ type
     IsLValue: Boolean;
     IsFunctionDesignator: Boolean;
     IsBitField: Boolean;
+    { Member named by a designated initializer, kept apart from Text because a
+      string literal stores its own value there. }
+    Designator: string;
     BitOffset: LongInt;
     BitWidth: LongInt;
     BitStorageSize: LongInt;
@@ -266,6 +272,9 @@ type
     Children: TStmtArray;
     CaseValue: Int64;
     IsDeclarationGroup: Boolean;
+    { Set on a local declaration carrying the static storage class, which gives
+      it program lifetime instead of a stack slot. }
+    IsStatic: Boolean;
     AsmTemplate: string;
     AsmVolatile: Boolean;
     AsmGoto: Boolean;
@@ -662,6 +671,7 @@ begin
   Result.ElementConst := False;
   Result.ElementPointerDepth := 0;
   Result.ElementStructInfo := nil;
+  Result.ElementRef := nil;
 end;
 
 function TokenKindName(AKind: TTokenKind): string;
@@ -737,9 +747,25 @@ begin
     if A.ElementUnsigned <> B.ElementUnsigned then Exit(False);
     if A.ElementPointerDepth <> B.ElementPointerDepth then Exit(False);
     if A.ElementStructInfo <> B.ElementStructInfo then Exit(False);
+    if (A.ElementRef <> nil) or (B.ElementRef <> nil) then
+    begin
+      if (A.ElementRef = nil) or (B.ElementRef = nil) then Exit(False);
+      if not TypesEqual(PCType(A.ElementRef)^, PCType(B.ElementRef)^) then
+        Exit(False);
+    end;
   end;
   if (A.Kind in [ctStruct, ctUnion]) and
-    (A.StructInfo <> B.StructInfo) then Exit(False);
+    (A.StructInfo <> B.StructInfo) then
+  begin
+    { Each translation unit parses its own copy of a header, so the same tagged
+      type has a different record in every unit. Merged units must still see
+      those as one type. }
+    if (A.StructInfo = nil) or (B.StructInfo = nil) then Exit(False);
+    if A.StructInfo^.Name = '' then Exit(False);
+    if A.StructInfo^.Name <> B.StructInfo^.Name then Exit(False);
+    if A.StructInfo^.IsUnion <> B.StructInfo^.IsUnion then Exit(False);
+    if A.StructInfo^.Size <> B.StructInfo^.Size then Exit(False);
+  end;
   if A.Kind = ctFunction then
   begin
     if (A.ReturnType = nil) <> (B.ReturnType = nil) then Exit(False);
@@ -764,6 +790,7 @@ end;
 
 function ArrayElementType(const AType: TCType): TCType;
 begin
+  if AType.ElementRef <> nil then Exit(PCType(AType.ElementRef)^);
   Result := MakeType(AType.ElementKind, AType.ElementUnsigned,
     AType.ElementPointerDepth);
   Result.IsConst := AType.ElementConst;

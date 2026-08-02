@@ -16,6 +16,10 @@ type
     ExpressionsVisited: QWord;
     StatementsVisited: QWord;
     PassesRun: QWord;
+    ConstantsPropagated: QWord;
+    LoopsUnrolled: QWord;
+    StrengthReductions: QWord;
+    ExpressionsHoisted: QWord;
   end;
 
 procedure OptimizeProgram(AProgram: TProgram; ALevel: LongInt;
@@ -25,7 +29,7 @@ function DumpProgramIR(AProgram: TProgram): string;
 implementation
 
 uses
-  rcc_typeops;
+  rcc_typeops, rcc_ast_opt2;
 
 function IsInteger(E: TExpr; out V: Int64): Boolean;
 begin
@@ -454,6 +458,10 @@ begin
   Inc(ATotal.DeadStatementsRemoved, APass.DeadStatementsRemoved);
   Inc(ATotal.ExpressionsVisited, APass.ExpressionsVisited);
   Inc(ATotal.StatementsVisited, APass.StatementsVisited);
+  Inc(ATotal.ConstantsPropagated, APass.ConstantsPropagated);
+  Inc(ATotal.LoopsUnrolled, APass.LoopsUnrolled);
+  Inc(ATotal.StrengthReductions, APass.StrengthReductions);
+  Inc(ATotal.ExpressionsHoisted, APass.ExpressionsHoisted);
 end;
 
 function PassChanged(const AStats: TOptimizationStats): Boolean;
@@ -469,6 +477,7 @@ procedure OptimizeProgram(AProgram: TProgram; ALevel: LongInt;
 var
   I, Pass, MaximumPasses: LongInt;
   PassStats: TOptimizationStats;
+  AdvancedStats: TAdvancedASTOptStats;
 begin
   FillChar(AStats, SizeOf(AStats), 0);
   if AOptimizeSize and (ALevel < 2) then ALevel := 2;
@@ -486,6 +495,14 @@ begin
     Inc(AStats.PassesRun);
     if not PassChanged(PassStats) then Break;
   end;
+
+  FillChar(AdvancedStats, SizeOf(AdvancedStats), 0);
+  if ALevel >= 2 then RunASTPropagation(AProgram, ALevel, AdvancedStats);
+  if ALevel >= 3 then RunASTLoopOptimization(AProgram, ALevel, AdvancedStats);
+  AStats.ConstantsPropagated := AdvancedStats.ConstantsPropagated;
+  AStats.LoopsUnrolled := AdvancedStats.LoopsUnrolled;
+  AStats.StrengthReductions := AdvancedStats.StrengthReductions;
+  AStats.ExpressionsHoisted := AdvancedStats.ExpressionsHoisted;
 end;
 
 function ExprText(E: TExpr): string;

@@ -34,17 +34,27 @@ type
 
   TDynamicImportArray = array of TDynamicImport;
 
+const
+  RCCELFBssAlignment = QWord(16);
+
 function AlignELFValue(AValue, AAlignment: QWord): QWord;
 function ComputeELFExecutableLayout(ATextSize, ADataSize: QWord;
   AEntryTextOffset: QWord): TELFExecutableLayout;
+{ Size of the loaded data image before any .bss region. The backend needs this
+  to resolve addresses of zero-initialized objects, which live past the dynamic
+  linking metadata that this unit appends after the caller's data buffer. }
+function ELF64DataPayloadSize(AText, AData: TByteBuffer;
+  const AImports: TDynamicImportArray;
+  const ALibraries, ARunPaths: array of string; ABindNow: Boolean): QWord;
 procedure WriteELF64Executable(const AFileName: string; AText, AData: TByteBuffer;
-  AEntryTextOffset: QWord); overload;
+  AEntryTextOffset: QWord; ABssSize: QWord = 0); overload;
 procedure WriteELF64Executable(const AFileName: string; AText, AData: TByteBuffer;
-  AEntryTextOffset: QWord; const AImports: TDynamicImportArray); overload;
+  AEntryTextOffset: QWord; const AImports: TDynamicImportArray;
+  ABssSize: QWord = 0); overload;
 procedure WriteELF64Executable(const AFileName: string; AText, AData: TByteBuffer;
   AEntryTextOffset: QWord; const AImports: TDynamicImportArray;
   const ALibraries, ARunPaths: array of string; ABindNow: Boolean;
-  const AInterpreter: string); overload;
+  const AInterpreter: string; ABssSize: QWord = 0); overload;
 
 implementation
 
@@ -123,52 +133,33 @@ begin
   ABuffer.Add64(AValue);
 end;
 
-procedure WriteELF64Executable(const AFileName: string; AText, AData: TByteBuffer;
-  AEntryTextOffset: QWord);
-var
-  EmptyImports: TDynamicImportArray;
+function ELFOutputIsHosted(const AImports: TDynamicImportArray;
+  const ALibraries: array of string): Boolean;
 begin
-  SetLength(EmptyImports, 0);
-  WriteELF64Executable(AFileName, AText, AData, AEntryTextOffset, EmptyImports);
+  Result := (Length(AImports) <> 0) or (Length(ALibraries) <> 0);
 end;
 
-procedure WriteELF64Executable(const AFileName: string; AText, AData: TByteBuffer;
-  AEntryTextOffset: QWord; const AImports: TDynamicImportArray);
-var
-  DefaultLibraries, EmptyPaths: array of string;
-begin
-  SetLength(EmptyPaths, 0);
-  if Length(AImports) <> 0 then
-  begin
-    SetLength(DefaultLibraries, 1);
-    DefaultLibraries[0] := DefaultHostedLibrary;
-  end
-  else
-    SetLength(DefaultLibraries, 0);
-  WriteELF64Executable(AFileName, AText, AData, AEntryTextOffset, AImports,
-    DefaultLibraries, EmptyPaths, False, LinuxInterpreter);
-end;
-
-procedure WriteELF64Executable(const AFileName: string; AText, AData: TByteBuffer;
-  AEntryTextOffset: QWord; const AImports: TDynamicImportArray;
+{ Appends the dynamic linking metadata that follows the caller's data buffer.
+  Shared by the writer and by ELF64DataPayloadSize so the two can never
+  disagree about where the loaded data image ends. }
+procedure BuildELF64DataPayload(ADataPayload, ADynamicBuffer: TByteBuffer;
+  AText, AData: TByteBuffer; AEntryTextOffset: QWord;
+  const AImports: TDynamicImportArray;
   const ALibraries, ARunPaths: array of string; ABindNow: Boolean;
-  const AInterpreter: string);
+  out ADynamicOffset: QWord);
 var
   Layout: TELFExecutableLayout;
-  FileBuffer, DataPayload, DynamicBuffer: TByteBuffer;
-  I, ImportCount, ProgramHeaderCount: LongInt;
-  Hosted: Boolean;
-  InterpOffset, InterpVA, InterpSize: QWord;
+  I, ImportCount: LongInt;
   DynStrOffset, DynStrSize, DynSymOffset, HashOffset, RelaOffset,
-    DynamicOffset, RunPathOffset: QWord;
+    RunPathOffset: QWord;
   LibraryNameOffsets, SymbolNameOffsets: array of QWord;
   SymbolType: Byte;
   ChainValue: LongWord;
-  RunPath, Interpreter: string;
+  RunPath: string;
 
   procedure PadDataTo(AAlignment: LongInt);
   begin
-    DataPayload.PadTo(AAlignment);
+    ADataPayload.PadTo(AAlignment);
   end;
 
   function JoinRunPaths: string;
@@ -185,113 +176,182 @@ var
   end;
 
 begin
+  ADynamicOffset := 0;
+  ImportCount := Length(AImports);
+  ADataPayload.Append(AData);
+  if not ELFOutputIsHosted(AImports, ALibraries) then Exit;
+
+  PadDataTo(8);
+  DynStrOffset := QWord(ADataPayload.Size);
+  ADataPayload.Add8(0);
+  SetLength(LibraryNameOffsets, Length(ALibraries));
+  for I := 0 to High(ALibraries) do
+  begin
+    LibraryNameOffsets[I] := QWord(ADataPayload.Size) - DynStrOffset;
+    ADataPayload.AddStringZ(ALibraries[I]);
+  end;
+  SetLength(SymbolNameOffsets, ImportCount);
+  for I := 0 to ImportCount - 1 do
+  begin
+    SymbolNameOffsets[I] := QWord(ADataPayload.Size) - DynStrOffset;
+    ADataPayload.AddStringZ(AImports[I].Name);
+  end;
+  RunPath := JoinRunPaths;
+  RunPathOffset := 0;
+  if RunPath <> '' then
+  begin
+    RunPathOffset := QWord(ADataPayload.Size) - DynStrOffset;
+    ADataPayload.AddStringZ(RunPath);
+  end;
+  DynStrSize := QWord(ADataPayload.Size) - DynStrOffset;
+
+  PadDataTo(8);
+  DynSymOffset := QWord(ADataPayload.Size);
+  for I := 1 to 24 do ADataPayload.Add8(0);
+  for I := 0 to ImportCount - 1 do
+  begin
+    ADataPayload.Add32(LongWord(SymbolNameOffsets[I]));
+    if AImports[I].Kind = dikObject then SymbolType := STT_OBJECT
+    else SymbolType := STT_FUNC;
+    ADataPayload.Add8(Byte((STB_GLOBAL shl 4) or SymbolType));
+    ADataPayload.Add8(0);
+    ADataPayload.Add16(0);
+    ADataPayload.Add64(0);
+    ADataPayload.Add64(0);
+  end;
+
+  PadDataTo(8);
+  HashOffset := QWord(ADataPayload.Size);
+  ADataPayload.Add32(1);
+  ADataPayload.Add32(LongWord(ImportCount + 1));
+  if ImportCount > 0 then ADataPayload.Add32(1)
+  else ADataPayload.Add32(0);
+  ADataPayload.Add32(0);
+  for I := 1 to ImportCount do
+  begin
+    if I < ImportCount then ChainValue := LongWord(I + 1)
+    else ChainValue := 0;
+    ADataPayload.Add32(ChainValue);
+  end;
+
+  PadDataTo(8);
+  RelaOffset := QWord(ADataPayload.Size);
+  Layout := ComputeELFExecutableLayout(QWord(AText.Size),
+    QWord(ADataPayload.Size), AEntryTextOffset);
+  for I := 0 to ImportCount - 1 do
+  begin
+    ADataPayload.Add64(Layout.DataVA + AImports[I].GOTOffset);
+    ADataPayload.Add64((QWord(I + 1) shl 32) or R_X86_64_GLOB_DAT);
+    ADataPayload.Add64(0);
+  end;
+
+  PadDataTo(8);
+  ADynamicOffset := QWord(ADataPayload.Size);
+  Layout := ComputeELFExecutableLayout(QWord(AText.Size),
+    QWord(ADataPayload.Size), AEntryTextOffset);
+  for I := 0 to High(ALibraries) do
+    AddDynamicEntry(ADynamicBuffer, DT_NEEDED, LibraryNameOffsets[I]);
+  AddDynamicEntry(ADynamicBuffer, DT_HASH, Layout.DataVA + HashOffset);
+  AddDynamicEntry(ADynamicBuffer, DT_STRTAB, Layout.DataVA + DynStrOffset);
+  AddDynamicEntry(ADynamicBuffer, DT_SYMTAB, Layout.DataVA + DynSymOffset);
+  AddDynamicEntry(ADynamicBuffer, DT_STRSZ, DynStrSize);
+  AddDynamicEntry(ADynamicBuffer, DT_SYMENT, 24);
+  AddDynamicEntry(ADynamicBuffer, DT_RELA, Layout.DataVA + RelaOffset);
+  AddDynamicEntry(ADynamicBuffer, DT_RELASZ, QWord(ImportCount) * 24);
+  AddDynamicEntry(ADynamicBuffer, DT_RELAENT, 24);
+  if RunPath <> '' then
+    AddDynamicEntry(ADynamicBuffer, DT_RUNPATH, RunPathOffset);
+  if ABindNow then AddDynamicEntry(ADynamicBuffer, DT_BIND_NOW, 0);
+  AddDynamicEntry(ADynamicBuffer, DT_NULL, 0);
+  ADataPayload.Append(ADynamicBuffer);
+end;
+
+function ELF64DataPayloadSize(AText, AData: TByteBuffer;
+  const AImports: TDynamicImportArray;
+  const ALibraries, ARunPaths: array of string; ABindNow: Boolean): QWord;
+var
+  Payload, Dynamic: TByteBuffer;
+  DynamicOffset: QWord;
+begin
+  Payload := TByteBuffer.Create;
+  Dynamic := TByteBuffer.Create;
+  try
+    BuildELF64DataPayload(Payload, Dynamic, AText, AData, 0, AImports,
+      ALibraries, ARunPaths, ABindNow, DynamicOffset);
+    Result := QWord(Payload.Size);
+  finally
+    Payload.Free;
+    Dynamic.Free;
+  end;
+end;
+
+procedure WriteELF64Executable(const AFileName: string; AText, AData: TByteBuffer;
+  AEntryTextOffset: QWord; ABssSize: QWord);
+var
+  EmptyImports: TDynamicImportArray;
+begin
+  SetLength(EmptyImports, 0);
+  WriteELF64Executable(AFileName, AText, AData, AEntryTextOffset, EmptyImports,
+    ABssSize);
+end;
+
+procedure WriteELF64Executable(const AFileName: string; AText, AData: TByteBuffer;
+  AEntryTextOffset: QWord; const AImports: TDynamicImportArray;
+  ABssSize: QWord);
+var
+  DefaultLibraries, EmptyPaths: array of string;
+begin
+  SetLength(EmptyPaths, 0);
+  if Length(AImports) <> 0 then
+  begin
+    SetLength(DefaultLibraries, 1);
+    DefaultLibraries[0] := DefaultHostedLibrary;
+  end
+  else
+    SetLength(DefaultLibraries, 0);
+  WriteELF64Executable(AFileName, AText, AData, AEntryTextOffset, AImports,
+    DefaultLibraries, EmptyPaths, False, LinuxInterpreter, ABssSize);
+end;
+
+procedure WriteELF64Executable(const AFileName: string; AText, AData: TByteBuffer;
+  AEntryTextOffset: QWord; const AImports: TDynamicImportArray;
+  const ALibraries, ARunPaths: array of string; ABindNow: Boolean;
+  const AInterpreter: string; ABssSize: QWord);
+var
+  Layout: TELFExecutableLayout;
+  FileBuffer, DataPayload, DynamicBuffer: TByteBuffer;
+  I, ProgramHeaderCount: LongInt;
+  Hosted: Boolean;
+  InterpOffset, InterpVA, InterpSize: QWord;
+  DynamicOffset, DataMemorySize: QWord;
+  Interpreter: string;
+
+begin
   if (AText = nil) or (AData = nil) then
     raise ERCCError.Create('internal error: nil buffer passed to ELF writer');
 
-  Hosted := (Length(AImports) <> 0) or (Length(ALibraries) <> 0);
+  Hosted := ELFOutputIsHosted(AImports, ALibraries);
   Interpreter := AInterpreter;
   if Hosted and (Interpreter = '') then
     raise ERCCError.Create('error: hosted ELF output requires a dynamic linker');
-  ImportCount := Length(AImports);
   DataPayload := TByteBuffer.Create;
   DynamicBuffer := TByteBuffer.Create;
   FileBuffer := TByteBuffer.Create;
   try
-    DataPayload.Append(AData);
+    BuildELF64DataPayload(DataPayload, DynamicBuffer, AText, AData,
+      AEntryTextOffset, AImports, ALibraries, ARunPaths, ABindNow,
+      DynamicOffset);
 
+    if ABssSize <> 0 then
+      DataMemorySize := AlignELFValue(QWord(DataPayload.Size),
+        RCCELFBssAlignment) + ABssSize
+    else
+      DataMemorySize := QWord(DataPayload.Size);
 
-
-
-
-    if Hosted then
-    begin
-      PadDataTo(8);
-      DynStrOffset := QWord(DataPayload.Size);
-      DataPayload.Add8(0);
-      SetLength(LibraryNameOffsets, Length(ALibraries));
-      for I := 0 to High(ALibraries) do
-      begin
-        LibraryNameOffsets[I] := QWord(DataPayload.Size) - DynStrOffset;
-        DataPayload.AddStringZ(ALibraries[I]);
-      end;
-      SetLength(SymbolNameOffsets, ImportCount);
-      for I := 0 to ImportCount - 1 do
-      begin
-        SymbolNameOffsets[I] := QWord(DataPayload.Size) - DynStrOffset;
-        DataPayload.AddStringZ(AImports[I].Name);
-      end;
-      RunPath := JoinRunPaths;
-      RunPathOffset := 0;
-      if RunPath <> '' then
-      begin
-        RunPathOffset := QWord(DataPayload.Size) - DynStrOffset;
-        DataPayload.AddStringZ(RunPath);
-      end;
-      DynStrSize := QWord(DataPayload.Size) - DynStrOffset;
-
-      PadDataTo(8);
-      DynSymOffset := QWord(DataPayload.Size);
-      for I := 1 to 24 do DataPayload.Add8(0);
-      for I := 0 to ImportCount - 1 do
-      begin
-        DataPayload.Add32(LongWord(SymbolNameOffsets[I]));
-        if AImports[I].Kind = dikObject then SymbolType := STT_OBJECT
-        else SymbolType := STT_FUNC;
-        DataPayload.Add8(Byte((STB_GLOBAL shl 4) or SymbolType));
-        DataPayload.Add8(0);
-        DataPayload.Add16(0);
-        DataPayload.Add64(0);
-        DataPayload.Add64(0);
-      end;
-
-      PadDataTo(8);
-      HashOffset := QWord(DataPayload.Size);
-      DataPayload.Add32(1);
-      DataPayload.Add32(LongWord(ImportCount + 1));
-      if ImportCount > 0 then DataPayload.Add32(1)
-      else DataPayload.Add32(0);
-      DataPayload.Add32(0);
-      for I := 1 to ImportCount do
-      begin
-        if I < ImportCount then ChainValue := LongWord(I + 1)
-        else ChainValue := 0;
-        DataPayload.Add32(ChainValue);
-      end;
-
-      PadDataTo(8);
-      RelaOffset := QWord(DataPayload.Size);
-      Layout := ComputeELFExecutableLayout(QWord(AText.Size),
-        QWord(DataPayload.Size), AEntryTextOffset);
-      for I := 0 to ImportCount - 1 do
-      begin
-        DataPayload.Add64(Layout.DataVA + AImports[I].GOTOffset);
-        DataPayload.Add64((QWord(I + 1) shl 32) or R_X86_64_GLOB_DAT);
-        DataPayload.Add64(0);
-      end;
-
-      PadDataTo(8);
-      DynamicOffset := QWord(DataPayload.Size);
-      Layout := ComputeELFExecutableLayout(QWord(AText.Size),
-        QWord(DataPayload.Size), AEntryTextOffset);
-      for I := 0 to High(ALibraries) do
-        AddDynamicEntry(DynamicBuffer, DT_NEEDED, LibraryNameOffsets[I]);
-      AddDynamicEntry(DynamicBuffer, DT_HASH, Layout.DataVA + HashOffset);
-      AddDynamicEntry(DynamicBuffer, DT_STRTAB, Layout.DataVA + DynStrOffset);
-      AddDynamicEntry(DynamicBuffer, DT_SYMTAB, Layout.DataVA + DynSymOffset);
-      AddDynamicEntry(DynamicBuffer, DT_STRSZ, DynStrSize);
-      AddDynamicEntry(DynamicBuffer, DT_SYMENT, 24);
-      AddDynamicEntry(DynamicBuffer, DT_RELA, Layout.DataVA + RelaOffset);
-      AddDynamicEntry(DynamicBuffer, DT_RELASZ, QWord(ImportCount) * 24);
-      AddDynamicEntry(DynamicBuffer, DT_RELAENT, 24);
-      if RunPath <> '' then
-        AddDynamicEntry(DynamicBuffer, DT_RUNPATH, RunPathOffset);
-      if ABindNow then AddDynamicEntry(DynamicBuffer, DT_BIND_NOW, 0);
-      AddDynamicEntry(DynamicBuffer, DT_NULL, 0);
-      DataPayload.Append(DynamicBuffer);
-    end;
 
     Layout := ComputeELFExecutableLayout(QWord(AText.Size),
       QWord(DataPayload.Size), AEntryTextOffset);
+    if DataMemorySize <> 0 then Layout.HasData := True;
 
     if Hosted then ProgramHeaderCount := 5
     else
@@ -330,7 +390,7 @@ begin
         Layout.TextOffset + QWord(AText.Size),
         Layout.TextOffset + QWord(AText.Size), RCCELFPageSize);
       AddProgramHeader(FileBuffer, PT_LOAD, PF_R or PF_W, Layout.DataOffset,
-        Layout.DataVA, QWord(DataPayload.Size), QWord(DataPayload.Size),
+        Layout.DataVA, QWord(DataPayload.Size), DataMemorySize,
         RCCELFPageSize);
       AddProgramHeader(FileBuffer, PT_DYNAMIC, PF_R or PF_W,
         Layout.DataOffset + DynamicOffset, Layout.DataVA + DynamicOffset,
@@ -344,7 +404,7 @@ begin
         Layout.TextOffset + QWord(AText.Size), RCCELFPageSize);
       if Layout.HasData then
         AddProgramHeader(FileBuffer, PT_LOAD, PF_R or PF_W, Layout.DataOffset,
-          Layout.DataVA, QWord(DataPayload.Size), QWord(DataPayload.Size),
+          Layout.DataVA, QWord(DataPayload.Size), DataMemorySize,
           RCCELFPageSize);
       AddProgramHeader(FileBuffer, PT_GNU_STACK, PF_R or PF_W, 0, 0, 0, 0, 16);
     end;

@@ -1,5 +1,8 @@
 #ifndef _LOCALE_H
 #define _LOCALE_H 1
+#ifndef NULL
+#define NULL ((void *)0)
+#endif
 
 #define LC_CTYPE 0
 #define LC_NUMERIC 1

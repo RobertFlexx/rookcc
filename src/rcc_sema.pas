@@ -400,6 +400,104 @@ begin
   Result := EvaluateIntegerConstantExpression(E, AValue);
 end;
 
+function ScalarSlotCount(const AType: TCType): LongInt;
+var
+  I, Total, Slots: LongInt;
+  ElementType: TCType;
+begin
+  if IsArrayType(AType) then
+  begin
+    if AType.ArrayLength <= 0 then Exit(0);
+    ElementType := ElementTypeOf(AType);
+    Slots := ScalarSlotCount(ElementType);
+    Exit(LongInt(AType.ArrayLength) * Slots);
+  end;
+  if (AType.PointerDepth = 0) and (AType.Kind in [ctStruct, ctUnion]) then
+  begin
+    if AType.StructInfo = nil then Exit(1);
+    if AType.Kind = ctUnion then
+    begin
+      if Length(AType.StructInfo^.Members) = 0 then Exit(0);
+      Exit(ScalarSlotCount(PCType(AType.StructInfo^.Members[0].CType)^));
+    end;
+    Total := 0;
+    for I := 0 to High(AType.StructInfo^.Members) do
+      Inc(Total, ScalarSlotCount(PCType(AType.StructInfo^.Members[I].CType)^));
+    Exit(Total);
+  end;
+  Result := 1;
+end;
+
+function InitializesWholeSubObject(AItem: TExpr;
+  const ASubType: TCType): Boolean;
+begin
+  Result := False;
+  if AItem = nil then Exit;
+  if AItem.Kind = ekCompoundLit then Exit(True);
+  if (AItem.Kind = ekString) and IsArrayType(ASubType) then
+  begin
+    Result := ElementTypeOf(ASubType).Kind = ctChar;
+    Exit;
+  end;
+end;
+
+{ C permits brace elision, so a flat list may fill several sub-objects in
+  order. Regroup it into one initializer per sub-object so the backends only
+  ever see fully braced initializers. }
+procedure ElideSubObjectBraces(E: TExpr; const ASubType: TCType;
+  ASubObjectCount: LongInt);
+var
+  Items: TExprArray;
+  Grouped: TExprArray;
+  Cursor, Produced, Take, Consumed, PerObject: LongInt;
+  Group: TExpr;
+  NeedsElision: Boolean;
+begin
+  if not IsAggregateType(ASubType) then Exit;
+  if Length(E.Args) = 0 then Exit;
+  NeedsElision := False;
+  for Cursor := 0 to High(E.Args) do
+    if not InitializesWholeSubObject(E.Args[Cursor], ASubType) then
+    begin
+      NeedsElision := True;
+      Break;
+    end;
+  if not NeedsElision then Exit;
+
+  PerObject := ScalarSlotCount(ASubType);
+  if PerObject < 1 then PerObject := 1;
+  Items := E.Args;
+  SetLength(Grouped, 0);
+  Cursor := 0;
+  Produced := 0;
+  while (Cursor <= High(Items)) and
+        ((ASubObjectCount <= 0) or (Produced < ASubObjectCount)) do
+  begin
+    if InitializesWholeSubObject(Items[Cursor], ASubType) then
+    begin
+      SetLength(Grouped, Produced + 1);
+      Grouped[Produced] := Items[Cursor];
+      Inc(Cursor);
+    end
+    else
+    begin
+      Group := TExpr.Create(ekCompoundLit, Items[Cursor].Pos);
+      Group.CType := ASubType;
+      Take := PerObject;
+      if Take > (High(Items) - Cursor + 1) then
+        Take := High(Items) - Cursor + 1;
+      SetLength(Group.Args, Take);
+      for Consumed := 0 to Take - 1 do
+        Group.Args[Consumed] := Items[Cursor + Consumed];
+      Inc(Cursor, Take);
+      SetLength(Grouped, Produced + 1);
+      Grouped[Produced] := Group;
+    end;
+    Inc(Produced);
+  end;
+  E.Args := Grouped;
+end;
+
 procedure TSemanticAnalyzer.AnalyzeInitializer(E: TExpr;
   const AExpectedType: TCType);
 var
@@ -417,9 +515,10 @@ begin
     Exit;
   end;
 
-  if AExpectedType.Kind = ctArray then
+  if IsArrayType(AExpectedType) then
   begin
     ElementType := ElementTypeOf(AExpectedType);
+    ElideSubObjectBraces(E, ElementType, LongInt(AExpectedType.ArrayLength));
     for I := 0 to High(E.Args) do
       AnalyzeInitializer(E.Args[I], ElementType);
   end
@@ -434,10 +533,9 @@ begin
     begin
       Item := E.Args[I];
       MemberIndex := -1;
-      if (Item <> nil) and (Length(Item.Text) > 1) and
-        (Item.Text[1] = '.') then
+      if (Item <> nil) and (Item.Designator <> '') then
       begin
-        Designator := Copy(Item.Text, 2, MaxInt);
+        Designator := Item.Designator;
         for J := 0 to High(AExpectedType.StructInfo^.Members) do
           if AExpectedType.StructInfo^.Members[J].Name = Designator then
           begin
@@ -447,7 +545,7 @@ begin
         if MemberIndex < 0 then
           RaiseCompileError(Item.Pos,
             'unknown designated member ''' + Designator + '''');
-        Item.Text := '';
+        Item.Designator := '';
         NextIndex := MemberIndex + 1;
       end
       else

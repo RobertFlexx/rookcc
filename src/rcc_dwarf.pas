@@ -26,7 +26,7 @@ procedure AddDWARF4ObjectSections(AObject: TObjectFile;
 implementation
 
 uses
-  Classes, SysUtils, rcc_buffer;
+  Classes, SysUtils, rcc_buffer, rcc_build;
 
 const
   DWTagCompileUnit = QWord($11);
@@ -161,7 +161,7 @@ begin
   AddAttribute(Abbrev, DWAtExternal, DWFormFlag);
   Abbrev.AddBytes([0, 0, 0]);
 
-  ProducerOffset := AddDebugString(DebugStr, 'RookCC 1.1.0');
+  ProducerOffset := AddDebugString(DebugStr, 'RookCC ' + RCCVersion);
   SourceOffset := AddDebugString(DebugStr, Source);
   DirectoryOffset := AddDebugString(DebugStr, GetCurrentDir);
   SetLength(FunctionNameOffsets, Length(AFunctions));

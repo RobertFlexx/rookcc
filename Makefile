@@ -14,14 +14,29 @@ RESOURCE_DIR := $(DESTDIR)$(PREFIX)/share/rcc
 DOC_DIR := $(DESTDIR)$(PREFIX)/share/doc/rcc
 
 .PHONY: all test test-platform-support test-target-formats test-native-driver \
-	test-native-host package package-check release-check install install-rookcc \
-	uninstall clean
+	test-native-host test-c-differential test-cross-differential bench \
+	package package-check release-check install install-rookcc uninstall clean
 
 all: $(BIN)
 
-test: test-platform-support
+test: test-platform-support test-c-differential test-cross-differential
 
 test-platform-support: test-target-formats test-native-driver test-native-host
+
+# Differential correctness: every program in tests/c must produce byte-identical
+# output under rcc and the reference compiler at every optimization level.
+test-c-differential: $(BIN)
+	python3 tests/c_differential.py "$(abspath $(BIN))"
+
+# Cross correctness: freestanding programs are built for every supported
+# architecture and executed (under qemu-user where the host cannot run them),
+# and all targets must agree with the reference compiler. Targets whose
+# emulator is absent are skipped rather than failing the run.
+test-cross-differential: $(BIN)
+	python3 tests/cross_differential.py "$(abspath $(BIN))"
+
+bench: $(BIN)
+	python3 bench/compare.py --rcc "$(abspath $(BIN))"
 
 release-check: test package-check
 

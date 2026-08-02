@@ -7,7 +7,42 @@ the compiler is written in free pascal and builds into one native program
 
 once built rcc does its own preprocessing parsing type checking optimization machine code encoding and object writing. its x86 64 linux backend also writes and links executables directly
 
-when the selected target exactly matches the host architecture and operating system rcc also behaves as a normal compiler driver. on macos bsd and non x86 linux hosts it invokes the platform compiler driver only for the final sdk startup file and system library link. it never sends c source to that driver. full support for other advertised targets (riscv, aarch64, bsd, macos) is spotty, and experimental, but i can proudly say linux c development is pretty stable.
+when the selected target exactly matches the host architecture and operating system rcc also behaves as a normal compiler driver. on macos bsd and non x86 linux hosts it invokes the platform compiler driver only for the final sdk startup file and system library link. it never sends c source to that driver.
+
+what each backend supports
+--------------------------
+
+the x86-64 backend is the complete one. the aarch64 and riscv64 backends
+share the same frontend, type checking and optimizer, and cover the integer
+and pointer subset of c. every program in `tests/cross` is compiled for all
+three architectures and executed (under qemu-user for the non-host ones) on
+every `make test`, so the shared column below is verified, not claimed. this compiler is bullshit.
+please enjoy the source code i found and debugged (im not gonna write this all in one night, i found ts lost from time, i just ruled out bugs and fixed them so they compile so i can confidently commit)
+
+| feature | x86-64 | aarch64 / riscv64 |
+| --- | --- | --- |
+| integers, pointers, casts, all operators | yes | yes |
+| arrays incl. multidimensional, `&` `*` `[]` `.` `->` | yes | yes |
+| structs, unions, aggregate assignment and copies | yes | yes |
+| struct parameters and returns | yes | up to two words |
+| loops, `switch`, `goto`, `break`, `continue` | yes | yes |
+| function pointers, static dispatch tables | yes | yes |
+| more than eight arguments (stack passing) | yes | yes |
+| `static` locals, file-scope and zero-init data | yes | yes |
+| string literals and pointer initializers | yes | yes |
+| floating point | yes | not implemented |
+| bit-fields | yes | not implemented |
+| variadic function definitions | yes | not implemented |
+| inline assembly | yes | not implemented |
+| hosted libc linking | yes | freestanding only |
+
+anything in the "not implemented" rows is rejected with a diagnostic naming
+the feature. the cross backends never silently emit wrong code for something
+they cannot express.
+
+aarch64 and riscv64 executables are static and freestanding, so build them
+with `-ffreestanding`; for hosted programs emit an object with `-c` and link
+with a target toolchain.
 
 free pascal is only needed to build rcc from source. apple command line tools are required for native hosted macos executable links; bsd and non x86 linux hosted links use the system cc driver
 
@@ -26,6 +61,16 @@ run the portable format driver and native host release checks with
     make test
 
 the native host check compiles links and executes a formatted libc program, so release builds should run it on every advertised host architecture and operating system
+
+`make test` also runs the C differential suite, which builds every program in
+`tests/c` with rcc at -O0 -O1 -O2 -O3 and -Os and with a reference compiler,
+and requires the output to match byte for byte at every level, so a codegen
+regression fails the build
+
+compare generated code against the system compiler on runtime, binary size and
+compile time with
+
+    make bench
 
 validate reproducible source archives and their extracted build with
 
@@ -128,6 +173,6 @@ the license is mit
 im maintaining this huge project **myself**, and i can only do so much so fast.
 
 
-originally made with 3 people over the span of years for an educational reason.
+originally made with 3 people over the span of years for an educational/school reason.
 but it aims to be auditable, simple architecture, and cross-arch compilation.
 i did most of the work to get it working, and where it is now. (RobertFlexx)

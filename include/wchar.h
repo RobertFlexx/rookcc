@@ -2,6 +2,9 @@
 #define _WCHAR_H 1
 
 #include <rcc/_types.h>
+#ifndef NULL
+#define NULL ((void *)0)
+#endif
 
 typedef int wchar_t;
 typedef unsigned int wint_t;

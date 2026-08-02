@@ -34,6 +34,8 @@ function EvaluateIntegerConstantExpression(E: TExpr;
 implementation
 
 function MakeArrayType(const AElementType: TCType; ALength: Int64): TCType;
+var
+  Owned: PCType;
 begin
   Result := MakeType(ctArray);
   Result.ArrayLength := ALength;
@@ -42,12 +44,16 @@ begin
   Result.ElementConst := AElementType.IsConst;
   Result.ElementPointerDepth := AElementType.PointerDepth;
   Result.ElementStructInfo := AElementType.StructInfo;
+  New(Owned);
+  Owned^ := AElementType;
+  Result.ElementRef := Owned;
 end;
 
 function ElementTypeOf(const AType: TCType): TCType;
 begin
   if AType.Kind <> ctArray then
     raise ERCCError.Create('internal error: element type requested for non-array');
+  if AType.ElementRef <> nil then Exit(PCType(AType.ElementRef)^);
   Result := MakeType(AType.ElementKind, AType.ElementUnsigned,
     AType.ElementPointerDepth);
   Result.IsConst := AType.ElementConst;
@@ -62,16 +68,22 @@ end;
 
 function PointeeType(const AType: TCType): TCType;
 begin
+  { A decayed array is an array type carrying PointerDepth > 0, so the pointer
+    level must be peeled first; `int (*)[5]` points at `int[5]`, not at `int`. }
+  if AType.PointerDepth > 0 then
+  begin
+    Result := AType;
+    Dec(Result.PointerDepth);
+    Exit;
+  end;
   if AType.Kind = ctArray then Exit(ElementTypeOf(AType));
-  if AType.PointerDepth <= 0 then
-    raise ERCCError.Create('internal error: pointee type requested for non-pointer');
-  Result := AType;
-  Dec(Result.PointerDepth);
+  raise ERCCError.Create('internal error: pointee type requested for non-pointer');
 end;
 
 function DecayType(const AType: TCType): TCType;
 begin
-  if AType.Kind = ctArray then
+  { Only a real array object decays; `int (*)[3]` is already a pointer. }
+  if (AType.Kind = ctArray) and (AType.PointerDepth = 0) then
     Result := PointerTo(ElementTypeOf(AType))
   else if (AType.Kind = ctFunction) and (AType.PointerDepth = 0) then
   begin

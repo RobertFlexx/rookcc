@@ -15,13 +15,17 @@ implementation
 uses
   SysUtils, rcc_gnu_compat;
 
-procedure AppendToken(var ADestination: TTokenArray; const AToken: TToken);
-var
-  N: LongInt;
+procedure AppendToken(var ADestination: TTokenArray; var ACount,
+  ACapacity: LongInt; const AToken: TToken);
 begin
-  N := Length(ADestination);
-  SetLength(ADestination, N + 1);
-  ADestination[N] := AToken;
+  if ACount >= ACapacity then
+  begin
+    if ACapacity = 0 then ACapacity := 4096
+    else ACapacity := ACapacity * 2;
+    SetLength(ADestination, ACapacity);
+  end;
+  ADestination[ACount] := AToken;
+  Inc(ACount);
 end;
 
 function CanonicalKeywordKind(const ACanonical: string;
@@ -86,13 +90,15 @@ procedure NormalizeGNUTokens(var ATokens: TTokenArray;
   AStandard: TCStandard);
 var
   ResultTokens: TTokenArray;
-  I: LongInt;
+  I, Count, Capacity: LongInt;
   Canonical: string;
   Kind: TTokenKind;
   Token: TToken;
 begin
   if not IsGNUStandard(AStandard) then Exit;
   SetLength(ResultTokens, 0);
+  Count := 0;
+  Capacity := 0;
   I := 0;
   while I <= High(ATokens) do
   begin
@@ -127,12 +133,12 @@ begin
       Token.Text := Canonical;
     end;
 
-    AppendToken(ResultTokens, Token);
+    AppendToken(ResultTokens, Count, Capacity, Token);
     Inc(I);
   end;
 
-  if (Length(ResultTokens) = 0) or
-     (ResultTokens[High(ResultTokens)].Kind <> tkEOF) then
+  if (Count = 0) or
+     (ResultTokens[Count - 1].Kind <> tkEOF) then
   begin
     Token.Kind := tkEOF;
     Token.Text := '';
@@ -141,8 +147,9 @@ begin
     Token.Pos.FileName := '';
     Token.Pos.Line := 0;
     Token.Pos.Column := 0;
-    AppendToken(ResultTokens, Token);
+    AppendToken(ResultTokens, Count, Capacity, Token);
   end;
+  SetLength(ResultTokens, Count);
   ATokens := ResultTokens;
 end;
 

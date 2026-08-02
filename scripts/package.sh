@@ -19,7 +19,7 @@ ROOT_FILES=(
   .gitignore LICENSE Makefile README.md VERSION
 )
 ROOT_DIRECTORIES=(
-  completions examples include man scripts src tests
+  bench completions examples include man scripts src tests
 )
 
 copy_file() {

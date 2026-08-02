@@ -2,6 +2,9 @@
 #define _TIME_H 1
 #include <rcc/features.h>
 #include <rcc/_types.h>
+#ifndef NULL
+#define NULL ((void *)0)
+#endif
 #define CLOCKS_PER_SEC 1000000L
 #define CLOCK_REALTIME 0
 #define CLOCK_MONOTONIC 1
@@ -43,6 +46,10 @@ char *asctime(const struct tm *broken_down);
 char *ctime(const time_t *value);
 struct tm *gmtime(const time_t *value);
 struct tm *localtime(const time_t *value);
+struct tm *gmtime_r(const time_t *value, struct tm *result);
+struct tm *localtime_r(const time_t *value, struct tm *result);
+char *asctime_r(const struct tm *broken_down, char *buffer);
+char *ctime_r(const time_t *value, char *buffer);
 size_t strftime(char *buffer, size_t maximum, const char *format,
                 const struct tm *broken_down);
 #ifdef __RCC_USE_POSIX

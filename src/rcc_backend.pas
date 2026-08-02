@@ -17,16 +17,20 @@ type
     FixupsResolved: QWord;
   end;
 
-  TLabelSection = (lsUnbound, lsText, lsData);
+  TLabelSection = (lsUnbound, lsText, lsData, lsBss);
 
   TLabelInfo = record
     Section: TLabelSection;
     Offset: LongInt;
   end;
 
+  TRelFixupKind = (rfRel32, rfJmpNear, rfJccNear, rfJmpShort, rfJccShort);
+
   TFixup = record
     PatchOffset: LongInt;
     TargetLabel: LongInt;
+    Kind: TRelFixupKind;
+    Condition: Byte;
   end;
 
   TDataAddressFixup = record
@@ -104,10 +108,39 @@ type
       FTarget: TTargetDescriptor;
       FText: TByteBuffer;
       FData: TByteBuffer;
+      { Zero-initialized globals occupy no file bytes; they are reserved past
+        the end of the loaded data image. }
+      FBssSize: LongInt;
+      FBssBase: QWord;
+      { Tracks that rax already holds a value normalized to FRaxStateType.
+        Only valid while nothing else has been emitted since (the recorded
+        text size still matches) and no label has been bound in between. }
+      FRaxStateValid: Boolean;
+      FRaxStateOffset: LongInt;
+      FRaxStateType: TCType;
+      FRaxStateIsZero: Boolean;
+      FBlockStart: LongInt;
+      FLoopHeads: array of LongInt;
+      FLoopHeadCount: LongInt;
+      FStaticLocals: array of TNamedLabel;
+      FPlainPrintfChecked: Boolean;
+      FPlainPrintfSafe: Boolean;
+      FCurrentDeclPos: TSourcePos;
       FLabels: array of TLabelInfo;
+      FLabelCapacity: LongInt;
+      FLabelCount: LongInt;
       FFixups: array of TFixup;
+      FFixupCapacity: LongInt;
+      FFixupCount: LongInt;
       FDataAddressFixups: array of TDataAddressFixup;
+      FDataAddressFixupCapacity: LongInt;
+      FDataAddressFixupCount: LongInt;
       FFunctions: array of TNamedLabel;
+      FFunctionHashNames: array of string;
+      FFunctionHashValues: array of LongInt;
+      FFunctionHashSize: LongInt;
+      FFunctionHashCount: LongInt;
+      FFunctionHashBuilt: Boolean;
       FGlobals: array of TNamedLabel;
       FExternalDefinitions: array of TExternalDefinition;
       FExternalRelocations: array of TExternalRelocation;
@@ -141,16 +174,32 @@ type
       FSyscallSites: TTargetSyscallSiteArray;
 
     function AlignUp(V, A: QWord): QWord;
+    procedure GrowLabelList;
+    procedure GrowFixupList;
+    procedure GrowDataAddressFixupList;
+    procedure FunctionHashEnsureCapacity;
+    procedure FunctionHashInsert(const AName: string; AValue: LongInt);
+    function FunctionHashLookup(const AName: string): LongInt;
+    function FindFunctionLabel(const AName: string): LongInt;
     function NewLabel: LongInt;
     procedure BindTextLabel(ALabel: LongInt);
     procedure BindDataLabel(ALabel: LongInt);
-    procedure AddFixup(ALabel, APatchOffset: LongInt);
+    procedure BindBssLabel(ALabel: LongInt);
+    function ReserveBss(ASize, AAlignment: LongInt): LongInt;
+    function BssBaseOffset: QWord;
+    procedure AddFixup(ALabel, APatchOffset: LongInt;
+      AKind: TRelFixupKind = rfRel32; ACondition: Byte = 0);
     procedure AddDataAddressFixup(ALabel, APatchOffset: LongInt);
     procedure EmitRel32(ALabel: LongInt);
     procedure EmitCall(ALabel: LongInt);
     procedure EmitIndirectCall(ALabel: LongInt);
     procedure EmitJump(ALabel: LongInt);
     procedure EmitJcc(AConditionOpcode: Byte; ALabel: LongInt);
+    procedure AdjustTextOffsets(AFrom, ADelta: LongInt);
+    procedure RelaxJumps;
+    function InsertionKeepsShortJumps(AOffset, APad: LongInt): Boolean;
+    procedure AlignLoopHeads;
+    procedure NoteLoopHead(ALabel: LongInt);
     procedure ResolveFixups(ATextVA, ADataVA: QWord);
     function FindNamedLabel(const AList: array of TNamedLabel;
       const AName: string): LongInt;
@@ -181,6 +230,7 @@ type
     procedure EmitDirectSyscall(const AName: string);
 
     procedure EmitMovRaxImm(V: Int64);
+    procedure EmitMovRcxImm(V: Int64);
     procedure EmitMovR8Imm(V: QWord);
     procedure EmitPushRax;
     procedure EmitPopRcx;
@@ -191,9 +241,26 @@ type
     procedure EmitStoreGlobal(ALabel: LongInt);
     procedure EmitAddressGlobal(ALabel: LongInt);
     procedure EmitLoadAtRax(const AType: TCType);
+    procedure EmitLoadMemoryTyped(const AType: TCType; AModRM: Byte;
+      ADisplacement: LongInt; ALabel: LongInt);
+    procedure EmitLoadLocalTyped(AOffset: LongInt; const AType: TCType);
+    procedure EmitLoadGlobalTyped(ALabel: LongInt; const AType: TCType);
+    procedure EmitStoreMemoryTyped(const AType: TCType; AModRM: Byte;
+      ADisplacement: LongInt; ALabel: LongInt);
+    function TryResolveDirectTarget(E: TExpr;
+      out ALocalOffset, ALabel: LongInt): Boolean;
+    procedure EmitLoadDirectTarget(ALocalOffset, ALabel: LongInt;
+      const AType: TCType);
+    procedure EmitStoreDirectTarget(ALocalOffset, ALabel: LongInt;
+      const AType: TCType);
+    procedure NoteRaxNormalized(const AType: TCType);
+    procedure InvalidateRaxState;
+    function RaxAlreadyNormalized(const AType: TCType): Boolean;
+    function TryLoadOperandToRcx(E: TExpr; const ALocalType: TCType): Boolean;
     procedure EmitStoreRaxAtRcx(const AType: TCType);
     procedure EmitAddRaxImmediate(AValue: LongInt);
     procedure EmitScaleRax(AFactor: LongInt);
+    procedure EmitAddScaledRcxToRax(AScale: LongInt);
     procedure EmitLeaRsiData(ALabel: LongInt);
     procedure EmitNormalizeBool;
     procedure EmitNormalizeInteger(const AType: TCType);
@@ -226,6 +293,11 @@ type
     procedure PreallocateInitializerLiterals(AExpression: TExpr);
     function AddFloatLiteral(AValue: Double; const AType: TCType): LongInt;
     procedure AllocateGlobals;
+    procedure ReserveStaticLocals(S: TStmt);
+    function FindStaticLocalLabel(const AName: string): LongInt;
+    function ResolveNeededLibraryNames: rcc_types.TStringArray;
+    procedure PrepareBssBase(const ANeededNames: array of string);
+    function ConstantAddressLabel(AExpression: TExpr): LongInt;
     procedure EmitGlobalObject(const AType: TCType; AInitializer: TExpr;
       const APos: TSourcePos);
     procedure ReserveFunctionLabels;
@@ -316,7 +388,11 @@ type
     procedure GenExpr(E: TExpr);
     procedure GenExprAsFloating(E: TExpr; const ATargetType: TCType);
     procedure GenCondition(E: TExpr);
+    function TryEmitComparisonFlags(E: TExpr; out AJccOpcode: Byte): Boolean;
+    procedure GenBranch(E: TExpr; ATargetLabel: LongInt;
+      ABranchIfTrue: Boolean);
     function TryGenPlainPrintf(E: TExpr): Boolean;
+    function PlainPrintfIsSafe: Boolean;
     procedure GenAggregateABICall(E: TExpr; ACallee: TFunction;
       const AFunctionType: TCType);
     procedure GenAggregateReturn(E: TExpr);
@@ -419,15 +495,104 @@ begin
   FText.AddBytes([$0F, $05]);
 end;
 
-function TX64Backend.NewLabel: LongInt;
-var
-  N: LongInt;
+procedure TX64Backend.GrowLabelList;
 begin
-  N := Length(FLabels);
-  SetLength(FLabels, N + 1);
-  FLabels[N].Section := lsUnbound;
-  FLabels[N].Offset := -1;
-  Result := N;
+  if FLabelCount < FLabelCapacity then Exit;
+  if FLabelCapacity = 0 then FLabelCapacity := 1024
+  else FLabelCapacity := FLabelCapacity * 2;
+  SetLength(FLabels, FLabelCapacity);
+end;
+
+procedure TX64Backend.GrowFixupList;
+begin
+  if FFixupCount < FFixupCapacity then Exit;
+  if FFixupCapacity = 0 then FFixupCapacity := 2048
+  else FFixupCapacity := FFixupCapacity * 2;
+  SetLength(FFixups, FFixupCapacity);
+end;
+
+procedure TX64Backend.GrowDataAddressFixupList;
+begin
+  if FDataAddressFixupCount < FDataAddressFixupCapacity then Exit;
+  if FDataAddressFixupCapacity = 0 then FDataAddressFixupCapacity := 1024
+  else FDataAddressFixupCapacity := FDataAddressFixupCapacity * 2;
+  SetLength(FDataAddressFixups, FDataAddressFixupCapacity);
+end;
+
+procedure TX64Backend.FunctionHashEnsureCapacity;
+var
+  OldNames: array of string;
+  OldValues: array of LongInt;
+  OldSize, I, J, K: LongInt;
+begin
+  if FFunctionHashSize = 0 then FFunctionHashSize := 1024;
+  while FFunctionHashCount * 2 > FFunctionHashSize do
+    FFunctionHashSize := FFunctionHashSize * 2;
+  OldSize := Length(FFunctionHashNames);
+  if OldSize >= FFunctionHashSize then Exit;
+  OldNames := FFunctionHashNames;
+  OldValues := FFunctionHashValues;
+  SetLength(FFunctionHashNames, 0);
+  SetLength(FFunctionHashValues, 0);
+  SetLength(FFunctionHashNames, FFunctionHashSize);
+  SetLength(FFunctionHashValues, FFunctionHashSize);
+  FFunctionHashCount := 0;
+  for I := 0 to OldSize - 1 do
+    if OldNames[I] <> '' then
+    begin
+      K := 2166136261 + Ord(OldNames[I][1]);
+      for J := 2 to Length(OldNames[I]) do
+        K := (K xor Ord(OldNames[I][J])) * 16777619;
+      K := K and (FFunctionHashSize - 1);
+      while FFunctionHashNames[K] <> '' do
+        K := (K + 1) and (FFunctionHashSize - 1);
+      FFunctionHashNames[K] := OldNames[I];
+      FFunctionHashValues[K] := OldValues[I];
+      Inc(FFunctionHashCount);
+    end;
+end;
+
+procedure TX64Backend.FunctionHashInsert(const AName: string; AValue: LongInt);
+var
+  K, J: LongInt;
+begin
+  FunctionHashEnsureCapacity;
+  K := 2166136261 + Ord(AName[1]);
+  for J := 2 to Length(AName) do
+    K := (K xor Ord(AName[J])) * 16777619;
+  K := K and (FFunctionHashSize - 1);
+  while FFunctionHashNames[K] <> '' do
+    K := (K + 1) and (FFunctionHashSize - 1);
+  FFunctionHashNames[K] := AName;
+  FFunctionHashValues[K] := AValue;
+  Inc(FFunctionHashCount);
+end;
+
+function TX64Backend.FunctionHashLookup(const AName: string): LongInt;
+var
+  K, J: LongInt;
+begin
+  Result := -1;
+  if FFunctionHashSize = 0 then Exit;
+  K := 2166136261 + Ord(AName[1]);
+  for J := 2 to Length(AName) do
+    K := (K xor Ord(AName[J])) * 16777619;
+  K := K and (FFunctionHashSize - 1);
+  while FFunctionHashNames[K] <> '' do
+  begin
+    if FFunctionHashNames[K] = AName then
+      Exit(FFunctionHashValues[K]);
+    K := (K + 1) and (FFunctionHashSize - 1);
+  end;
+end;
+
+function TX64Backend.NewLabel: LongInt;
+begin
+  Result := FLabelCount;
+  GrowLabelList;
+  FLabels[Result].Section := lsUnbound;
+  FLabels[Result].Offset := -1;
+  Inc(FLabelCount);
 end;
 
 procedure TX64Backend.BindTextLabel(ALabel: LongInt);
@@ -436,6 +601,53 @@ begin
     raise ERCCError.Create('internal error: label bound twice');
   FLabels[ALabel].Section := lsText;
   FLabels[ALabel].Offset := FText.Size;
+  { Control can reach this point from elsewhere, so nothing is known about
+    what the preceding instruction left in rax. }
+  FBlockStart := FText.Size;
+  FRaxStateValid := False;
+end;
+
+procedure TX64Backend.InvalidateRaxState;
+begin
+  FRaxStateValid := False;
+  FRaxStateIsZero := False;
+end;
+
+procedure TX64Backend.NoteRaxNormalized(const AType: TCType);
+begin
+  FRaxStateIsZero := False;
+  if IsPointerType(AType) or not IsIntegerType(AType) then
+  begin
+    FRaxStateValid := False;
+    Exit;
+  end;
+  FRaxStateValid := True;
+  FRaxStateOffset := FText.Size;
+  FRaxStateType := AType;
+end;
+
+function TX64Backend.RaxAlreadyNormalized(const AType: TCType): Boolean;
+var
+  RecordedSize, WantedSize: LongInt;
+begin
+  Result := False;
+  if not FRaxStateValid then Exit;
+  { Any later emission moves the text size, which invalidates the note without
+    every emitter having to clear it explicitly. }
+  if FRaxStateOffset <> FText.Size then Exit;
+  if FRaxStateOffset < FBlockStart then Exit;
+  if IsPointerType(AType) or not IsIntegerType(AType) then Exit;
+  { Zero is already the normalized representation at every integer type. }
+  if FRaxStateIsZero then Exit(True);
+  RecordedSize := StorageSize(FRaxStateType);
+  WantedSize := StorageSize(AType);
+  if RecordedSize = WantedSize then
+    Exit(FRaxStateType.IsUnsigned = AType.IsUnsigned);
+  if RecordedSize > WantedSize then Exit;
+  { A zero-extended narrower value is already valid at any wider type; a
+    sign-extended one only stays valid while the wider type is also signed. }
+  if FRaxStateType.IsUnsigned then Exit(True);
+  Result := not AType.IsUnsigned;
 end;
 
 procedure TX64Backend.BindDataLabel(ALabel: LongInt);
@@ -446,24 +658,47 @@ begin
   FLabels[ALabel].Offset := FData.Size;
 end;
 
-procedure TX64Backend.AddFixup(ALabel, APatchOffset: LongInt);
-var
-  N: LongInt;
+procedure TX64Backend.BindBssLabel(ALabel: LongInt);
 begin
-  N := Length(FFixups);
-  SetLength(FFixups, N + 1);
-  FFixups[N].PatchOffset := APatchOffset;
-  FFixups[N].TargetLabel := ALabel;
+  if FLabels[ALabel].Section <> lsUnbound then
+    raise ERCCError.Create('internal error: label bound twice');
+  FLabels[ALabel].Section := lsBss;
+  FLabels[ALabel].Offset := FBssSize;
+end;
+
+function TX64Backend.ReserveBss(ASize, AAlignment: LongInt): LongInt;
+begin
+  if AAlignment < 1 then AAlignment := 1;
+  while (FBssSize mod AAlignment) <> 0 do Inc(FBssSize);
+  Result := FBssSize;
+  if ASize < 0 then
+    raise ERCCError.Create('internal error: negative zero-fill reservation');
+  Inc(FBssSize, ASize);
+end;
+
+function TX64Backend.BssBaseOffset: QWord;
+begin
+  if FBssBase <> 0 then Exit(FBssBase);
+  Result := AlignUp(QWord(FData.Size), RCCELFBssAlignment);
+end;
+
+procedure TX64Backend.AddFixup(ALabel, APatchOffset: LongInt;
+  AKind: TRelFixupKind; ACondition: Byte);
+begin
+  GrowFixupList;
+  FFixups[FFixupCount].PatchOffset := APatchOffset;
+  FFixups[FFixupCount].TargetLabel := ALabel;
+  FFixups[FFixupCount].Kind := AKind;
+  FFixups[FFixupCount].Condition := ACondition;
+  Inc(FFixupCount);
 end;
 
 procedure TX64Backend.AddDataAddressFixup(ALabel, APatchOffset: LongInt);
-var
-  N: LongInt;
 begin
-  N := Length(FDataAddressFixups);
-  SetLength(FDataAddressFixups, N + 1);
-  FDataAddressFixups[N].PatchOffset := APatchOffset;
-  FDataAddressFixups[N].TargetLabel := ALabel;
+  GrowDataAddressFixupList;
+  FDataAddressFixups[FDataAddressFixupCount].PatchOffset := APatchOffset;
+  FDataAddressFixups[FDataAddressFixupCount].TargetLabel := ALabel;
+  Inc(FDataAddressFixupCount);
 end;
 
 procedure TX64Backend.EmitRel32(ALabel: LongInt);
@@ -488,16 +723,178 @@ begin
 end;
 
 procedure TX64Backend.EmitJump(ALabel: LongInt);
+var
+  P: LongInt;
 begin
   FText.Add8($E9);
-  EmitRel32(ALabel);
+  P := FText.Size;
+  FText.Add32(0);
+  AddFixup(ALabel, P, rfJmpNear);
 end;
 
 procedure TX64Backend.EmitJcc(AConditionOpcode: Byte; ALabel: LongInt);
+var
+  P: LongInt;
 begin
   FText.Add8($0F);
   FText.Add8(AConditionOpcode);
-  EmitRel32(ALabel);
+  P := FText.Size;
+  FText.Add32(0);
+  AddFixup(ALabel, P, rfJccNear, AConditionOpcode);
+end;
+
+procedure TX64Backend.AdjustTextOffsets(AFrom, ADelta: LongInt);
+var
+  I: LongInt;
+begin
+  for I := 0 to FLabelCount - 1 do
+    if (FLabels[I].Section = lsText) and (FLabels[I].Offset >= AFrom) then
+      Inc(FLabels[I].Offset, ADelta);
+  for I := 0 to FFixupCount - 1 do
+    if FFixups[I].PatchOffset >= AFrom then
+      Inc(FFixups[I].PatchOffset, ADelta);
+  for I := 0 to High(FGeneratedObjectRelocations) do
+    if (FGeneratedObjectRelocations[I].PatchSection = lsText) and
+       (FGeneratedObjectRelocations[I].PatchOffset >= AFrom) then
+      Inc(FGeneratedObjectRelocations[I].PatchOffset, ADelta);
+  for I := 0 to High(FExternalRelocations) do
+    if (FExternalRelocations[I].PatchSection = lsText) and
+       (FExternalRelocations[I].PatchOffset >= AFrom) then
+      Inc(FExternalRelocations[I].PatchOffset, ADelta);
+  for I := 0 to High(FSyscallSites) do
+    if LongInt(FSyscallSites[I].TextOffset) >= AFrom then
+      FSyscallSites[I].TextOffset :=
+        QWord(LongInt(FSyscallSites[I].TextOffset) + ADelta);
+end;
+
+procedure TX64Backend.NoteLoopHead(ALabel: LongInt);
+begin
+  if FOptions.OptimizeSize or (FOptions.OptimizationLevel < 2) then Exit;
+  if FLoopHeadCount >= Length(FLoopHeads) then
+    SetLength(FLoopHeads, (FLoopHeadCount + 1) * 2);
+  FLoopHeads[FLoopHeadCount] := ALabel;
+  Inc(FLoopHeadCount);
+end;
+
+procedure TX64Backend.RelaxJumps;
+var
+  I, OpcodeOffset, Shrink, DeleteAt, TargetOffset: LongInt;
+  NearDisp, ShortDisp: Int64;
+  Changed: Boolean;
+  L: TLabelInfo;
+begin
+  repeat
+    Changed := False;
+    for I := 0 to FFixupCount - 1 do
+    begin
+      if not (FFixups[I].Kind in [rfJmpNear, rfJccNear]) then Continue;
+      L := FLabels[FFixups[I].TargetLabel];
+      if L.Section <> lsText then Continue;
+      TargetOffset := L.Offset;
+      if FFixups[I].Kind = rfJmpNear then
+      begin
+        OpcodeOffset := FFixups[I].PatchOffset - 1;
+        if (OpcodeOffset < 0) or (FText.ByteAt(OpcodeOffset) <> $E9) then
+          raise ERCCError.Create('internal error: corrupt near jmp fixup');
+        NearDisp := Int64(TargetOffset) - (Int64(FFixups[I].PatchOffset) + 4);
+        if TargetOffset >= OpcodeOffset + 5 then
+          ShortDisp := NearDisp
+        else
+          ShortDisp := NearDisp + 3;
+        if (ShortDisp < -128) or (ShortDisp > 127) then Continue;
+        FText.Patch8(OpcodeOffset, $EB);
+        DeleteAt := OpcodeOffset + 2;
+        Shrink := 3;
+        FFixups[I].Kind := rfJmpShort;
+      end
+      else
+      begin
+        OpcodeOffset := FFixups[I].PatchOffset - 2;
+        if (OpcodeOffset < 0) or (FText.ByteAt(OpcodeOffset) <> $0F) or
+           (FText.ByteAt(OpcodeOffset + 1) <> FFixups[I].Condition) then
+          raise ERCCError.Create('internal error: corrupt near jcc fixup');
+        NearDisp := Int64(TargetOffset) - (Int64(FFixups[I].PatchOffset) + 4);
+        if TargetOffset >= OpcodeOffset + 6 then
+          ShortDisp := NearDisp
+        else
+          ShortDisp := NearDisp + 4;
+        if (ShortDisp < -128) or (ShortDisp > 127) then Continue;
+        FText.Patch8(OpcodeOffset, Byte(FFixups[I].Condition - $10));
+        DeleteAt := OpcodeOffset + 2;
+        Shrink := 4;
+        FFixups[I].Kind := rfJccShort;
+        FFixups[I].PatchOffset := OpcodeOffset + 1;
+      end;
+      FText.DeleteBytes(DeleteAt, Shrink);
+      { Offsets at or past the removed bytes are rewritten in place, so the
+        scan can carry on from here rather than restarting. }
+      AdjustTextOffsets(DeleteAt + Shrink, -Shrink);
+      Changed := True;
+    end;
+  until not Changed;
+end;
+
+{ Multi-byte no-ops, indexed by length. Padding inserted ahead of a loop head
+  is reached by fall-through, so it has to be executable. }
+function NopPadding(ALength: LongInt): TBytes;
+begin
+  case ALength of
+    1: Result := [$90];
+    2: Result := [$66, $90];
+    3: Result := [$0F, $1F, $00];
+    4: Result := [$0F, $1F, $40, $00];
+    5: Result := [$0F, $1F, $44, $00, $00];
+    6: Result := [$66, $0F, $1F, $44, $00, $00];
+    7: Result := [$0F, $1F, $80, $00, $00, $00, $00];
+    8: Result := [$0F, $1F, $84, $00, $00, $00, $00, $00];
+    9: Result := [$66, $0F, $1F, $84, $00, $00, $00, $00, $00];
+    10: Result := [$66, $66, $0F, $1F, $84, $00, $00, $00, $00, $00];
+    11: Result := [$66, $66, $66, $0F, $1F, $84, $00, $00, $00, $00, $00];
+  else
+    Result := nil;
+  end;
+end;
+
+{ True when growing the text at AOffset by APad keeps every already-shortened
+  branch inside its one-byte displacement. }
+function TX64Backend.InsertionKeepsShortJumps(AOffset, APad: LongInt): Boolean;
+var
+  I, Site, Target: LongInt;
+  Displacement: Int64;
+begin
+  for I := 0 to FFixupCount - 1 do
+  begin
+    if not (FFixups[I].Kind in [rfJmpShort, rfJccShort]) then Continue;
+    if FLabels[FFixups[I].TargetLabel].Section <> lsText then Continue;
+    Site := FFixups[I].PatchOffset + 1;
+    Target := FLabels[FFixups[I].TargetLabel].Offset;
+    if Site >= AOffset then Inc(Site, APad);
+    if Target >= AOffset then Inc(Target, APad);
+    Displacement := Int64(Target) - Int64(Site);
+    if (Displacement < -128) or (Displacement > 127) then Exit(False);
+  end;
+  Result := True;
+end;
+
+{ Pads loop entry points onto a 16-byte boundary. Runs after relaxation so the
+  padding is not invalidated by branches shrinking afterwards. }
+procedure TX64Backend.AlignLoopHeads;
+var
+  I, Offset, Pad: LongInt;
+  Padding: TBytes;
+begin
+  for I := 0 to FLoopHeadCount - 1 do
+  begin
+    if FLabels[FLoopHeads[I]].Section <> lsText then Continue;
+    Offset := FLabels[FLoopHeads[I]].Offset;
+    Pad := (16 - (Offset mod 16)) mod 16;
+    if (Pad = 0) or (Pad > 11) then Continue;
+    if not InsertionKeepsShortJumps(Offset, Pad) then Continue;
+    Padding := NopPadding(Pad);
+    if Padding = nil then Continue;
+    FText.InsertBytes(Offset, Padding);
+    AdjustTextOffsets(Offset, Pad);
+  end;
 end;
 
 procedure TX64Backend.ResolveFixups(ATextVA, ADataVA: QWord);
@@ -506,31 +903,59 @@ var
   TargetVA, NextVA: Int64;
   L: TLabelInfo;
   Disp: Int64;
+  DispSize: LongInt;
 begin
-  for I := 0 to High(FFixups) do
+  for I := 0 to FFixupCount - 1 do
   begin
     L := FLabels[FFixups[I].TargetLabel];
     if L.Section = lsUnbound then
       raise ERCCError.Create('internal error: unresolved backend label');
     if L.Section = lsText then TargetVA := Int64(ATextVA) + L.Offset
+    else if L.Section = lsBss then
+      TargetVA := Int64(ADataVA) + Int64(BssBaseOffset) + L.Offset
     else TargetVA := Int64(ADataVA) + L.Offset;
-    NextVA := Int64(ATextVA) + FFixups[I].PatchOffset + 4;
+    if FFixups[I].Kind in [rfJmpShort, rfJccShort] then DispSize := 1
+    else DispSize := 4;
+    NextVA := Int64(ATextVA) + FFixups[I].PatchOffset + DispSize;
     Disp := TargetVA - NextVA;
-    if (Disp < Low(LongInt)) or (Disp > High(LongInt)) then
-      raise ERCCError.Create('internal error: x86-64 relative relocation overflow');
-    FText.Patch32(FFixups[I].PatchOffset, LongInt(Disp));
+    if DispSize = 1 then
+    begin
+      if (Disp < -128) or (Disp > 127) then
+        raise ERCCError.Create('internal error: short jump displacement out of range');
+      FText.Patch8(FFixups[I].PatchOffset, Byte(LongWord(Disp) and $FF));
+    end
+    else
+    begin
+      if (Disp < Low(LongInt)) or (Disp > High(LongInt)) then
+        raise ERCCError.Create('internal error: x86-64 relative relocation overflow');
+      FText.Patch32(FFixups[I].PatchOffset, LongInt(Disp));
+    end;
     Inc(FStats.FixupsResolved);
   end;
-  for I := 0 to High(FDataAddressFixups) do
+  for I := 0 to FDataAddressFixupCount - 1 do
   begin
     L := FLabels[FDataAddressFixups[I].TargetLabel];
     if L.Section = lsUnbound then
       raise ERCCError.Create('internal error: unresolved data address label');
     if L.Section = lsText then TargetVA := Int64(ATextVA) + L.Offset
+    else if L.Section = lsBss then
+      TargetVA := Int64(ADataVA) + Int64(BssBaseOffset) + L.Offset
     else TargetVA := Int64(ADataVA) + L.Offset;
     FData.Patch64(FDataAddressFixups[I].PatchOffset, QWord(TargetVA));
     Inc(FStats.FixupsResolved);
   end;
+end;
+
+function TX64Backend.FindFunctionLabel(const AName: string): LongInt;
+var
+  I: LongInt;
+begin
+  if FFunctionHashSize = 0 then
+  begin
+    for I := 0 to High(FFunctions) do
+      FunctionHashInsert(FFunctions[I].Name, FFunctions[I].LabelID);
+  end;
+  Result := FunctionHashLookup(AName);
 end;
 
 function TX64Backend.FindNamedLabel(const AList: array of TNamedLabel;
@@ -573,7 +998,7 @@ var
 begin
   if ASymbolType <> ELF_STT_OBJECT then
   begin
-    Result := FindNamedLabel(FFunctions, AName);
+    Result := FindFunctionLabel(AName);
     if Result >= 0 then Exit;
   end;
   if ASymbolType <> ELF_STT_FUNC then
@@ -742,7 +1167,7 @@ var
     K, DefinitionCount: LongInt;
   begin
     if AName = '' then Exit;
-    if (FindNamedLabel(FFunctions, AName) >= 0) or
+    if (FindFunctionLabel(AName) >= 0) or
        (FindNamedLabel(FGlobals, AName) >= 0) then
     begin
       if AWeak then Exit;
@@ -781,7 +1206,7 @@ var
   var
     K: LongInt;
   begin
-    if (FindNamedLabel(FFunctions, AName) >= 0) or
+    if (FindFunctionLabel(AName) >= 0) or
        (FindNamedLabel(FGlobals, AName) >= 0) then Exit(True);
     for K := 0 to High(FRuntime) do
       if FRuntime[K].Name = AName then Exit(True);
@@ -1165,11 +1590,13 @@ var
 
   function LabelAddress(ALabel: LongInt): QWord;
   begin
-    if (ALabel < 0) or (ALabel > High(FLabels)) or
+    if (ALabel < 0) or (ALabel >= FLabelCount) or
        (FLabels[ALabel].Section = lsUnbound) then
       raise ERCCError.Create('internal error: unresolved external relocation label');
     if FLabels[ALabel].Section = lsText then
       Result := ATextVA + QWord(FLabels[ALabel].Offset)
+    else if FLabels[ALabel].Section = lsBss then
+      Result := ADataVA + BssBaseOffset + QWord(FLabels[ALabel].Offset)
     else
       Result := ADataVA + QWord(FLabels[ALabel].Offset);
   end;
@@ -1387,7 +1814,7 @@ var
   I: LongInt;
 begin
   AIndirect := False;
-  Result := FindNamedLabel(FFunctions, AName);
+  Result := FindFunctionLabel(AName);
   if Result >= 0 then Exit;
   Result := FindExternalDefinition(AName, ELF_STT_FUNC);
   if Result >= 0 then Exit;
@@ -1405,6 +1832,15 @@ end;
 
 procedure TX64Backend.EmitMovRaxImm(V: Int64);
 begin
+  if V = 0 then
+  begin
+    FText.AddBytes([$31, $C0]);
+    FRaxStateValid := True;
+    FRaxStateOffset := FText.Size;
+    FRaxStateIsZero := False;
+    FRaxStateValid := False;
+    Exit;
+  end;
   if (V >= 0) and (QWord(V) <= High(LongWord)) then
   begin
     FText.Add8($B8);
@@ -1418,6 +1854,20 @@ begin
   else
   begin
     FText.AddBytes([$48, $B8]);
+    FText.Add64(QWord(V));
+  end;
+end;
+
+procedure TX64Backend.EmitMovRcxImm(V: Int64);
+begin
+  if (V >= Low(LongInt)) and (V <= High(LongInt)) then
+  begin
+    FText.AddBytes([$48, $C7, $C1]);
+    FText.AddI32(LongInt(V));
+  end
+  else
+  begin
+    FText.AddBytes([$48, $B9]);
     FText.Add64(QWord(V));
   end;
 end;
@@ -1518,6 +1968,167 @@ begin
     raise ERCCError.Create('internal error: unsupported scalar load width ' +
       IntToStr(Size));
   end;
+  NoteRaxNormalized(AType);
+end;
+
+{ Emits the same widening load as EmitLoadAtRax but straight from a memory
+  operand, so a variable read costs one instruction instead of an address
+  computation followed by a dereference. AModRM selects the operand form and
+  ADisplacement its 32-bit displacement. }
+procedure TX64Backend.EmitLoadMemoryTyped(const AType: TCType; AModRM: Byte;
+  ADisplacement: LongInt; ALabel: LongInt);
+var
+  Size: LongInt;
+
+  procedure Operand(const APrefix: array of Byte);
+  begin
+    FText.AddBytes(APrefix);
+    FText.Add8(AModRM);
+    if ALabel >= 0 then EmitRel32(ALabel)
+    else FText.AddI32(ADisplacement);
+  end;
+
+begin
+  if IsAggregateType(AType) or IsFunctionType(AType) then Exit;
+  if IsFloatingType(AType) then
+  begin
+    case AType.Kind of
+      ctFloat: Operand([$F3, $0F, $10]);
+      ctDouble: Operand([$F2, $0F, $10]);
+    else
+      raise ERCCError.Create('long double scalar loads are unsupported by the x86-64 backend');
+    end;
+    Exit;
+  end;
+  Size := StorageSize(AType);
+  case Size of
+    1:
+      if AType.IsUnsigned or (AType.Kind = ctBool) then Operand([$0F, $B6])
+      else Operand([$48, $0F, $BE]);
+    2:
+      if AType.IsUnsigned then Operand([$0F, $B7])
+      else Operand([$48, $0F, $BF]);
+    4:
+      if AType.IsUnsigned then Operand([$8B])
+      else Operand([$48, $63]);
+    8: Operand([$48, $8B]);
+  else
+    raise ERCCError.Create('internal error: unsupported scalar load width ' +
+      IntToStr(Size));
+  end;
+  NoteRaxNormalized(AType);
+end;
+
+procedure TX64Backend.EmitLoadLocalTyped(AOffset: LongInt;
+  const AType: TCType);
+begin
+  EmitLoadMemoryTyped(AType, $85, -AOffset, -1);
+end;
+
+procedure TX64Backend.EmitLoadGlobalTyped(ALabel: LongInt;
+  const AType: TCType);
+begin
+  EmitLoadMemoryTyped(AType, $05, 0, ALabel);
+end;
+
+{ Counterpart of EmitStoreRaxAtRcx that writes straight to a memory operand,
+  so storing to a plain variable needs no address register. }
+procedure TX64Backend.EmitStoreMemoryTyped(const AType: TCType; AModRM: Byte;
+  ADisplacement: LongInt; ALabel: LongInt);
+var
+  Size: LongInt;
+
+  procedure Operand(const APrefix: array of Byte);
+  begin
+    FText.AddBytes(APrefix);
+    FText.Add8(AModRM);
+    if ALabel >= 0 then EmitRel32(ALabel)
+    else FText.AddI32(ADisplacement);
+  end;
+
+begin
+  if IsFloatingType(AType) then
+  begin
+    case AType.Kind of
+      ctFloat: Operand([$F3, $0F, $11]);
+      ctDouble: Operand([$F2, $0F, $11]);
+    else
+      raise ERCCError.Create('long double scalar stores are unsupported by the x86-64 backend');
+    end;
+    Exit;
+  end;
+  Size := StorageSize(AType);
+  case Size of
+    1: Operand([$88]);
+    2: Operand([$66, $89]);
+    4: Operand([$89]);
+    8: Operand([$48, $89]);
+  else
+    raise ERCCError.Create('internal error: unsupported scalar store width ' +
+      IntToStr(Size));
+  end;
+end;
+
+{ Recognizes destinations that live at a fixed address: a non-indirect local
+  slot or a global defined in this translation unit. }
+function TX64Backend.TryResolveDirectTarget(E: TExpr;
+  out ALocalOffset, ALabel: LongInt): Boolean;
+var
+  LocalType: TCType;
+  IndirectLocal: Boolean;
+begin
+  Result := False;
+  ALocalOffset := 0;
+  ALabel := -1;
+  if (E = nil) or (E.Kind <> ekVariable) then Exit;
+  if E.IsFunctionDesignator or E.IsBitField then Exit;
+  if IsAggregateType(E.CType) or IsFunctionType(E.CType) then Exit;
+  if FindLocal(E.Text, ALocalOffset, LocalType, IndirectLocal) then
+  begin
+    if IndirectLocal then Exit;
+    Exit(True);
+  end;
+  ALabel := FindStaticLocalLabel(E.Text);
+  if ALabel < 0 then ALabel := FindNamedLabel(FGlobals, E.Text);
+  Result := ALabel >= 0;
+end;
+
+procedure TX64Backend.EmitLoadDirectTarget(ALocalOffset, ALabel: LongInt;
+  const AType: TCType);
+begin
+  if ALabel >= 0 then EmitLoadGlobalTyped(ALabel, AType)
+  else EmitLoadLocalTyped(ALocalOffset, AType);
+end;
+
+procedure TX64Backend.EmitStoreDirectTarget(ALocalOffset, ALabel: LongInt;
+  const AType: TCType);
+begin
+  if ALabel >= 0 then EmitStoreMemoryTyped(AType, $05, 0, ALabel)
+  else EmitStoreMemoryTyped(AType, $85, -ALocalOffset, -1);
+end;
+
+{ Loads a plain variable operand straight into rcx, letting a binary operation
+  skip the push/pop round trip through the stack. Only used when the variable's
+  own width and signedness already match the operation type, so the widening
+  load also performs the normalization the stack path would have done. }
+function TX64Backend.TryLoadOperandToRcx(E: TExpr;
+  const ALocalType: TCType): Boolean;
+var
+  TargetOffset, TargetLabel: LongInt;
+begin
+  Result := False;
+  if FOptions.OptimizationLevel < 1 then Exit;
+  if E = nil then Exit;
+  if IsFloatingType(E.CType) or IsFloatingType(ALocalType) then Exit;
+  if StorageSize(E.CType) <> StorageSize(ALocalType) then Exit;
+  if E.CType.IsUnsigned <> ALocalType.IsUnsigned then Exit;
+  if E.CType.Kind = ctBool then Exit;
+  if not TryResolveDirectTarget(E, TargetOffset, TargetLabel) then Exit;
+  if TargetLabel >= 0 then EmitLoadMemoryTyped(E.CType, $0D, 0, TargetLabel)
+  else EmitLoadMemoryTyped(E.CType, $8D, -TargetOffset, -1);
+  { The widening load wrote rcx, not rax. }
+  InvalidateRaxState;
+  Result := True;
 end;
 
 procedure TX64Backend.EmitStoreRaxAtRcx(const AType: TCType);
@@ -1558,9 +2169,43 @@ begin
   end;
 end;
 
+{ rax := rax + rcx * AScale, using a scaled-index lea where the hardware
+  supports the factor directly. }
+procedure TX64Backend.EmitAddScaledRcxToRax(AScale: LongInt);
+begin
+  case AScale of
+    1: FText.AddBytes([$48, $8D, $04, $08]);
+    2: FText.AddBytes([$48, $8D, $04, $48]);
+    4: FText.AddBytes([$48, $8D, $04, $88]);
+    8: FText.AddBytes([$48, $8D, $04, $C8]);
+  else
+    begin
+      FText.AddBytes([$48, $69, $C9]);
+      FText.AddI32(AScale);
+      FText.AddBytes([$48, $01, $C8]);
+    end;
+  end;
+  InvalidateRaxState;
+end;
+
 procedure TX64Backend.EmitScaleRax(AFactor: LongInt);
+var
+  Shift: Byte;
+  Remaining: LongWord;
 begin
   if AFactor <= 1 then Exit;
+  if (LongWord(AFactor) and LongWord(AFactor - 1)) = 0 then
+  begin
+    Shift := 0;
+    Remaining := LongWord(AFactor);
+    while Remaining > 1 do
+    begin
+      Remaining := Remaining shr 1;
+      Inc(Shift);
+    end;
+    FText.AddBytes([$48, $C1, $E0, Shift]);
+    Exit;
+  end;
   FText.AddBytes([$48, $69, $C0]);
   FText.AddI32(AFactor);
 end;
@@ -1586,6 +2231,7 @@ begin
     EmitNormalizeBool;
     Exit;
   end;
+  if RaxAlreadyNormalized(AType) then Exit;
   case StorageSize(AType) of
     1:
       if AType.IsUnsigned then FText.AddBytes([$0F, $B6, $C0])
@@ -1600,6 +2246,7 @@ begin
   else
     raise ERCCError.Create('internal error: unsupported integer width');
   end;
+  NoteRaxNormalized(AType);
 end;
 
 procedure TX64Backend.EmitNormalizeBitFieldResult(const AType: TCType;
@@ -2161,6 +2808,103 @@ begin
   end;
 end;
 
+{ Label of the object or function whose address a constant initializer denotes,
+  or -1 when the initializer is not an address constant. }
+function TX64Backend.ConstantAddressLabel(AExpression: TExpr): LongInt;
+var
+  CastValue: Int64;
+begin
+  Result := -1;
+  if AExpression = nil then Exit;
+  case AExpression.Kind of
+    ekCast:
+      begin
+        { A null pointer constant such as `(void *)0` is an integer constant
+          wearing a cast, not an address. }
+        if EvaluateIntegerConstantExpression(AExpression.Left, CastValue) then
+          Exit(-1);
+        Exit(ConstantAddressLabel(AExpression.Left));
+      end;
+    ekAddress: Exit(ConstantAddressLabel(AExpression.Left));
+    ekString: Exit(AddStringLiteral(AExpression.Text));
+    ekVariable:
+      begin
+        if AExpression.IsFunctionDesignator then
+          Exit(FindFunctionLabel(AExpression.Text));
+        if IsArrayType(AExpression.CType) or
+           IsAggregateType(AExpression.CType) then
+          Exit(FindNamedLabel(FGlobals, AExpression.Text));
+      end;
+  end;
+end;
+
+{ Folds the constant floating expressions permitted in a static initializer:
+  literals, casts, unary sign and the basic arithmetic operators. }
+function TryEvaluateConstantFloat(E: TExpr; out AValue: Double): Boolean;
+var
+  Left, Right: Double;
+  IntegerValue: Int64;
+begin
+  Result := False;
+  AValue := 0.0;
+  if E = nil then Exit;
+  case E.Kind of
+    ekFloat:
+      begin
+        AValue := E.FloatValue;
+        Exit(True);
+      end;
+    ekInteger:
+      begin
+        AValue := E.IntValue;
+        Exit(True);
+      end;
+    ekCast:
+      begin
+        if not TryEvaluateConstantFloat(E.Left, AValue) then Exit;
+        if IsIntegerType(E.CType) and not IsPointerType(E.CType) then
+          AValue := Trunc(AValue)
+        else if E.CType.Kind = ctFloat then
+          AValue := Single(AValue);
+        Exit(True);
+      end;
+    ekUnary:
+      begin
+        if not TryEvaluateConstantFloat(E.Left, Left) then Exit;
+        case E.UnaryOp of
+          uoPositive: AValue := Left;
+          uoNegative: AValue := -Left;
+        else
+          Exit;
+        end;
+        Exit(True);
+      end;
+    ekBinary:
+      begin
+        if not TryEvaluateConstantFloat(E.Left, Left) then Exit;
+        if not TryEvaluateConstantFloat(E.Right, Right) then Exit;
+        case E.BinaryOp of
+          boAdd: AValue := Left + Right;
+          boSub: AValue := Left - Right;
+          boMul: AValue := Left * Right;
+          boDiv:
+            begin
+              if Right = 0 then Exit;
+              AValue := Left / Right;
+            end;
+        else
+          Exit;
+        end;
+        Exit(True);
+      end;
+  end;
+  if EvaluateIntegerConstantExpression(E, IntegerValue) then
+  begin
+    AValue := IntegerValue;
+    Result := True;
+  end;
+end;
+
 procedure TX64Backend.EmitGlobalObject(const AType: TCType;
   AInitializer: TExpr; const APos: TSourcePos);
 var
@@ -2213,7 +2957,7 @@ begin
     AddZeros(Size);
     Exit;
   end;
-  if AType.Kind = ctArray then
+  if IsArrayType(AType) then
   begin
     ElementType := ElementTypeOf(AType);
     StartOffset := FData.Size;
@@ -2328,10 +3072,9 @@ begin
   begin
     if AInitializer <> nil then
     begin
-      if AInitializer.Kind = ekFloat then FloatValue := AInitializer.FloatValue
-      else if AInitializer.Kind = ekInteger then FloatValue := AInitializer.IntValue
-      else RaiseCompileError(APos,
-        'global floating initializer is not a constant expression');
+      if not TryEvaluateConstantFloat(AInitializer, FloatValue) then
+        RaiseCompileError(APos,
+          'global floating initializer is not a constant expression');
     end;
     case AType.Kind of
       ctFloat:
@@ -2360,9 +3103,26 @@ begin
       FData.Add64(0);
       Exit;
     end;
+    if IsPointerType(AType) then
+    begin
+      { A static pointer may name a function or another object; both resolve
+        to an address that is only known once the image is laid out. }
+      I := ConstantAddressLabel(AInitializer);
+      if I >= 0 then
+      begin
+        AddDataAddressFixup(I, FData.Size);
+        FData.Add64(0);
+        Exit;
+      end;
+    end;
     if not EvaluateIntegerConstantExpression(AInitializer, Value) then
-      RaiseCompileError(AInitializer.Pos,
-        'global initializer is not an integer constant expression');
+    begin
+      { Accept a null pointer constant written with a cast. }
+      if not ((AInitializer.Kind = ekCast) and
+              EvaluateIntegerConstantExpression(AInitializer.Left, Value)) then
+        RaiseCompileError(AInitializer.Pos,
+          'global initializer is not an integer constant expression');
+    end;
   end;
   Value := ConvertIntegerValue(Value, AType);
   case Size of
@@ -2380,6 +3140,47 @@ begin
   end;
 end;
 
+{ Static locals have program lifetime, so they are laid out like globals and
+  initialized once at load time rather than on entry to the enclosing block. }
+procedure TX64Backend.ReserveStaticLocals(S: TStmt);
+var
+  I, L, N: LongInt;
+begin
+  if S = nil then Exit;
+  if (S.Kind = skDecl) and S.IsStatic then
+  begin
+    { String literals in the initializer become objects of their own, so they
+      have to be interned before this object's bytes are laid out. }
+    PreallocateInitializerLiterals(S.Expr);
+    L := NewLabel;
+    if S.Expr = nil then
+    begin
+      BindBssLabel(L);
+      FLabels[L].Offset := ReserveBss(StorageSize(S.CType),
+        StorageAlign(S.CType));
+    end
+    else
+    begin
+      FData.PadTo(StorageAlign(S.CType));
+      BindDataLabel(L);
+      EmitGlobalObject(S.CType, S.Expr, S.Pos);
+    end;
+    N := Length(FStaticLocals);
+    SetLength(FStaticLocals, N + 1);
+    FStaticLocals[N].Name := S.Name;
+    FStaticLocals[N].LabelID := L;
+  end;
+  ReserveStaticLocals(S.InitStmt);
+  ReserveStaticLocals(S.Body);
+  ReserveStaticLocals(S.ElseBody);
+  for I := 0 to High(S.Children) do ReserveStaticLocals(S.Children[I]);
+end;
+
+function TX64Backend.FindStaticLocalLabel(const AName: string): LongInt;
+begin
+  Result := FindNamedLabel(FStaticLocals, AName);
+end;
+
 procedure TX64Backend.AllocateGlobals;
 var
   I, N, L: LongInt;
@@ -2391,10 +3192,21 @@ begin
     if G.IsExtern then Continue;
     if FindNamedLabel(FGlobals, G.Name) >= 0 then
       RaiseCompileError(G.Pos, 'duplicate global ''' + G.Name + '''');
-    FData.PadTo(StorageAlign(G.CType));
     L := NewLabel;
-    BindDataLabel(L);
-    EmitGlobalObject(G.CType, G.Initializer, G.Pos);
+    if G.Initializer = nil then
+    begin
+      { No initializer means an all-zero object: reserve address space for it
+        instead of writing the zeros into the output file. }
+      BindBssLabel(L);
+      FLabels[L].Offset := ReserveBss(StorageSize(G.CType),
+        StorageAlign(G.CType));
+    end
+    else
+    begin
+      FData.PadTo(StorageAlign(G.CType));
+      BindDataLabel(L);
+      EmitGlobalObject(G.CType, G.Initializer, G.Pos);
+    end;
     N := Length(FGlobals);
     SetLength(FGlobals, N + 1);
     FGlobals[N].Name := G.Name;
@@ -2404,21 +3216,22 @@ end;
 
 procedure TX64Backend.ReserveFunctionLabels;
 var
-  I, N, L, Existing: LongInt;
+  I, N, L: LongInt;
   F: TFunction;
 begin
   for I := 0 to High(FProgram.Functions) do
   begin
     F := FProgram.Functions[I];
     if F.IsPrototype then Continue;
-    Existing := FindNamedLabel(FFunctions, F.Name);
-    if Existing >= 0 then
+    FunctionHashEnsureCapacity;
+    if FunctionHashLookup(F.Name) >= 0 then
       RaiseCompileError(F.Pos, 'duplicate function definition ''' + F.Name + '''');
     L := NewLabel;
     N := Length(FFunctions);
     SetLength(FFunctions, N + 1);
     FFunctions[N].Name := F.Name;
     FFunctions[N].LabelID := L;
+    FunctionHashInsert(F.Name, L);
   end;
 end;
 
@@ -2443,7 +3256,7 @@ var
   ExplicitLibC, UseHostedExit: Boolean;
   LibraryRequest: string;
 begin
-  MainLabel := FindNamedLabel(FFunctions, 'main');
+  MainLabel := FindFunctionLabel('main');
   if MainLabel < 0 then
     MainLabel := FindExternalDefinition('main', ELF_STT_FUNC);
   if MainLabel < 0 then
@@ -3662,7 +4475,8 @@ begin
   for I := High(FLocals) downto 0 do
     if (FLocals[I].Name = AName) and
       (FLocals[I].ScopeDepth = FScopeDepth) then
-      raise ERCCError.Create('error: duplicate local variable ''' + AName + '''');
+      RaiseCompileError(FCurrentDeclPos,
+        'duplicate local variable ''' + AName + '''');
   Size := StorageSize(AType);
   Alignment := StorageAlign(AType);
   if AIndirectObject then
@@ -3843,13 +4657,25 @@ end;
 procedure TX64Backend.GenSwitchBody(S: TStmt;
   const AEntries: TSwitchEntryArray);
 var
-  I, L: LongInt;
+  I, L, SavedCount: LongInt;
 begin
   if S = nil then Exit;
   case S.Kind of
     skBlock:
-      for I := 0 to High(S.Children) do
-        GenSwitchBody(S.Children[I], AEntries);
+      if S.IsDeclarationGroup then
+        for I := 0 to High(S.Children) do
+          GenSwitchBody(S.Children[I], AEntries)
+      else
+      begin
+        { The switch body and any braced case body are still blocks, so they
+          scope their declarations even though case labels are walked here
+          rather than through GenStmt. }
+        SavedCount := Length(FLocals);
+        EnterScope;
+        for I := 0 to High(S.Children) do
+          GenSwitchBody(S.Children[I], AEntries);
+        LeaveScope(SavedCount);
+      end;
     skCase, skDefault:
       begin
         L := SwitchTargetFor(S, AEntries);
@@ -3872,7 +4698,7 @@ var
   Member: TStructMember;
 begin
   if AInitializer = nil then Exit;
-  if AType.Kind = ctArray then
+  if IsArrayType(AType) then
   begin
     ElementType := ElementTypeOf(AType);
     ElementSize := StorageSize(ElementType);
@@ -3968,7 +4794,7 @@ begin
   if AInitializer = nil then Exit;
   if IsAggregateType(AType) and
      (AInitializer.Kind <> ekCompoundLit) and
-     not ((AType.Kind = ctArray) and (AInitializer.Kind = ekString)) then
+     not (IsArrayType(AType) and (AInitializer.Kind = ekString)) then
   begin
 
 
@@ -4009,7 +4835,7 @@ end;
 
 procedure TX64Backend.GenAddress(E: TExpr);
 var
-  Offset, L: LongInt;
+  Offset, L, Scale: LongInt;
   LocalType: TCType;
   GlobalDecl: TGlobal;
   IndirectLocal: Boolean;
@@ -4025,7 +4851,8 @@ begin
         end
         else
         begin
-          L := FindGlobalLabel(E.Text);
+          L := FindStaticLocalLabel(E.Text);
+          if L < 0 then L := FindGlobalLabel(E.Text);
           if L >= 0 then EmitAddressGlobal(L)
           else
           begin
@@ -4041,14 +4868,32 @@ begin
     ekDeref: GenExpr(E.Left);
     ekIndex:
       begin
-        GenExpr(E.Left);
-        EmitPushRax;
-        GenExpr(E.Right);
-        EmitScaleRax(LongInt(E.IntValue));
-        FText.AddBytes([$48, $89, $C1]);
-        FText.Add8($58);
-        Dec(FStackDepth, 8);
-        FText.AddBytes([$48, $01, $C8]);
+        Scale := LongInt(E.IntValue);
+        if Scale < 1 then Scale := 1;
+        if (FOptions.OptimizationLevel >= 1) and (E.Right <> nil) and
+           (E.Right.Kind = ekInteger) and
+           (Abs(E.Right.IntValue) < High(LongInt) div Scale) then
+        begin
+          { A constant subscript folds into the base address. }
+          GenExpr(E.Left);
+          EmitAddRaxImmediate(LongInt(E.Right.IntValue) * Scale);
+        end
+        else
+        begin
+          GenExpr(E.Left);
+          if TryLoadOperandToRcx(E.Right, E.Right.CType) then
+            EmitAddScaledRcxToRax(Scale)
+          else
+          begin
+            EmitPushRax;
+            GenExpr(E.Right);
+            EmitScaleRax(Scale);
+            FText.AddBytes([$48, $89, $C1]);
+            FText.Add8($58);
+            Dec(FStackDepth, 8);
+            FText.AddBytes([$48, $01, $C8]);
+          end;
+        end;
       end;
     ekMember:
       begin
@@ -4084,11 +4929,152 @@ begin
   else EmitNormalizeBool;
 end;
 
+{ Emits an integer comparison and reports the Jcc opcode that tests it, so a
+  branch can consume the flags directly instead of materializing a 0/1 value
+  and testing that. }
+function TX64Backend.TryEmitComparisonFlags(E: TExpr;
+  out AJccOpcode: Byte): Boolean;
+var
+  LocalType: TCType;
+  Unsigned: Boolean;
+  Value: Int64;
+begin
+  Result := False;
+  AJccOpcode := 0;
+  if (E = nil) or (E.Kind <> ekBinary) then Exit;
+  if not (E.BinaryOp in [boEqual, boNotEqual, boLess, boLessEqual,
+    boGreater, boGreaterEqual]) then Exit;
+  if (E.Left = nil) or (E.Right = nil) then Exit;
+  if IsFloatingType(E.Left.CType) or IsFloatingType(E.Right.CType) then Exit;
+
+  LocalType := E.OperationType;
+  if IsFloatingType(LocalType) then Exit;
+  case E.BinaryOp of
+    boEqual, boNotEqual: Unsigned := False;
+  else
+    Unsigned := IsPointerType(LocalType) or LocalType.IsUnsigned;
+  end;
+  case E.BinaryOp of
+    boEqual: AJccOpcode := $84;
+    boNotEqual: AJccOpcode := $85;
+    boLess: if Unsigned then AJccOpcode := $82 else AJccOpcode := $8C;
+    boLessEqual: if Unsigned then AJccOpcode := $86 else AJccOpcode := $8E;
+    boGreater: if Unsigned then AJccOpcode := $87 else AJccOpcode := $8F;
+    boGreaterEqual: if Unsigned then AJccOpcode := $83 else AJccOpcode := $8D;
+  end;
+
+  if (FOptions.OptimizationLevel >= 1) and (E.Right.Kind = ekInteger) and
+     (not IsIntegerType(LocalType) or
+       ((StorageSize(E.Right.CType) = StorageSize(LocalType)) and
+        (E.Right.CType.IsUnsigned = LocalType.IsUnsigned))) then
+  begin
+    Value := E.Right.IntValue;
+    if (Value >= Low(LongInt)) and (Value <= High(LongInt)) then
+    begin
+      GenExpr(E.Left);
+      if IsIntegerType(LocalType) then EmitNormalizeInteger(LocalType);
+      FText.AddBytes([$48, $3D]);
+      FText.AddI32(LongInt(Value));
+      Exit(True);
+    end;
+  end;
+
+  GenExpr(E.Left);
+  if IsIntegerType(LocalType) then EmitNormalizeInteger(LocalType);
+  if not TryLoadOperandToRcx(E.Right, LocalType) then
+  begin
+    EmitPushRax;
+    GenExpr(E.Right);
+    if IsIntegerType(LocalType) then EmitNormalizeInteger(LocalType);
+    FText.AddBytes([$48, $89, $C1]);
+    FText.Add8($58);
+    Dec(FStackDepth, 8);
+  end;
+  FText.AddBytes([$48, $39, $C8]);
+  Result := True;
+end;
+
+procedure TX64Backend.GenBranch(E: TExpr; ATargetLabel: LongInt;
+  ABranchIfTrue: Boolean);
+var
+  JccOpcode: Byte;
+  SkipLabel: LongInt;
+  Value: Int64;
+begin
+  if E = nil then Exit;
+
+  if (E.Kind = ekUnary) and (E.UnaryOp = uoLogicalNot) and
+     not IsFloatingType(E.Left.CType) then
+  begin
+    GenBranch(E.Left, ATargetLabel, not ABranchIfTrue);
+    Exit;
+  end;
+
+  if (E.Kind = ekInteger) and (FOptions.OptimizationLevel >= 1) then
+  begin
+    Value := E.IntValue;
+    if (Value <> 0) = ABranchIfTrue then EmitJump(ATargetLabel);
+    Exit;
+  end;
+
+  if (E.Kind = ekBinary) and (E.BinaryOp = boLogicalAnd) then
+  begin
+    if ABranchIfTrue then
+    begin
+      SkipLabel := NewLabel;
+      GenBranch(E.Left, SkipLabel, False);
+      GenBranch(E.Right, ATargetLabel, True);
+      BindTextLabel(SkipLabel);
+    end
+    else
+    begin
+      GenBranch(E.Left, ATargetLabel, False);
+      GenBranch(E.Right, ATargetLabel, False);
+    end;
+    Exit;
+  end;
+
+  if (E.Kind = ekBinary) and (E.BinaryOp = boLogicalOr) then
+  begin
+    if ABranchIfTrue then
+    begin
+      GenBranch(E.Left, ATargetLabel, True);
+      GenBranch(E.Right, ATargetLabel, True);
+    end
+    else
+    begin
+      SkipLabel := NewLabel;
+      GenBranch(E.Left, SkipLabel, True);
+      GenBranch(E.Right, ATargetLabel, False);
+      BindTextLabel(SkipLabel);
+    end;
+    Exit;
+  end;
+
+  if TryEmitComparisonFlags(E, JccOpcode) then
+  begin
+    if not ABranchIfTrue then JccOpcode := JccOpcode xor 1;
+    EmitJcc(JccOpcode, ATargetLabel);
+    Exit;
+  end;
+
+  GenExpr(E);
+  if IsFloatingType(E.CType) then
+  begin
+    EmitFloatToBool(E.CType);
+    FText.AddBytes([$48, $85, $C0]);
+  end
+  else
+    FText.AddBytes([$48, $85, $C0]);
+  if ABranchIfTrue then EmitJcc($85, ATargetLabel)
+  else EmitJcc($84, ATargetLabel);
+end;
+
 procedure TX64Backend.GenAssignment(E: TExpr);
 var
   Op: TBinaryOp;
-  L, Pad, Scale: LongInt;
-  Indirect: Boolean;
+  L, Pad, Scale, TargetOffset, TargetLabel: LongInt;
+  Indirect, Direct: Boolean;
 begin
   if E.Left.IsBitField then
   begin
@@ -4181,17 +5167,32 @@ begin
     Exit;
   end;
 
-  GenAddress(E.Left);
-  EmitPushRax;
-  if E.AssignOp = aoAssign then
+  Direct := TryResolveDirectTarget(E.Left, TargetOffset, TargetLabel);
+
+  if Direct and (E.AssignOp = aoAssign) then
   begin
     GenExpr(E.Right);
     EmitNormalizeInteger(E.Left.CType);
-    EmitPopRcx;
-    EmitStoreRaxAtRcx(E.Left.CType);
+    EmitStoreDirectTarget(TargetOffset, TargetLabel, E.Left.CType);
     Exit;
   end;
-  EmitLoadAtRax(E.Left.CType);
+
+  if not Direct then
+  begin
+    GenAddress(E.Left);
+    EmitPushRax;
+    if E.AssignOp = aoAssign then
+    begin
+      GenExpr(E.Right);
+      EmitNormalizeInteger(E.Left.CType);
+      EmitPopRcx;
+      EmitStoreRaxAtRcx(E.Left.CType);
+      Exit;
+    end;
+    EmitLoadAtRax(E.Left.CType);
+  end
+  else
+    EmitLoadDirectTarget(TargetOffset, TargetLabel, E.Left.CType);
   EmitPushRax;
   GenExpr(E.Right);
   Scale := 1;
@@ -4215,13 +5216,18 @@ begin
   end;
   EmitBinaryOperation(Op, E.Left.CType.IsUnsigned);
   EmitNormalizeInteger(E.Left.CType);
-  EmitPopRcx;
-  EmitStoreRaxAtRcx(E.Left.CType);
+  if Direct then
+    EmitStoreDirectTarget(TargetOffset, TargetLabel, E.Left.CType)
+  else
+  begin
+    EmitPopRcx;
+    EmitStoreRaxAtRcx(E.Left.CType);
+  end;
 end;
 
 procedure TX64Backend.GenIncDec(E: TExpr; ADelta: LongInt; APost: Boolean);
 var
-  Delta: LongInt;
+  Delta, TargetOffset, TargetLabel: LongInt;
   OneType: TCType;
 begin
   if E.Left.IsBitField then
@@ -4285,16 +5291,108 @@ begin
     Exit;
   end;
 
+  Delta := ADelta;
+  if E.IntValue > 1 then Delta := Delta * LongInt(E.IntValue);
+
+  if TryResolveDirectTarget(E.Left, TargetOffset, TargetLabel) then
+  begin
+    EmitLoadDirectTarget(TargetOffset, TargetLabel, E.Left.CType);
+    if APost then FText.AddBytes([$48, $89, $C2]);
+    EmitAddRaxImmediate(Delta);
+    EmitNormalizeInteger(E.Left.CType);
+    EmitStoreDirectTarget(TargetOffset, TargetLabel, E.Left.CType);
+    if APost then FText.AddBytes([$48, $89, $D0]);
+    Exit;
+  end;
+
   GenAddress(E.Left);
   FText.AddBytes([$48, $89, $C1]);
   EmitLoadAtRax(E.Left.CType);
   if APost then FText.AddBytes([$48, $89, $C2]);
-  Delta := ADelta;
-  if E.IntValue > 1 then Delta := Delta * LongInt(E.IntValue);
   EmitAddRaxImmediate(Delta);
   EmitNormalizeInteger(E.Left.CType);
   EmitStoreRaxAtRcx(E.Left.CType);
   if APost then FText.AddBytes([$48, $89, $D0]);
+end;
+
+{ True when a printf format uses only the conversions the direct-write path can
+  render itself. }
+function PlainPrintfFormat(const AText: string): Boolean;
+var
+  I: LongInt;
+begin
+  Result := False;
+  I := 1;
+  while I <= Length(AText) do
+  begin
+    if AText[I] <> '%' then begin Inc(I); Continue; end;
+    Inc(I);
+    if I > Length(AText) then Exit;
+    if AText[I] = '%' then begin Inc(I); Continue; end;
+    if AText[I] in ['-', '+', ' ', '#', '0', '.', '1'..'9', '*'] then Exit;
+    if AText[I] in ['h', 'l', 'j', 'z', 't', 'L'] then Exit;
+    if not (AText[I] in ['d', 'i', 's', 'c']) then Exit;
+    Inc(I);
+  end;
+  Result := True;
+end;
+
+function PlainPrintfCallsOnly(E: TExpr): Boolean; forward;
+
+function PlainPrintfCallsOnlyStmt(S: TStmt): Boolean;
+var
+  I: LongInt;
+begin
+  Result := True;
+  if S = nil then Exit;
+  if not PlainPrintfCallsOnly(S.Expr) then Exit(False);
+  if not PlainPrintfCallsOnly(S.Expr2) then Exit(False);
+  if not PlainPrintfCallsOnlyStmt(S.InitStmt) then Exit(False);
+  if not PlainPrintfCallsOnlyStmt(S.Body) then Exit(False);
+  if not PlainPrintfCallsOnlyStmt(S.ElseBody) then Exit(False);
+  for I := 0 to High(S.Children) do
+    if not PlainPrintfCallsOnlyStmt(S.Children[I]) then Exit(False);
+end;
+
+function PlainPrintfCallsOnly(E: TExpr): Boolean;
+var
+  I: LongInt;
+begin
+  Result := True;
+  if E = nil then Exit;
+  if (E.Kind = ekCall) and (E.Text = 'printf') then
+  begin
+    if (Length(E.Args) = 0) or (E.Args[0] = nil) or
+       (E.Args[0].Kind <> ekString) then Exit(False);
+    if not PlainPrintfFormat(E.Args[0].Text) then Exit(False);
+  end;
+  if not PlainPrintfCallsOnly(E.Left) then Exit(False);
+  if not PlainPrintfCallsOnly(E.Right) then Exit(False);
+  if not PlainPrintfCallsOnly(E.Third) then Exit(False);
+  for I := 0 to High(E.Args) do
+    if not PlainPrintfCallsOnly(E.Args[I]) then Exit(False);
+end;
+
+{ The direct-write printf path bypasses libc's buffered stdout, so it may only
+  be used when no other printf in the program falls back to libc; otherwise the
+  two output paths interleave and the program's output comes out reordered. }
+function TX64Backend.PlainPrintfIsSafe: Boolean;
+var
+  I: LongInt;
+begin
+  if not FPlainPrintfChecked then
+  begin
+    FPlainPrintfChecked := True;
+    FPlainPrintfSafe := True;
+    for I := 0 to High(FProgram.Functions) do
+      if not FProgram.Functions[I].IsPrototype then
+        if not PlainPrintfCallsOnlyStmt(FProgram.Functions[I].Body) then
+        begin
+          FPlainPrintfSafe := False;
+          Break;
+        end;
+  end;
+  Result := FPlainPrintfSafe;
 end;
 
 function TX64Backend.TryGenPlainPrintf(E: TExpr): Boolean;
@@ -4345,6 +5443,7 @@ var
 begin
   Result := False;
   if E.Text <> 'printf' then Exit;
+  if not PlainPrintfIsSafe then Exit;
   if (Length(E.Args) = 0) or (E.Args[0] = nil) or
     (E.Args[0].Kind <> ekString) then Exit;
 
@@ -5258,6 +6357,7 @@ var
   LocalType: TCType;
   GlobalDecl: TGlobal;
   IndirectLocal: Boolean;
+  ImmediateValue: Int64;
 begin
   if E = nil then
   begin
@@ -5285,7 +6385,7 @@ begin
       begin
         if E.IsFunctionDesignator then
         begin
-          L := FindNamedLabel(FFunctions, E.Text);
+          L := FindFunctionLabel(E.Text);
           if L >= 0 then
           begin
             EmitAddressGlobal(L);
@@ -5305,15 +6405,24 @@ begin
         end;
         if FindLocal(E.Text, Offset, LocalType, IndirectLocal) then
         begin
-          if IndirectLocal then EmitLoadLocal(Offset)
-          else EmitAddressLocal(Offset);
-          if not IsAggregateType(E.CType) then EmitLoadAtRax(E.CType);
+          if not IndirectLocal and not IsAggregateType(E.CType) then
+            EmitLoadLocalTyped(Offset, E.CType)
+          else
+          begin
+            if IndirectLocal then EmitLoadLocal(Offset)
+            else EmitAddressLocal(Offset);
+            if not IsAggregateType(E.CType) then EmitLoadAtRax(E.CType);
+          end;
         end
         else
         begin
-          L := FindGlobalLabel(E.Text);
+          L := FindStaticLocalLabel(E.Text);
+          if L < 0 then L := FindGlobalLabel(E.Text);
           if L >= 0 then
-            EmitAddressGlobal(L)
+          begin
+            if IsAggregateType(E.CType) then EmitAddressGlobal(L)
+            else EmitLoadGlobalTyped(L, E.CType);
+          end
           else
           begin
             GlobalDecl := FindGlobal(E.Text);
@@ -5322,8 +6431,8 @@ begin
             L := EnsureExternalObject(E.Text, E.Pos);
             if FOptions.EmitMode = emObject then EmitObjectGOTLoad(L)
             else EmitLoadGlobal(L);
+            if not IsAggregateType(E.CType) then EmitLoadAtRax(E.CType);
           end;
-          if not IsAggregateType(E.CType) then EmitLoadAtRax(E.CType);
         end;
       end;
     ekAddress: GenAddress(E.Left);
@@ -5391,9 +6500,7 @@ begin
         if E.BinaryOp = boLogicalAnd then
         begin
           FalseLabel := NewLabel; EndLabel := NewLabel;
-          GenCondition(E.Left);
-          FText.AddBytes([$48, $85, $C0]);
-          EmitJcc($84, FalseLabel);
+          GenBranch(E.Left, FalseLabel, False);
           GenCondition(E.Right);
           EmitJump(EndLabel);
           BindTextLabel(FalseLabel);
@@ -5405,9 +6512,7 @@ begin
         begin
           EndLabel := NewLabel;
           FalseLabel := NewLabel;
-          GenCondition(E.Left);
-          FText.AddBytes([$48, $85, $C0]);
-          EmitJcc($84, FalseLabel);
+          GenBranch(E.Left, FalseLabel, False);
           EmitMovRaxImm(1);
           EmitJump(EndLabel);
           BindTextLabel(FalseLabel);
@@ -5466,31 +6571,42 @@ begin
             ((StorageSize(E.Right.CType) = StorageSize(LocalType)) and
              (E.Right.CType.IsUnsigned = LocalType.IsUnsigned))) then
         begin
+          if IsPointerResult then ImmediateValue := E.Right.IntValue * Scale
+          else ImmediateValue := E.Right.IntValue;
           GenExpr(E.Left);
           if IsIntegerType(LocalType) then EmitNormalizeInteger(LocalType);
-          if IsPointerResult then
-            EmitImmediateOperation(E.BinaryOp, E.Right.IntValue * Scale,
-              UnsignedOperation, Handled)
-          else
-            EmitImmediateOperation(E.BinaryOp, E.Right.IntValue,
-              UnsignedOperation, Handled);
-          if Handled then
+          EmitImmediateOperation(E.BinaryOp, ImmediateValue,
+            UnsignedOperation, Handled);
+          if not Handled then
           begin
-            EmitNormalizeInteger(E.CType);
-            Exit;
+            { The left operand has already been evaluated, and re-evaluating it
+              would run its side effects twice, so finish with the general form
+              using the constant materialized in rcx. }
+            EmitMovRcxImm(ImmediateValue);
+            EmitBinaryOperation(E.BinaryOp, UnsignedOperation);
           end;
+          EmitNormalizeInteger(E.CType);
+          Exit;
         end;
         GenExpr(E.Left);
         if IsIntegerType(LocalType) then EmitNormalizeInteger(LocalType);
-        EmitPushRax;
-        GenExpr(E.Right);
-        if IsIntegerType(LocalType) and
-          not (E.BinaryOp in [boShiftLeft, boShiftRight]) then
-          EmitNormalizeInteger(LocalType);
-        if IsPointerResult then EmitScaleRax(Scale);
-        FText.AddBytes([$48, $89, $C1]);
-        FText.Add8($58);
-        Dec(FStackDepth, 8);
+        if not IsPointerResult and not IsPointerDifference and
+           TryLoadOperandToRcx(E.Right, LocalType) then
+        begin
+          { rax already holds the left operand and rcx now holds the right. }
+        end
+        else
+        begin
+          EmitPushRax;
+          GenExpr(E.Right);
+          if IsIntegerType(LocalType) and
+            not (E.BinaryOp in [boShiftLeft, boShiftRight]) then
+            EmitNormalizeInteger(LocalType);
+          if IsPointerResult then EmitScaleRax(Scale);
+          FText.AddBytes([$48, $89, $C1]);
+          FText.Add8($58);
+          Dec(FStackDepth, 8);
+        end;
         EmitBinaryOperation(E.BinaryOp, UnsignedOperation);
         if IsPointerDifference and (Scale > 1) then
         begin
@@ -5509,9 +6625,7 @@ begin
     ekConditional:
       begin
         FalseLabel := NewLabel; EndLabel := NewLabel;
-        GenCondition(E.Left);
-        FText.AddBytes([$48, $85, $C0]);
-        EmitJcc($84, FalseLabel);
+        GenBranch(E.Left, FalseLabel, False);
         GenExpr(E.Right);
         EmitJump(EndLabel);
         BindTextLabel(FalseLabel);
@@ -6197,7 +7311,11 @@ begin
     skExpr: GenExpr(S.Expr);
     skAsm: GenInlineAsm(S);
     skDecl:
+      { A static local was laid out and initialized before the body was
+        generated, so reaching the declaration does nothing at run time. }
+      if not S.IsStatic then
       begin
+        FCurrentDeclPos := S.Pos;
         AddLocal(S.Name, S.CType, False, Offset);
         InitializeLocal(Offset, S.CType, S.Expr, S.Pos);
       end;
@@ -6237,9 +7355,7 @@ begin
     skIf:
       begin
         ElseLabel := NewLabel; EndLabel := NewLabel;
-        GenCondition(S.Expr);
-        FText.AddBytes([$48, $85, $C0]);
-        EmitJcc($84, ElseLabel);
+        GenBranch(S.Expr, ElseLabel, False);
         GenStmt(S.Body);
         EmitJump(EndLabel);
         BindTextLabel(ElseLabel);
@@ -6250,9 +7366,8 @@ begin
       begin
         CondLabel := NewLabel; EndLabel := NewLabel;
         BindTextLabel(CondLabel);
-        GenCondition(S.Expr);
-        FText.AddBytes([$48, $85, $C0]);
-        EmitJcc($84, EndLabel);
+        NoteLoopHead(CondLabel);
+        GenBranch(S.Expr, EndLabel, False);
         PushLoop(EndLabel, CondLabel);
         GenStmt(S.Body);
         PopLoop;
@@ -6263,13 +7378,12 @@ begin
       begin
         BodyLabel := NewLabel; ContinueLabel := NewLabel; EndLabel := NewLabel;
         BindTextLabel(BodyLabel);
+        NoteLoopHead(BodyLabel);
         PushLoop(EndLabel, ContinueLabel);
         GenStmt(S.Body);
         PopLoop;
         BindTextLabel(ContinueLabel);
-        GenCondition(S.Expr);
-        FText.AddBytes([$48, $85, $C0]);
-        EmitJcc($85, BodyLabel);
+        GenBranch(S.Expr, BodyLabel, True);
         BindTextLabel(EndLabel);
       end;
     skFor:
@@ -6279,12 +7393,8 @@ begin
         GenStmt(S.InitStmt);
         CondLabel := NewLabel; ContinueLabel := NewLabel; EndLabel := NewLabel;
         BindTextLabel(CondLabel);
-        if S.Expr <> nil then
-        begin
-          GenCondition(S.Expr);
-          FText.AddBytes([$48, $85, $C0]);
-          EmitJcc($84, EndLabel);
-        end;
+        NoteLoopHead(CondLabel);
+        if S.Expr <> nil then GenBranch(S.Expr, EndLabel, False);
         PushLoop(EndLabel, ContinueLabel);
         GenStmt(S.Body);
         PopLoop;
@@ -6442,11 +7552,18 @@ begin
   FrameSize := LongInt(AlignUp(QWord(ParameterBytes + LocalBytes), 16));
   if FrameSize > 0 then
   begin
-    FText.AddBytes([$48, $81, $EC]);
-    FText.AddI32(FrameSize);
+    if FrameSize <= 127 then
+      FText.AddBytes([$48, $83, $EC, Byte(FrameSize)])
+    else
+    begin
+      FText.AddBytes([$48, $81, $EC]);
+      FText.AddI32(FrameSize);
+    end;
   end;
   SetLength(FLocals, 0);
   SetLength(FUserLabels, 0);
+  SetLength(FStaticLocals, 0);
+  ReserveStaticLocals(F.Body);
   ReserveUserLabels(F.Body);
   FScopeDepth := 0;
   FNextLocalSlot := 0;
@@ -6581,15 +7698,50 @@ begin
   for I := 0 to High(FProgram.Functions) do
     if not FProgram.Functions[I].IsPrototype then
     begin
-      L := FindNamedLabel(FFunctions, FProgram.Functions[I].Name);
+      L := FindFunctionLabel(FProgram.Functions[I].Name);
       GenFunction(FProgram.Functions[I], L);
     end;
-  if FOptions.EmitMode = emObject then Exit;
+  if FOptions.EmitMode = emObject then
+  begin
+    RelaxJumps;
+    AlignLoopHeads;
+    Exit;
+  end;
   EmitRuntime;
 
 
 
   EmitStartup;
+  RelaxJumps;
+  AlignLoopHeads;
+end;
+
+{ The needed-library set decides how much dynamic metadata the ELF writer will
+  append, which in turn fixes where the zero-fill region starts. Both the
+  executable writer and the resolved listing have to agree on it. }
+function TX64Backend.ResolveNeededLibraryNames: rcc_types.TStringArray;
+var
+  Target: TTargetDescriptor;
+  ResolvedLibraries: TResolvedLibraryArray;
+begin
+  Result := nil;
+  SetLength(ResolvedLibraries, 0);
+  Target := GetTargetOrRaise(FOptions.TargetTriple);
+  if Target.OperatingSystem <> osLinux then Exit;
+  if FOptions.StaticLink then Exit;
+  ResolveDynamicLibraries(FOptions.LibraryPaths, FOptions.Libraries,
+    FOptions.Sysroot, TargetMultiArchName(Target), Target.DefaultLibC,
+    ArchitectureName(Target.Architecture), Target.ELFMachine,
+    Target.Architecture = archX86_64,
+    (Length(FImports) <> 0) or (Length(FOptions.Libraries) <> 0),
+    FOptions.NoDefaultLibraries, FOptions.Freestanding, ResolvedLibraries);
+  Result := ResolvedNeededNames(ResolvedLibraries);
+end;
+
+procedure TX64Backend.PrepareBssBase(const ANeededNames: array of string);
+begin
+  FBssBase := AlignUp(ELF64DataPayloadSize(FText, FData, FImports,
+    ANeededNames, FOptions.RPaths, FOptions.BindNow), RCCELFBssAlignment);
 end;
 
 procedure TX64Backend.BuildAssemblyListing;
@@ -6624,6 +7776,7 @@ var
 begin
   Layout := ComputeELFExecutableLayout(QWord(FText.Size), QWord(FData.Size),
     QWord(FLabels[FEntryLabel].Offset));
+  PrepareBssBase(ResolveNeededLibraryNames);
   ResolveFixups(Layout.TextVA, Layout.DataVA);
   ResolveExternalRelocations(Layout.TextVA, Layout.DataVA);
   FListing.Clear;
@@ -6640,7 +7793,8 @@ procedure TX64Backend.WriteObject(const AFileName: string);
 var
   Target: TTargetDescriptor;
   Obj: TObjectFile;
-  TextIndex, DataIndex, TextSectionSymbol, DataSectionSymbol: LongInt;
+  TextIndex, DataIndex, BssIndex: LongInt;
+  TextSectionSymbol, DataSectionSymbol, BssSectionSymbol: LongInt;
   UndefinedSymbolIndices: array of LongInt;
   I, SymbolIndex, BaseAddend, SectionIndex: LongInt;
   Fixup: TFixup;
@@ -6688,7 +7842,7 @@ var
     begin
       F := FProgram.Functions[J];
       if F.IsPrototype or (F.IsStatic <> AStatic) then Continue;
-      LabelID := FindNamedLabel(FFunctions, F.Name);
+      LabelID := FindFunctionLabel(F.Name);
       Obj.AddSymbol(F.Name, Binding, ostFunction, osvDefault,
         TextIndex, QWord(FLabels[LabelID].Offset), FunctionSize(LabelID), True);
     end;
@@ -6697,9 +7851,14 @@ var
       G := FProgram.Globals[J];
       if G.IsExtern or (G.IsStatic <> AStatic) then Continue;
       LabelID := FindNamedLabel(FGlobals, G.Name);
-      Obj.AddSymbol(G.Name, Binding, ostObject, osvDefault,
-        DataIndex, QWord(FLabels[LabelID].Offset),
-        QWord(StorageSize(G.CType)), True);
+      if FLabels[LabelID].Section = lsBss then
+        Obj.AddSymbol(G.Name, Binding, ostObject, osvDefault,
+          BssIndex, QWord(FLabels[LabelID].Offset),
+          QWord(StorageSize(G.CType)), True)
+      else
+        Obj.AddSymbol(G.Name, Binding, ostObject, osvDefault,
+          DataIndex, QWord(FLabels[LabelID].Offset),
+          QWord(StorageSize(G.CType)), True);
     end;
   end;
 
@@ -6727,7 +7886,7 @@ var
   procedure RelocationTarget(ALabel: LongInt; out ASymbolIndex,
     ABaseAddend: LongInt);
   begin
-    if (ALabel < 0) or (ALabel > High(FLabels)) then
+    if (ALabel < 0) or (ALabel >= FLabelCount) then
       raise ERCCError.Create('internal error: invalid object relocation label');
     LabelInfo := FLabels[ALabel];
     case LabelInfo.Section of
@@ -6739,6 +7898,11 @@ var
       lsData:
         begin
           ASymbolIndex := DataSectionSymbol;
+          ABaseAddend := LabelInfo.Offset;
+        end;
+      lsBss:
+        begin
+          ASymbolIndex := BssSectionSymbol;
           ABaseAddend := LabelInfo.Offset;
         end;
       lsUnbound:
@@ -6764,6 +7928,8 @@ begin
       [osfAlloc, osfExecute], 16);
     DataIndex := Obj.AddSection('.data', oskData,
       [osfAlloc, osfWrite], 16);
+    BssIndex := Obj.AddSection('.bss', oskBSS, [osfAlloc, osfWrite], 16);
+    Obj.Section(BssIndex).VirtualSize := QWord(FBssSize);
     Obj.AddSection('.note.GNU-stack', oskCustom, [], 1);
 
 
@@ -6771,6 +7937,8 @@ begin
       TextIndex, 0, 0, True);
     DataSectionSymbol := Obj.AddSymbol('', osbLocal, ostSection, osvDefault,
       DataIndex, 0, 0, True);
+    BssSectionSymbol := Obj.AddSymbol('', osbLocal, ostSection, osvDefault,
+      BssIndex, 0, 0, True);
     AddDefinedSymbols(True);
     AddDefinedSymbols(False);
 
@@ -6780,17 +7948,24 @@ begin
         osbGlobal, ObjectSymbolType(FObjectUndefined[I].SymbolType),
         osvDefault, 0, 0, 0, False);
 
-    for I := 0 to High(FFixups) do
+    for I := 0 to FFixupCount - 1 do
     begin
       Fixup := FFixups[I];
       LabelInfo := FLabels[Fixup.TargetLabel];
       if LabelInfo.Section = lsText then
       begin
-        FText.Patch32(Fixup.PatchOffset,
-          LabelInfo.Offset - (Fixup.PatchOffset + 4));
+        if Fixup.Kind in [rfJmpShort, rfJccShort] then
+          FText.Patch8(Fixup.PatchOffset,
+            Byte(LongWord(LabelInfo.Offset - (Fixup.PatchOffset + 1)) and $FF))
+        else
+          FText.Patch32(Fixup.PatchOffset,
+            LabelInfo.Offset - (Fixup.PatchOffset + 4));
         Inc(FStats.FixupsResolved);
         Continue;
       end;
+      if Fixup.Kind in [rfJmpShort, rfJccShort] then
+        raise ERCCError.Create(
+          'internal error: short jump requires a local text label');
       RelocationTarget(Fixup.TargetLabel, SymbolIndex, BaseAddend);
       if LabelInfo.Section = lsUnbound then
       begin
@@ -6806,7 +7981,7 @@ begin
           orkPCRelative32, R_X86_64_PC32, Int64(BaseAddend) - 4);
     end;
 
-    for I := 0 to High(FDataAddressFixups) do
+    for I := 0 to FDataAddressFixupCount - 1 do
     begin
       DataFixup := FDataAddressFixups[I];
       RelocationTarget(DataFixup.TargetLabel, SymbolIndex, BaseAddend);
@@ -6840,7 +8015,7 @@ begin
         begin
           SectionIndex := Length(DebugFunctions);
           SetLength(DebugFunctions, SectionIndex + 1);
-          SymbolIndex := FindNamedLabel(FFunctions,
+          SymbolIndex := FindFunctionLabel(
             FProgram.Functions[I].Name);
           DebugFunctions[SectionIndex].Name := FProgram.Functions[I].Name;
           DebugFunctions[SectionIndex].FileName :=
@@ -6912,7 +8087,7 @@ var
       FunctionDecl := FProgram.Functions[J];
       if FunctionDecl.IsPrototype or
          (FunctionDecl.IsStatic <> AStatic) then Continue;
-      LabelID := FindNamedLabel(FFunctions, FunctionDecl.Name);
+      LabelID := FindFunctionLabel(FunctionDecl.Name);
       DebugObject.AddSymbol(FunctionDecl.Name, Binding, ostFunction,
         osvDefault, DebugTextIndex, QWord(FLabels[LabelID].Offset),
         DebugFunctionSize(LabelID), True);
@@ -6954,7 +8129,7 @@ var
       if FunctionDecl.IsPrototype then Continue;
       N := Length(DebugFunctions);
       SetLength(DebugFunctions, N + 1);
-      LabelID := FindNamedLabel(FFunctions, FunctionDecl.Name);
+      LabelID := FindFunctionLabel(FunctionDecl.Name);
       DebugFunctions[N].Name := FunctionDecl.Name;
       DebugFunctions[N].FileName := FunctionDecl.Pos.FileName;
       DebugFunctions[N].Line := FunctionDecl.Pos.Line;
@@ -6973,8 +8148,6 @@ begin
   Target := GetTargetOrRaise(FOptions.TargetTriple);
   Layout := ComputeELFExecutableLayout(QWord(FText.Size), QWord(FData.Size),
     QWord(FLabels[FEntryLabel].Offset));
-  ResolveFixups(Layout.TextVA, Layout.DataVA);
-  ResolveExternalRelocations(Layout.TextVA, Layout.DataVA);
 
   try
     if Target.OperatingSystem <> osLinux then
@@ -6988,9 +8161,12 @@ begin
         raise ERCCError.Create(
           'error: BSD direct executable output is currently static and ' +
           'freestanding; emit an object with -c to use a target system linker');
+      FBssBase := AlignUp(QWord(FData.Size), RCCELFBssAlignment);
+      ResolveFixups(Layout.TextVA, Layout.DataVA);
+      ResolveExternalRelocations(Layout.TextVA, Layout.DataVA);
       if FOptions.DebugInfo then BuildExecutableDebugObject;
       WriteStaticELF64Executable(AFileName, Target, FText, FData,
-        QWord(FLabels[FEntryLabel].Offset), FSyscallSites);
+        QWord(FLabels[FEntryLabel].Offset), FSyscallSites, QWord(FBssSize));
       if DebugObject <> nil then
         AppendELF64DebugSections(AFileName, DebugObject,
           Layout.TextOffset, Layout.TextVA, QWord(FText.Size),
@@ -7022,10 +8198,16 @@ begin
       Target.ELFMachine);
     DynamicLinker := FOptions.DynamicLinker;
     if DynamicLinker = '' then DynamicLinker := Target.DefaultDynamicLoader;
+    { Zero-initialized objects sit past the dynamic linking metadata that the
+      ELF writer appends, so their addresses can only be resolved once the
+      needed-library set is known. }
+    PrepareBssBase(NeededNames);
+    ResolveFixups(Layout.TextVA, Layout.DataVA);
+    ResolveExternalRelocations(Layout.TextVA, Layout.DataVA);
     if FOptions.DebugInfo then BuildExecutableDebugObject;
     WriteELF64Executable(AFileName, FText, FData,
       QWord(FLabels[FEntryLabel].Offset), FImports, NeededNames,
-      FOptions.RPaths, FOptions.BindNow, DynamicLinker);
+      FOptions.RPaths, FOptions.BindNow, DynamicLinker, QWord(FBssSize));
     if DebugObject <> nil then
       AppendELF64DebugSections(AFileName, DebugObject,
         Layout.TextOffset, Layout.TextVA, QWord(FText.Size),

@@ -80,6 +80,34 @@ type
     GlobalIndex: LongInt;
   end;
 
+  { A pointer stored in initialized data that names another global; the target
+    address is only known once the data segment has been placed. }
+  TCrossDataPointerFixup = record
+    DataOffset: LongInt;
+    GlobalIndex: LongInt;
+  end;
+
+  TCrossUserLabel = record
+    Name: string;
+    LabelID: LongInt;
+  end;
+
+  { A static local has program lifetime, so it is laid out as a global but
+    only visible inside the function that declared it. }
+  TCrossStaticLocal = record
+    FunctionName: string;
+    VariableName: string;
+    GlobalIndex: LongInt;
+  end;
+
+  TCrossSwitchEntry = record
+    Statement: TStmt;
+    TargetLabel: LongInt;
+    IsDefault: Boolean;
+    Value: Int64;
+  end;
+  TCrossSwitchEntryArray = array of TCrossSwitchEntry;
+
   TCrossExternalCall = record
     Name: string;
     PatchOffset: LongInt;
@@ -98,6 +126,12 @@ type
     FGlobals: array of TCrossGlobal;
     FStrings: array of TCrossStringLiteral;
     FGlobalFixups: array of TCrossGlobalFixup;
+    FDataPointerFixups: array of TCrossDataPointerFixup;
+    FDataFunctionFixups: array of TCrossDataPointerFixup;
+    FFunctionAddressFixups: array of TCrossGlobalFixup;
+    FUserLabels: array of TCrossUserLabel;
+    FStaticLocals: array of TCrossStaticLocal;
+    FCurrentFunctionName: string;
     FExternalCalls: array of TCrossExternalCall;
     FSyscallSites: TTargetSyscallSiteArray;
     FBreakLabels: array of LongInt;
@@ -125,6 +159,7 @@ type
       out AType: TCType): Boolean;
     procedure EmitGlobalAddress(AGlobalIndex: LongInt);
     procedure ResolveGlobalFixups(ADataAddress: QWord);
+    procedure ResolveFunctionAddressFixups(ATextAddress: QWord);
     procedure EmitLoadAtAddress(const AType: TCType);
     procedure EmitStoreAtAddress(const AType: TCType);
     procedure EmitLoadGlobal(AGlobalIndex: LongInt; const AType: TCType);
@@ -140,6 +175,45 @@ type
     procedure PopLoop;
     procedure RequireScalar(const AType: TCType; const APos: TSourcePos;
       const AContext: string);
+    procedure RequireRegisterValue(const AType: TCType;
+      const APos: TSourcePos; const AContext: string);
+    function CountLocalBytes(AStatement: TStmt): LongInt;
+    procedure EmitLocalAddress(AOffset: LongInt);
+    procedure EmitAddLargeImmediate(AValue: Int64);
+    procedure EmitMoveAccumulatorToLeft;
+    procedure EmitMoveLeftToAccumulator;
+    procedure EmitMoveStackPointerToAccumulator;
+    procedure EmitPushAggregate(ASize: LongInt);
+    procedure EmitPopArgumentPair(AIndex: LongInt);
+    function AggregateRegisterCount(const AType: TCType): LongInt;
+    procedure EmitPopAccumulator;
+    procedure EmitCopyBlock(ASize: LongInt);
+    function AllocateTemporarySlot: LongInt;
+    procedure EmitZeroLocalBlock(AOffset, ASize: LongInt);
+    procedure GenAddress(AExpression: TExpr);
+    function TryGlobalConstantAddress(AExpression: TExpr;
+      out AGlobalIndex: LongInt): Boolean;
+    function TryConstantFunctionLabel(AExpression: TExpr): LongInt;
+    procedure EmitGlobalObject(const AType: TCType; AInitializer: TExpr;
+      const APos: TSourcePos);
+    procedure InitializeLocalAt(ABaseOffset, AByteOffset: LongInt;
+      const AType: TCType; AInitializer: TExpr; const APos: TSourcePos);
+    function FindUserLabel(const AName: string): LongInt;
+    procedure ReserveUserLabels(AStatement: TStmt);
+    procedure CollectSwitchEntries(AStatement: TStmt;
+      var AEntries: TCrossSwitchEntryArray);
+    procedure GenSwitchBody(AStatement: TStmt;
+      const AEntries: TCrossSwitchEntryArray);
+    function SwitchTargetFor(AStatement: TStmt;
+      const AEntries: TCrossSwitchEntryArray): LongInt;
+    procedure EmitFunctionAddress(ALabel: LongInt);
+    procedure EmitIndirectCall;
+    procedure InternInitializerLiterals(const AType: TCType;
+      AExpression: TExpr);
+    procedure ReserveStaticLocals(AStatement: TStmt);
+    function FindStaticLocal(const AName: string;
+      out AGlobalIndex: LongInt; out AType: TCType): Boolean;
+    function CountSwitchSlots(AStatement: TStmt): LongInt;
     procedure EmitLoadImmediate(AValue: Int64);
     procedure EmitNormalize(const AType: TCType);
     procedure EmitPushResult;
@@ -255,35 +329,236 @@ begin
   inherited Destroy;
 end;
 
+{ Label of a function named by a constant initializer, or -1. }
+function TCrossIntegerBackend.TryConstantFunctionLabel(
+  AExpression: TExpr): LongInt;
+begin
+  Result := -1;
+  if AExpression = nil then Exit;
+  if AExpression.Kind = ekCast then
+    Exit(TryConstantFunctionLabel(AExpression.Left));
+  if (AExpression.Kind = ekAddress) and (AExpression.Left <> nil) then
+    Exit(TryConstantFunctionLabel(AExpression.Left));
+  if (AExpression.Kind = ekVariable) and AExpression.IsFunctionDesignator then
+    Exit(FindFunctionLabel(AExpression.Text));
+end;
+
+{ Recognizes initializers that denote the address of another global, which is
+  how string literals and array names appear in static data. }
+function TCrossIntegerBackend.TryGlobalConstantAddress(AExpression: TExpr;
+  out AGlobalIndex: LongInt): Boolean;
+var
+  GlobalType: TCType;
+begin
+  Result := False;
+  AGlobalIndex := -1;
+  if AExpression = nil then Exit;
+  case AExpression.Kind of
+    ekString:
+      begin
+        AGlobalIndex := AddStringLiteral(AExpression.Text);
+        Exit(True);
+      end;
+    ekAddress:
+      begin
+        if (AExpression.Left <> nil) and
+           (AExpression.Left.Kind = ekVariable) then
+          Exit(FindGlobal(AExpression.Left.Text, AGlobalIndex, GlobalType));
+      end;
+    ekVariable:
+      begin
+        if IsArrayType(AExpression.CType) or
+           AExpression.IsFunctionDesignator then
+          Exit(FindGlobal(AExpression.Text, AGlobalIndex, GlobalType));
+      end;
+    ekCast: Exit(TryGlobalConstantAddress(AExpression.Left, AGlobalIndex));
+  end;
+end;
+
+{ Emits the static image of one object, recursing through aggregates the same
+  way the native backend does. }
+procedure TCrossIntegerBackend.EmitGlobalObject(const AType: TCType;
+  AInitializer: TExpr; const APos: TSourcePos);
+var
+  Size, Count, I, StartOffset, TargetOffset, GlobalIndex, N: LongInt;
+  ElementType, MemberType: TCType;
+  Value: Int64;
+  Member: TStructMember;
+  ItemInitializer: TExpr;
+
+  procedure AddZeros(AAmount: LongInt);
+  var
+    Z: LongInt;
+  begin
+    for Z := 1 to AAmount do FData.Add8(0);
+  end;
+
+begin
+  Size := StorageSize(AType);
+  if AInitializer = nil then
+  begin
+    AddZeros(Size);
+    Exit;
+  end;
+
+  if IsArrayType(AType) then
+  begin
+    ElementType := ElementTypeOf(AType);
+    StartOffset := FData.Size;
+    if (AInitializer.Kind = ekString) and (ElementType.Kind = ctChar) and
+       (ElementType.PointerDepth = 0) then
+    begin
+      Count := Length(AInitializer.Text);
+      if Count >= AType.ArrayLength then Count := LongInt(AType.ArrayLength) - 1;
+      for I := 1 to Count do FData.Add8(Byte(Ord(AInitializer.Text[I])));
+      if FData.Size - StartOffset < AType.ArrayLength then FData.Add8(0);
+    end
+    else if AInitializer.Kind = ekCompoundLit then
+    begin
+      for I := 0 to LongInt(AType.ArrayLength) - 1 do
+        if I <= High(AInitializer.Args) then
+          EmitGlobalObject(ElementType, AInitializer.Args[I], APos)
+        else
+          EmitGlobalObject(ElementType, nil, APos);
+    end;
+    while FData.Size - StartOffset < Size do FData.Add8(0);
+    if FData.Size - StartOffset > Size then
+      RaiseCompileError(APos, 'initializer is too large for array object');
+    Exit;
+  end;
+
+  if (AType.PointerDepth = 0) and (AType.Kind in [ctStruct, ctUnion]) then
+  begin
+    if AType.StructInfo = nil then
+      RaiseCompileError(APos, 'cannot allocate incomplete aggregate type');
+    StartOffset := FData.Size;
+    if AInitializer.Kind <> ekCompoundLit then
+      RaiseCompileError(APos, 'aggregate initializer requires braces');
+    for I := 0 to High(AType.StructInfo^.Members) do
+    begin
+      Member := AType.StructInfo^.Members[I];
+      if Member.IsBitField then
+        RaiseCompileError(APos,
+          'static bit-field initialization is unsupported in the cross backend');
+      TargetOffset := StartOffset + Member.Offset;
+      while FData.Size < TargetOffset do FData.Add8(0);
+      MemberType := PCType(Member.CType)^;
+      if I <= High(AInitializer.Args) then
+        ItemInitializer := AInitializer.Args[I]
+      else
+        ItemInitializer := nil;
+      EmitGlobalObject(MemberType, ItemInitializer, APos);
+      if AType.Kind = ctUnion then Break;
+    end;
+    while FData.Size - StartOffset < Size do FData.Add8(0);
+    Exit;
+  end;
+
+  if IsPointerType(AType) then
+  begin
+    { A static pointer to a function records the callee's text address. }
+    GlobalIndex := TryConstantFunctionLabel(AInitializer);
+    if GlobalIndex >= 0 then
+    begin
+      N := Length(FDataFunctionFixups);
+      SetLength(FDataFunctionFixups, N + 1);
+      FDataFunctionFixups[N].DataOffset := FData.Size;
+      FDataFunctionFixups[N].GlobalIndex := GlobalIndex;
+      AddZeros(8);
+      Exit;
+    end;
+    if TryGlobalConstantAddress(AInitializer, GlobalIndex) then
+    begin
+      N := Length(FDataPointerFixups);
+      SetLength(FDataPointerFixups, N + 1);
+      FDataPointerFixups[N].DataOffset := FData.Size;
+      FDataPointerFixups[N].GlobalIndex := GlobalIndex;
+      AddZeros(8);
+      Exit;
+    end;
+  end;
+
+  Value := 0;
+  if not EvaluateIntegerConstantExpression(AInitializer, Value) then
+    RaiseCompileError(APos,
+      'cross-target global initializer must be a constant expression');
+  Value := ConvertIntegerValue(Value, AType);
+  for I := 0 to Size - 1 do
+    FData.Add8(Byte(QWord(Value) shr (I * 8)));
+end;
+
+{ A string literal used as a pointer value becomes its own global, so it has to
+  be interned before any object's bytes are laid out. A string filling a char
+  array is inlined instead and needs no literal. }
+procedure TCrossIntegerBackend.InternInitializerLiterals(const AType: TCType;
+  AExpression: TExpr);
+var
+  J: LongInt;
+  ElementType: TCType;
+begin
+  if AExpression = nil then Exit;
+  if IsArrayType(AType) then
+  begin
+    ElementType := ElementTypeOf(AType);
+    if (AExpression.Kind = ekString) and (ElementType.Kind = ctChar) and
+       (ElementType.PointerDepth = 0) then Exit;
+    if AExpression.Kind = ekCompoundLit then
+      for J := 0 to High(AExpression.Args) do
+        InternInitializerLiterals(ElementType, AExpression.Args[J]);
+    Exit;
+  end;
+  if (AType.PointerDepth = 0) and (AType.Kind in [ctStruct, ctUnion]) and
+     (AType.StructInfo <> nil) and (AExpression.Kind = ekCompoundLit) then
+  begin
+    for J := 0 to High(AExpression.Args) do
+      if J <= High(AType.StructInfo^.Members) then
+        InternInitializerLiterals(PCType(AType.StructInfo^.Members[J].CType)^,
+          AExpression.Args[J]);
+    Exit;
+  end;
+  if IsPointerType(AType) and (AExpression.Kind = ekString) then
+    AddStringLiteral(AExpression.Text);
+end;
+
 procedure TCrossIntegerBackend.AllocateGlobals;
 var
-  I, N, Size, J: LongInt;
-  Value: Int64;
+  I, N: LongInt;
   Global: TGlobal;
+
 begin
   for I := 0 to High(FProgram.Globals) do
   begin
     Global := FProgram.Globals[I];
     if Global.IsExtern then Continue;
-    RequireScalar(Global.CType, Global.Pos, 'global variable');
-    Size := StorageSize(Global.CType);
+    InternInitializerLiterals(Global.CType, Global.Initializer);
+  end;
+
+  for I := 0 to High(FProgram.Globals) do
+  begin
+    Global := FProgram.Globals[I];
+    if Global.IsExtern then Continue;
+    if IsFloatingType(Global.CType) then
+      RaiseCompileError(Global.Pos,
+        'floating-point globals are not implemented in the cross backend');
     FData.PadTo(StorageAlign(Global.CType));
     N := Length(FGlobals);
     SetLength(FGlobals, N + 1);
     FGlobals[N].Name := Global.Name;
     FGlobals[N].Offset := FData.Size;
-    FGlobals[N].Size := Size;
+    FGlobals[N].Size := StorageSize(Global.CType);
     FGlobals[N].CType := Global.CType;
     FGlobals[N].IsStatic := Global.IsStatic;
-    Value := 0;
-    if (Global.Initializer <> nil) and
-       not EvaluateIntegerConstantExpression(Global.Initializer, Value) then
-      RaiseCompileError(Global.Pos,
-        'cross-target global initializer must be an integer constant expression');
-    Value := ConvertIntegerValue(Value, Global.CType);
-    for J := 0 to Size - 1 do
-      FData.Add8(Byte(QWord(Value) shr (J * 8)));
+    EmitGlobalObject(Global.CType, Global.Initializer, Global.Pos);
   end;
+
+  { Static locals share the data segment, so they are laid out here too. }
+  for I := 0 to High(FProgram.Functions) do
+    if not FProgram.Functions[I].IsPrototype then
+    begin
+      FCurrentFunctionName := FProgram.Functions[I].Name;
+      ReserveStaticLocals(FProgram.Functions[I].Body);
+    end;
+  FCurrentFunctionName := '';
 end;
 
 function TCrossIntegerBackend.AddStringLiteral(
@@ -362,12 +637,55 @@ begin
   FGlobalFixups[N].GlobalIndex := AGlobalIndex;
 end;
 
+{ Patches the constant-materialization sequences that take the address of a
+  function, now that the text segment placement is known. }
+procedure TCrossIntegerBackend.ResolveFunctionAddressFixups(
+  ATextAddress: QWord);
+var
+  I, P, Shift: LongInt;
+  Address: QWord;
+  High20, Low12: Int64;
+begin
+  for I := 0 to High(FDataFunctionFixups) do
+    FData.Patch64(FDataFunctionFixups[I].DataOffset,
+      ATextAddress + QWord(FLabels[FDataFunctionFixups[I].GlobalIndex].Offset));
+  for I := 0 to High(FFunctionAddressFixups) do
+  begin
+    P := FFunctionAddressFixups[I].PatchOffset;
+    Address := ATextAddress +
+      QWord(FLabels[FFunctionAddressFixups[I].GlobalIndex].Offset);
+    if FTarget.Architecture = archAArch64 then
+    begin
+      FText.Patch32(P, LongInt($D2800000 or
+        (LongWord(Address and $FFFF) shl 5)));
+      for Shift := 1 to 3 do
+        FText.Patch32(P + Shift * 4, LongInt($F2800000 or
+          (LongWord(Shift) shl 21) or
+          (LongWord((Address shr (Shift * 16)) and $FFFF) shl 5)));
+    end
+    else
+    begin
+      if Address > QWord(High(LongInt)) then
+        raise ERCCError.Create('error: RISC-V function address exceeds medlow range');
+      High20 := (Int64(Address) + $800) shr 12;
+      Low12 := Int64(Address) - (High20 shl 12);
+      FText.Patch32(P, LongInt((LongWord(High20) and $FFFFF) shl 12 or
+        LongWord(10 shl 7) or $37));
+      FText.Patch32(P + 4,
+        LongInt(EncodeRISCVI(LongInt(Low12), 10, 0, 10, $13)));
+    end;
+  end;
+end;
+
 procedure TCrossIntegerBackend.ResolveGlobalFixups(ADataAddress: QWord);
 var
   I, P, Shift: LongInt;
   Address: QWord;
   High20, Low12: Int64;
 begin
+  for I := 0 to High(FDataPointerFixups) do
+    FData.Patch64(FDataPointerFixups[I].DataOffset,
+      ADataAddress + QWord(FGlobals[FDataPointerFixups[I].GlobalIndex].Offset));
   for I := 0 to High(FGlobalFixups) do
   begin
     P := FGlobalFixups[I].PatchOffset;
@@ -608,11 +926,16 @@ end;
 procedure TCrossIntegerBackend.AddLocal(const AName: string;
   const AType: TCType; out AOffset: LongInt);
 var
-  N: LongInt;
+  N, Size, Alignment: LongInt;
 begin
-  RequireScalar(AType, Default(TSourcePos), 'local variable');
+  Size := StorageSize(AType);
+  if Size < 1 then Size := 1;
+  Alignment := StorageAlign(AType);
+  if Alignment < 1 then Alignment := 1;
+  if Alignment < 8 then Alignment := 8;
+  FNextLocalOffset := AlignUp(FNextLocalOffset, Alignment);
   AOffset := FNextLocalOffset;
-  Inc(FNextLocalOffset, 8);
+  Inc(FNextLocalOffset, AlignUp(Size, 8));
   if FNextLocalOffset > FFrameSize then
     raise ERCCError.Create('internal error: cross-target frame estimate is too small');
   N := Length(FLocals);
@@ -621,6 +944,27 @@ begin
   FLocals[N].Offset := AOffset;
   FLocals[N].CType := AType;
   FLocals[N].ScopeDepth := FScopeDepth;
+end;
+
+{ Frame space needed by a function body. Aggregates occupy their real size, so
+  counting declarations is not enough. }
+function TCrossIntegerBackend.CountLocalBytes(AStatement: TStmt): LongInt;
+var
+  I, Size: LongInt;
+begin
+  Result := 0;
+  if AStatement = nil then Exit;
+  if (AStatement.Kind = skDecl) and not AStatement.IsStatic then
+  begin
+    Size := StorageSize(AStatement.CType);
+    if Size < 8 then Size := 8;
+    Inc(Result, AlignUp(Size, 8) + StorageAlign(AStatement.CType) + 8);
+  end;
+  Inc(Result, CountLocalBytes(AStatement.InitStmt));
+  Inc(Result, CountLocalBytes(AStatement.Body));
+  Inc(Result, CountLocalBytes(AStatement.ElseBody));
+  for I := 0 to High(AStatement.Children) do
+    Inc(Result, CountLocalBytes(AStatement.Children[I]));
 end;
 
 function TCrossIntegerBackend.FindLocal(const AName: string;
@@ -679,13 +1023,182 @@ begin
     RaiseCompileError(APos, AContext + ' exceeds the cross register width');
 end;
 
+{ Values the cross backend can hold in the accumulator. Aggregates are handled
+  by address and so are allowed to flow through expressions; floating point is
+  the remaining gap. }
+procedure TCrossIntegerBackend.RequireRegisterValue(const AType: TCType;
+  const APos: TSourcePos; const AContext: string);
+begin
+  if AType.Kind = ctVoid then Exit;
+  if IsAggregateType(AType) or IsFunctionType(AType) then Exit;
+  if IsPointerType(AType) then Exit;
+  if IsFloatingType(AType) then
+    RaiseCompileError(APos, AContext +
+      ' uses floating point, which the cross backend does not implement yet');
+  if not IsIntegerType(AType) then
+    RaiseCompileError(APos, AContext +
+      ' requires an integer or pointer type in the freestanding cross backend');
+  if StorageSize(AType) > 8 then
+    RaiseCompileError(APos, AContext + ' exceeds the cross register width');
+end;
+
+{ Accumulator := frame pointer + AOffset. }
+procedure TCrossIntegerBackend.EmitLocalAddress(AOffset: LongInt);
+begin
+  if FTarget.Architecture = archAArch64 then
+  begin
+    { add x0, x29, #offset - the base register field must be written, not
+      merged into a template that already encodes sp. }
+    if (AOffset >= 0) and (AOffset <= 4095) then
+      EmitWord($91000000 or (LongWord(AOffset) shl 10) or (LongWord(29) shl 5))
+    else
+    begin
+      EmitLoadImmediate(AOffset);
+      EmitWord($8B0003A0);
+    end;
+  end
+  else
+  begin
+    if (AOffset >= -2048) and (AOffset <= 2047) then
+      EmitWord(EncodeRISCVI(AOffset, 8, 0, 10, $13))
+    else
+    begin
+      EmitLoadImmediate(AOffset);
+      EmitWord(EncodeRISCVR(0, 8, 10, 0, 10, $33));
+    end;
+  end;
+end;
+
+{ Accumulator := accumulator + AValue, for displacements of any magnitude. }
+procedure TCrossIntegerBackend.EmitAddLargeImmediate(AValue: Int64);
+begin
+  if AValue = 0 then Exit;
+  if (AValue >= -2047) and (AValue <= 2047) then
+  begin
+    EmitAddImmediate(LongInt(AValue));
+    Exit;
+  end;
+  { Stage the accumulator, materialize the displacement, and add. }
+  EmitPushResult;
+  EmitLoadImmediate(AValue);
+  EmitPopLeft;
+  if FTarget.Architecture = archAArch64 then
+    EmitWord($8B000020)
+  else
+    EmitWord(EncodeRISCVR(0, 10, 5, 0, 10, $33));
+end;
+
+procedure TCrossIntegerBackend.EmitMoveAccumulatorToLeft;
+begin
+  if FTarget.Architecture = archAArch64 then
+    EmitWord($AA0003E1)
+  else
+    EmitWord(EncodeRISCVI(0, 10, 0, 5, $13));
+end;
+
+function TCrossIntegerBackend.AggregateRegisterCount(
+  const AType: TCType): LongInt;
+begin
+  if StorageSize(AType) <= 8 then Result := 1 else Result := 2;
+end;
+
+procedure TCrossIntegerBackend.EmitMoveStackPointerToAccumulator;
+begin
+  if FTarget.Architecture = archAArch64 then
+    EmitWord($910003E0)
+  else
+    EmitWord(EncodeRISCVI(0, 2, 0, 10, $13));
+end;
+
+{ Copies an aggregate whose address is in the accumulator into a fresh 16-byte
+  argument staging slot. Both supported ABIs pass aggregates of at most two
+  words in consecutive integer registers. }
+procedure TCrossIntegerBackend.EmitPushAggregate(ASize: LongInt);
+begin
+  EmitMoveAccumulatorToLeft;
+  if FTarget.Architecture = archAArch64 then
+    EmitWord($D10043FF)
+  else
+    EmitWord(EncodeRISCVI(-16, 2, 0, 2, $13));
+  EmitMoveStackPointerToAccumulator;
+  EmitCopyBlock(ASize);
+end;
+
+{ Loads a staged aggregate into one or two argument registers. }
+procedure TCrossIntegerBackend.EmitPopArgumentPair(AIndex: LongInt);
+var
+  First, Second: LongInt;
+begin
+  if FTarget.Architecture = archAArch64 then
+  begin
+    First := AIndex;
+    Second := AIndex + 1;
+    EmitWord($F94003E0 or LongWord(First));
+    EmitWord($F94007E0 or LongWord(Second));
+    EmitWord($910043FF);
+  end
+  else
+  begin
+    First := 10 + AIndex;
+    Second := 11 + AIndex;
+    EmitWord(EncodeRISCVI(0, 2, 3, First, $03));
+    EmitWord(EncodeRISCVI(8, 2, 3, Second, $03));
+    EmitWord(EncodeRISCVI(16, 2, 0, 2, $13));
+  end;
+end;
+
+procedure TCrossIntegerBackend.EmitMoveLeftToAccumulator;
+begin
+  if FTarget.Architecture = archAArch64 then
+    EmitWord($AA0103E0)
+  else
+    EmitWord(EncodeRISCVI(0, 5, 0, 10, $13));
+end;
+
+procedure TCrossIntegerBackend.EmitPopAccumulator;
+begin
+  if FTarget.Architecture = archAArch64 then
+  begin
+    EmitWord($F94003E0);
+    EmitWord($910043FF);
+  end
+  else
+  begin
+    EmitWord(EncodeRISCVI(0, 2, 3, 10, $03));
+    EmitWord(EncodeRISCVI(16, 2, 0, 2, $13));
+  end;
+end;
+
+{ Byte-wise copy of ASize bytes from the address in the left register to the
+  address in the accumulator. Used for aggregate assignment and argument and
+  return passing. }
+procedure TCrossIntegerBackend.EmitCopyBlock(ASize: LongInt);
+var
+  I: LongInt;
+begin
+  if ASize <= 0 then Exit;
+  for I := 0 to ASize - 1 do
+    if FTarget.Architecture = archAArch64 then
+    begin
+      { ldrb w9,[x1,#I] ; strb w9,[x0,#I] }
+      EmitWord($39400029 or (LongWord(I) shl 10));
+      EmitWord($39000009 or (LongWord(I) shl 10));
+    end
+    else
+    begin
+      { lbu t1,I(t0) ; sb t1,I(a0) }
+      EmitWord(EncodeRISCVI(I, 5, 4, 6, $03));
+      EmitWord(EncodeRISCVS(I, 6, 10, 0));
+    end;
+end;
+
 procedure TCrossIntegerBackend.EmitLoadImmediate(AValue: Int64);
 var
   Part: LongWord;
   Shift: LongInt;
   First: Boolean;
   Instruction: LongWord;
-  High20, Low12: Int64;
+  High20, Low12, HighPart, LowPart: Int64;
 begin
   if FTarget.Architecture = archAArch64 then
   begin
@@ -709,13 +1222,32 @@ begin
     EmitWord(EncodeRISCVI(LongInt(AValue), 0, 0, 10, $13));
     Exit;
   end;
-  if (AValue < Low(LongInt)) or (AValue > High(LongInt)) then
-    raise ERCCError.Create(
-      'error: RISC-V integer code generation requires a signed 32-bit constant');
-  High20 := (AValue + $800) shr 12;
-  Low12 := AValue - (High20 shl 12);
+  if (AValue >= Low(LongInt)) and (AValue <= High(LongInt)) then
+  begin
+    High20 := (AValue + $800) shr 12;
+    Low12 := AValue - (High20 shl 12);
+    EmitWord((LongWord(High20) and $FFFFF) shl 12 or (10 shl 7) or $37);
+    EmitWord(EncodeRISCVI(LongInt(Low12), 10, 0, 10, $13));
+    Exit;
+  end;
+
+  { Wider constants are built from two 32-bit halves: the high half is placed
+    in the upper word and the zero-extended low half is added underneath. }
+  HighPart := Int64(LongInt(LongWord(QWord(AValue) shr 32)));
+  LowPart := Int64(LongWord(QWord(AValue) and $FFFFFFFF));
+  High20 := (HighPart + $800) shr 12;
+  Low12 := HighPart - (High20 shl 12);
   EmitWord((LongWord(High20) and $FFFFF) shl 12 or (10 shl 7) or $37);
   EmitWord(EncodeRISCVI(LongInt(Low12), 10, 0, 10, $13));
+  EmitWord(EncodeRISCVI(32, 10, 1, 10, $13));
+  High20 := (LowPart + $800) shr 12;
+  Low12 := LowPart - (High20 shl 12);
+  EmitWord((LongWord(High20) and $FFFFF) shl 12 or (6 shl 7) or $37);
+  EmitWord(EncodeRISCVI(LongInt(Low12), 6, 0, 6, $13));
+  { Clear any sign extension the low half picked up. }
+  EmitWord(EncodeRISCVI(32, 6, 1, 6, $13));
+  EmitWord(EncodeRISCVI(32, 6, 5, 6, $13));
+  EmitWord(EncodeRISCVR(0, 6, 10, 0, 10, $33));
 end;
 
 procedure TCrossIntegerBackend.EmitNormalize(const AType: TCType);
@@ -997,97 +1529,533 @@ begin
     EmitWord(EncodeRISCVJAL(1, 0));
 end;
 
+procedure TCrossIntegerBackend.ReserveStaticLocals(AStatement: TStmt);
+var
+  I, N, G: LongInt;
+begin
+  if AStatement = nil then Exit;
+  if (AStatement.Kind = skDecl) and AStatement.IsStatic then
+  begin
+    { Literals referenced by the initializer are objects of their own and must
+      be laid out before this object's bytes. }
+    InternInitializerLiterals(AStatement.CType, AStatement.Expr);
+    FData.PadTo(StorageAlign(AStatement.CType));
+    G := Length(FGlobals);
+    SetLength(FGlobals, G + 1);
+    FGlobals[G].Name := FCurrentFunctionName + '.' + AStatement.Name;
+    FGlobals[G].Offset := FData.Size;
+    FGlobals[G].Size := StorageSize(AStatement.CType);
+    FGlobals[G].CType := AStatement.CType;
+    FGlobals[G].IsStatic := True;
+    EmitGlobalObject(AStatement.CType, AStatement.Expr, AStatement.Pos);
+    N := Length(FStaticLocals);
+    SetLength(FStaticLocals, N + 1);
+    FStaticLocals[N].FunctionName := FCurrentFunctionName;
+    FStaticLocals[N].VariableName := AStatement.Name;
+    FStaticLocals[N].GlobalIndex := G;
+  end;
+  ReserveStaticLocals(AStatement.InitStmt);
+  ReserveStaticLocals(AStatement.Body);
+  ReserveStaticLocals(AStatement.ElseBody);
+  for I := 0 to High(AStatement.Children) do
+    ReserveStaticLocals(AStatement.Children[I]);
+end;
+
+function TCrossIntegerBackend.FindStaticLocal(const AName: string;
+  out AGlobalIndex: LongInt; out AType: TCType): Boolean;
+var
+  I: LongInt;
+begin
+  for I := High(FStaticLocals) downto 0 do
+    if (FStaticLocals[I].VariableName = AName) and
+       (FStaticLocals[I].FunctionName = FCurrentFunctionName) then
+    begin
+      AGlobalIndex := FStaticLocals[I].GlobalIndex;
+      AType := FGlobals[AGlobalIndex].CType;
+      Exit(True);
+    end;
+  AGlobalIndex := -1;
+  AType := MakeType(ctVoid);
+  Result := False;
+end;
+
+function TCrossIntegerBackend.CountSwitchSlots(AStatement: TStmt): LongInt;
+var
+  I: LongInt;
+begin
+  Result := 0;
+  if AStatement = nil then Exit;
+  if AStatement.Kind = skSwitch then Inc(Result);
+  Inc(Result, CountSwitchSlots(AStatement.InitStmt));
+  Inc(Result, CountSwitchSlots(AStatement.Body));
+  Inc(Result, CountSwitchSlots(AStatement.ElseBody));
+  for I := 0 to High(AStatement.Children) do
+    Inc(Result, CountSwitchSlots(AStatement.Children[I]));
+end;
+
+function TCrossIntegerBackend.AllocateTemporarySlot: LongInt;
+begin
+  FNextLocalOffset := AlignUp(FNextLocalOffset, 8);
+  Result := FNextLocalOffset;
+  Inc(FNextLocalOffset, 8);
+  if FNextLocalOffset > FFrameSize then
+    raise ERCCError.Create('internal error: cross-target frame estimate is too small');
+end;
+
+procedure TCrossIntegerBackend.EmitZeroLocalBlock(AOffset, ASize: LongInt);
+var
+  I: LongInt;
+begin
+  if ASize <= 0 then Exit;
+  EmitLoadImmediate(0);
+  I := 0;
+  while I + 8 <= ASize do
+  begin
+    EmitStoreLocal(AOffset + I);
+    Inc(I, 8);
+  end;
+  while I < ASize do
+  begin
+    if FTarget.Architecture = archAArch64 then
+      EmitWord($39000000 or (LongWord(AOffset + I) shl 10) or
+        (LongWord(29) shl 5))
+    else
+      EmitWord(EncodeRISCVS(AOffset + I, 10, 8, 0));
+    Inc(I);
+  end;
+end;
+
+{ Fills an aggregate local element by element, mirroring the native backend's
+  initializer walk. }
+procedure TCrossIntegerBackend.InitializeLocalAt(ABaseOffset,
+  AByteOffset: LongInt; const AType: TCType; AInitializer: TExpr;
+  const APos: TSourcePos);
+var
+  I, Count, ElementSize: LongInt;
+  ElementType, MemberType: TCType;
+  Member: TStructMember;
+begin
+  if AInitializer = nil then Exit;
+
+  if IsArrayType(AType) then
+  begin
+    ElementType := ElementTypeOf(AType);
+    ElementSize := StorageSize(ElementType);
+    if (AInitializer.Kind = ekString) and (ElementType.Kind = ctChar) and
+       (ElementType.PointerDepth = 0) then
+    begin
+      Count := Length(AInitializer.Text);
+      if Count >= AType.ArrayLength then Count := LongInt(AType.ArrayLength) - 1;
+      for I := 0 to Count - 1 do
+      begin
+        EmitLoadImmediate(Ord(AInitializer.Text[I + 1]));
+        EmitMoveAccumulatorToLeft;
+        EmitLocalAddress(ABaseOffset + AByteOffset + I);
+        EmitStoreAtAddress(ElementType);
+      end;
+      Exit;
+    end;
+    if AInitializer.Kind <> ekCompoundLit then
+      RaiseCompileError(APos,
+        'array initializer requires braces or a string literal');
+    for I := 0 to High(AInitializer.Args) do
+    begin
+      if I >= AType.ArrayLength then
+        RaiseCompileError(APos, 'too many elements in array initializer');
+      InitializeLocalAt(ABaseOffset, AByteOffset + I * ElementSize,
+        ElementType, AInitializer.Args[I], APos);
+    end;
+    Exit;
+  end;
+
+  if (AType.PointerDepth = 0) and (AType.Kind in [ctStruct, ctUnion]) then
+  begin
+    if AType.StructInfo = nil then
+      RaiseCompileError(APos, 'initializer uses incomplete aggregate type');
+    if AInitializer.Kind <> ekCompoundLit then
+    begin
+      { Copy from another aggregate value, which may be an lvalue or the
+        result of a call; either way the expression yields its address. }
+      GenExpr(AInitializer);
+      EmitMoveAccumulatorToLeft;
+      EmitLocalAddress(ABaseOffset + AByteOffset);
+      EmitCopyBlock(StorageSize(AType));
+      Exit;
+    end;
+    for I := 0 to High(AInitializer.Args) do
+    begin
+      if I > High(AType.StructInfo^.Members) then
+        RaiseCompileError(APos, 'too many values in aggregate initializer');
+      Member := AType.StructInfo^.Members[I];
+      if Member.IsBitField then
+        RaiseCompileError(APos,
+          'bit-field initialization is unsupported in the cross backend');
+      MemberType := PCType(Member.CType)^;
+      InitializeLocalAt(ABaseOffset, AByteOffset + Member.Offset,
+        MemberType, AInitializer.Args[I], APos);
+    end;
+    Exit;
+  end;
+
+  GenExpr(AInitializer);
+  EmitNormalize(AType);
+  EmitMoveAccumulatorToLeft;
+  EmitLocalAddress(ABaseOffset + AByteOffset);
+  EmitStoreAtAddress(AType);
+end;
+
+function TCrossIntegerBackend.FindUserLabel(const AName: string): LongInt;
+var
+  I: LongInt;
+begin
+  for I := 0 to High(FUserLabels) do
+    if FUserLabels[I].Name = AName then Exit(FUserLabels[I].LabelID);
+  raise ERCCError.Create('internal error: undefined cross-target label ' + AName);
+end;
+
+procedure TCrossIntegerBackend.ReserveUserLabels(AStatement: TStmt);
+var
+  I, N: LongInt;
+begin
+  if AStatement = nil then Exit;
+  if AStatement.Kind = skLabel then
+  begin
+    N := Length(FUserLabels);
+    SetLength(FUserLabels, N + 1);
+    FUserLabels[N].Name := AStatement.Name;
+    FUserLabels[N].LabelID := NewLabel;
+  end;
+  ReserveUserLabels(AStatement.InitStmt);
+  ReserveUserLabels(AStatement.Body);
+  ReserveUserLabels(AStatement.ElseBody);
+  for I := 0 to High(AStatement.Children) do
+    ReserveUserLabels(AStatement.Children[I]);
+end;
+
+procedure TCrossIntegerBackend.CollectSwitchEntries(AStatement: TStmt;
+  var AEntries: TCrossSwitchEntryArray);
+var
+  I, N: LongInt;
+begin
+  if AStatement = nil then Exit;
+  if AStatement.Kind in [skCase, skDefault] then
+  begin
+    N := Length(AEntries);
+    SetLength(AEntries, N + 1);
+    AEntries[N].Statement := AStatement;
+    AEntries[N].TargetLabel := -1;
+    AEntries[N].IsDefault := AStatement.Kind = skDefault;
+    AEntries[N].Value := AStatement.CaseValue;
+    if (AStatement.Body <> nil) and
+       (AStatement.Body.Kind in [skCase, skDefault]) then
+      CollectSwitchEntries(AStatement.Body, AEntries);
+    Exit;
+  end;
+  { A nested switch owns its own labels. }
+  if AStatement.Kind = skSwitch then Exit;
+  if AStatement.Kind = skBlock then
+    for I := 0 to High(AStatement.Children) do
+      CollectSwitchEntries(AStatement.Children[I], AEntries);
+end;
+
+function TCrossIntegerBackend.SwitchTargetFor(AStatement: TStmt;
+  const AEntries: TCrossSwitchEntryArray): LongInt;
+var
+  I: LongInt;
+begin
+  for I := 0 to High(AEntries) do
+    if AEntries[I].Statement = AStatement then Exit(AEntries[I].TargetLabel);
+  Result := -1;
+end;
+
+{ Emits the switch body in source order, binding each case label where it
+  appears so execution falls through between cases. }
+procedure TCrossIntegerBackend.GenSwitchBody(AStatement: TStmt;
+  const AEntries: TCrossSwitchEntryArray);
+var
+  I, Target, SavedCount: LongInt;
+begin
+  if AStatement = nil then Exit;
+  if AStatement.Kind in [skCase, skDefault] then
+  begin
+    Target := SwitchTargetFor(AStatement, AEntries);
+    if Target >= 0 then BindLabel(Target);
+    GenSwitchBody(AStatement.Body, AEntries);
+    Exit;
+  end;
+  if AStatement.Kind = skBlock then
+  begin
+    if AStatement.IsDeclarationGroup then
+    begin
+      for I := 0 to High(AStatement.Children) do
+        GenSwitchBody(AStatement.Children[I], AEntries);
+      Exit;
+    end;
+    { The switch body and any braced case body are still blocks, so they scope
+      their declarations even though case labels are walked here. }
+    SavedCount := Length(FLocals);
+    EnterScope;
+    for I := 0 to High(AStatement.Children) do
+      GenSwitchBody(AStatement.Children[I], AEntries);
+    LeaveScope(SavedCount);
+    Exit;
+  end;
+  GenStmt(AStatement);
+end;
+
+{ Leaves the address of an lvalue in the accumulator. }
+procedure TCrossIntegerBackend.GenAddress(AExpression: TExpr);
+var
+  Offset, GlobalIndex, Scale, FunctionLabel: LongInt;
+  LocalType: TCType;
+  Member: TStructMember;
+begin
+  if AExpression = nil then
+    raise ERCCError.Create('internal error: nil cross-target lvalue');
+  case AExpression.Kind of
+    ekVariable:
+      begin
+        if AExpression.IsFunctionDesignator then
+        begin
+          FunctionLabel := FindFunctionLabel(AExpression.Text);
+          if FunctionLabel < 0 then
+            RaiseCompileError(AExpression.Pos,
+              'cross-target address of undefined function ''' +
+              AExpression.Text + '''');
+          EmitFunctionAddress(FunctionLabel);
+          Exit;
+        end;
+        if FindLocal(AExpression.Text, Offset, LocalType) then
+          EmitLocalAddress(Offset)
+        else if FindStaticLocal(AExpression.Text, GlobalIndex, LocalType) then
+          EmitGlobalAddress(GlobalIndex)
+        else if FindGlobal(AExpression.Text, GlobalIndex, LocalType) then
+          EmitGlobalAddress(GlobalIndex)
+        else
+          RaiseCompileError(AExpression.Pos,
+            'cross-target variable has no definition: ' + AExpression.Text);
+      end;
+    ekDeref: GenExpr(AExpression.Left);
+    ekIndex:
+      begin
+        Scale := LongInt(AExpression.IntValue);
+        if Scale < 1 then Scale := 1;
+        GenExpr(AExpression.Left);
+        if (AExpression.Right <> nil) and
+           (AExpression.Right.Kind = ekInteger) then
+          EmitAddLargeImmediate(AExpression.Right.IntValue * Scale)
+        else
+        begin
+          EmitPushResult;
+          GenExpr(AExpression.Right);
+          if Scale > 1 then
+          begin
+            EmitMoveAccumulatorToLeft;
+            EmitLoadImmediate(Scale);
+            if FTarget.Architecture = archAArch64 then
+              EmitWord($9B007C20)
+            else
+              EmitWord(EncodeRISCVR(1, 10, 5, 0, 10, $33));
+          end;
+          EmitPopLeft;
+          if FTarget.Architecture = archAArch64 then
+            EmitWord($8B000020)
+          else
+            EmitWord(EncodeRISCVR(0, 10, 5, 0, 10, $33));
+        end;
+      end;
+    ekMember:
+      begin
+        if not FindMember(AExpression.Left.CType, AExpression.Text, Member) then
+          RaiseCompileError(AExpression.Pos,
+            'unknown aggregate member ''' + AExpression.Text + '''');
+        if Member.IsBitField or AExpression.IsBitField then
+          RaiseCompileError(AExpression.Pos,
+            'bit-field access is not implemented in the cross backend');
+        GenAddress(AExpression.Left);
+        EmitAddLargeImmediate(Member.Offset);
+      end;
+    ekArrow:
+      begin
+        if not FindMember(PointeeType(DecayType(AExpression.Left.CType)),
+             AExpression.Text, Member) then
+          RaiseCompileError(AExpression.Pos,
+            'unknown aggregate member ''' + AExpression.Text + '''');
+        if Member.IsBitField or AExpression.IsBitField then
+          RaiseCompileError(AExpression.Pos,
+            'bit-field access is not implemented in the cross backend');
+        GenExpr(AExpression.Left);
+        EmitAddLargeImmediate(Member.Offset);
+      end;
+  else
+    RaiseCompileError(AExpression.Pos,
+      'expression is not an addressable object in the cross backend');
+  end;
+end;
+
 procedure TCrossIntegerBackend.GenAssignment(AExpression: TExpr);
 var
-  Offset, GlobalIndex: LongInt;
-  LocalType: TCType;
   Operation: TBinaryOp;
-  IsLocal: Boolean;
+  TargetType: TCType;
+  Scale: LongInt;
 begin
-  if (AExpression.Left = nil) or (AExpression.Left.Kind <> ekVariable) then
+  if AExpression.Left = nil then
     RaiseCompileError(AExpression.Pos,
-      'cross-target assignment requires a scalar variable');
-  IsLocal := FindLocal(AExpression.Left.Text, Offset, LocalType);
-  if not IsLocal and
-     not FindGlobal(AExpression.Left.Text, GlobalIndex, LocalType) then
-    RaiseCompileError(AExpression.Pos,
-      'cross-target assignment has no storage for ''' +
-      AExpression.Left.Text + '''');
-  if AExpression.AssignOp = aoAssign then
-    GenExpr(AExpression.Right)
-  else
+      'cross-target assignment requires an lvalue');
+  TargetType := AExpression.Left.CType;
+
+  if IsAggregateType(TargetType) then
   begin
-    if IsLocal then EmitLoadLocal(Offset)
-    else EmitLoadGlobal(GlobalIndex, LocalType);
+    if AExpression.AssignOp <> aoAssign then
+      RaiseCompileError(AExpression.Pos,
+        'compound assignment is invalid for aggregates');
+    GenAddress(AExpression.Right);
+    EmitPushResult;
+    GenAddress(AExpression.Left);
+    EmitPopLeft;
+    EmitCopyBlock(StorageSize(TargetType));
+    Exit;
+  end;
+
+  if AExpression.AssignOp = aoAssign then
+  begin
+    GenAddress(AExpression.Left);
     EmitPushResult;
     GenExpr(AExpression.Right);
-    EmitPopLeft;
-    case AExpression.AssignOp of
-      aoAdd: Operation := boAdd;
-      aoSub: Operation := boSub;
-      aoMul: Operation := boMul;
-      aoDiv: Operation := boDiv;
-      aoMod: Operation := boMod;
-      aoBitAnd: Operation := boBitAnd;
-      aoBitOr: Operation := boBitOr;
-      aoBitXor: Operation := boBitXor;
-      aoShiftLeft: Operation := boShiftLeft;
-      aoShiftRight: Operation := boShiftRight;
-    else
-      Operation := boAdd;
-    end;
-    EmitBinary(Operation, LocalType.IsUnsigned);
+    EmitNormalize(TargetType);
+    EmitMoveAccumulatorToLeft;
+    EmitPopAccumulator;
+    EmitStoreAtAddress(TargetType);
+    EmitMoveLeftToAccumulator;
+    Exit;
   end;
-  EmitNormalize(LocalType);
-  if IsLocal then EmitStoreLocal(Offset)
-  else EmitStoreGlobal(GlobalIndex, LocalType);
+
+  GenAddress(AExpression.Left);
+  EmitPushResult;
+  EmitLoadAtAddress(TargetType);
+  EmitPushResult;
+  GenExpr(AExpression.Right);
+  { Adding to a pointer advances by whole elements. }
+  if IsPointerType(DecayType(TargetType)) and
+     (AExpression.AssignOp in [aoAdd, aoSub]) then
+  begin
+    Scale := StorageSize(PointeeType(DecayType(TargetType)));
+    if Scale > 1 then
+    begin
+      EmitMoveAccumulatorToLeft;
+      EmitLoadImmediate(Scale);
+      if FTarget.Architecture = archAArch64 then
+        EmitWord($9B007C20)
+      else
+        EmitWord(EncodeRISCVR(1, 10, 5, 0, 10, $33));
+    end;
+  end;
+  EmitPopLeft;
+  case AExpression.AssignOp of
+    aoAdd: Operation := boAdd;
+    aoSub: Operation := boSub;
+    aoMul: Operation := boMul;
+    aoDiv: Operation := boDiv;
+    aoMod: Operation := boMod;
+    aoBitAnd: Operation := boBitAnd;
+    aoBitOr: Operation := boBitOr;
+    aoBitXor: Operation := boBitXor;
+    aoShiftLeft: Operation := boShiftLeft;
+    aoShiftRight: Operation := boShiftRight;
+  else
+    Operation := boAdd;
+  end;
+  EmitBinary(Operation, TargetType.IsUnsigned);
+  EmitNormalize(TargetType);
+  EmitMoveAccumulatorToLeft;
+  EmitPopAccumulator;
+  EmitStoreAtAddress(TargetType);
+  EmitMoveLeftToAccumulator;
 end;
 
 procedure TCrossIntegerBackend.GenIncDec(AExpression: TExpr;
   ADelta: LongInt; APost: Boolean);
 var
-  Offset, GlobalIndex: LongInt;
-  LocalType: TCType;
-  IsLocal: Boolean;
+  TargetType: TCType;
+  Delta: LongInt;
 begin
-  if (AExpression.Left = nil) or (AExpression.Left.Kind <> ekVariable) then
+  if AExpression.Left = nil then
     RaiseCompileError(AExpression.Pos,
-      'cross-target increment requires a scalar variable');
-  IsLocal := FindLocal(AExpression.Left.Text, Offset, LocalType);
-  if not IsLocal and
-     not FindGlobal(AExpression.Left.Text, GlobalIndex, LocalType) then
-    RaiseCompileError(AExpression.Pos,
-      'cross-target increment has no storage for ''' +
-      AExpression.Left.Text + '''');
-  if IsLocal then EmitLoadLocal(Offset)
-  else EmitLoadGlobal(GlobalIndex, LocalType);
-  if APost then EmitPushResult;
-  EmitAddImmediate(ADelta);
-  EmitNormalize(LocalType);
-  if IsLocal then EmitStoreLocal(Offset)
-  else EmitStoreGlobal(GlobalIndex, LocalType);
+      'cross-target increment requires an lvalue');
+  TargetType := AExpression.Left.CType;
+  Delta := ADelta;
+  if AExpression.IntValue > 1 then Delta := Delta * LongInt(AExpression.IntValue);
+
+  GenAddress(AExpression.Left);
+  EmitPushResult;
+  EmitLoadAtAddress(TargetType);
+  EmitAddLargeImmediate(Delta);
+  EmitNormalize(TargetType);
+  EmitMoveAccumulatorToLeft;
+  EmitPopAccumulator;
+  EmitStoreAtAddress(TargetType);
+  EmitMoveLeftToAccumulator;
   if APost then
   begin
-    if FTarget.Architecture = archAArch64 then
-    begin
-      EmitWord($F94003E0);
-      EmitWord($910043FF);
-    end
-    else
-    begin
-      EmitWord(EncodeRISCVI(0, 2, 3, 10, $03));
-      EmitWord(EncodeRISCVI(16, 2, 0, 2, $13));
-    end;
+    { The expression yields the value from before the update. }
+    EmitAddLargeImmediate(-Delta);
+    EmitNormalize(TargetType);
+  end;
+end;
+
+{ Materializes the run-time address of a function into the accumulator. Text
+  addresses are resolved once the image layout is known. }
+procedure TCrossIntegerBackend.EmitFunctionAddress(ALabel: LongInt);
+var
+  N, P: LongInt;
+begin
+  P := FText.Size;
+  if FTarget.Architecture = archAArch64 then
+  begin
+    EmitWord($D2800000);
+    EmitWord($F2A00000);
+    EmitWord($F2C00000);
+    EmitWord($F2E00000);
+  end
+  else
+  begin
+    EmitWord(LongWord(10 shl 7) or $37);
+    EmitWord(EncodeRISCVI(0, 10, 0, 10, $13));
+  end;
+  N := Length(FFunctionAddressFixups);
+  SetLength(FFunctionAddressFixups, N + 1);
+  FFunctionAddressFixups[N].PatchOffset := P;
+  FFunctionAddressFixups[N].GlobalIndex := ALabel;
+end;
+
+{ Pops the staged callee address into a scratch register and branches to it.
+  A scratch register is required because the accumulator doubles as the first
+  argument register. }
+procedure TCrossIntegerBackend.EmitIndirectCall;
+begin
+  if FTarget.Architecture = archAArch64 then
+  begin
+    EmitWord($F94003E0 or 9);
+    EmitWord($910043FF);
+    EmitWord($D63F0000 or (LongWord(9) shl 5));
+  end
+  else
+  begin
+    EmitWord(EncodeRISCVI(0, 2, 3, 6, $03));
+    EmitWord(EncodeRISCVI(16, 2, 0, 2, $13));
+    EmitWord(EncodeRISCVI(0, 6, 0, 1, $67));
   end;
 end;
 
 procedure TCrossIntegerBackend.GenExpr(AExpression: TExpr);
 var
   I, Offset, GlobalIndex, FalseLabel, EndLabel, FunctionLabel,
-    FixedArgumentCount, VariadicArgumentCount, SourceOffset,
-    DestinationOffset: LongInt;
+    FixedArgumentCount, VariadicArgumentCount, StackArgumentCount,
+    RegisterIndex, SourceOffset, DestinationOffset: LongInt;
   LocalType, OperationType: TCType;
   UnsignedOperation, DarwinVariadicCall: Boolean;
+  PointerResult, PointerDifference: Boolean;
+  Scale: LongInt;
   FunctionDeclaration: TFunction;
 begin
   if AExpression = nil then
@@ -1098,13 +2066,23 @@ begin
     EmitGlobalAddress(GlobalIndex);
     Exit;
   end;
-  RequireScalar(AExpression.CType, AExpression.Pos, 'cross-target expression');
+  RequireRegisterValue(AExpression.CType, AExpression.Pos,
+    'cross-target expression');
   case AExpression.Kind of
     ekInteger: EmitLoadImmediate(AExpression.IntValue);
+    ekNullptr: EmitLoadImmediate(0);
     ekVariable:
       begin
+        if AExpression.IsFunctionDesignator or
+           IsAggregateType(AExpression.CType) then
+        begin
+          GenAddress(AExpression);
+          Exit;
+        end;
         if FindLocal(AExpression.Text, Offset, LocalType) then
           EmitLoadLocal(Offset)
+        else if FindStaticLocal(AExpression.Text, GlobalIndex, LocalType) then
+          EmitLoadGlobal(GlobalIndex, LocalType)
         else if FindGlobal(AExpression.Text, GlobalIndex, LocalType) then
           EmitLoadGlobal(GlobalIndex, LocalType)
         else
@@ -1112,6 +2090,14 @@ begin
             'cross-target scalar variable has no definition: ' +
             AExpression.Text);
         EmitNormalize(AExpression.CType);
+      end;
+    ekAddress: GenAddress(AExpression.Left);
+    ekDeref, ekIndex, ekMember, ekArrow:
+      begin
+        GenAddress(AExpression);
+        if not IsAggregateType(AExpression.CType) and
+           not IsFunctionType(AExpression.CType) then
+          EmitLoadAtAddress(AExpression.CType);
       end;
     ekUnary:
       begin
@@ -1169,9 +2155,29 @@ begin
           BindLabel(EndLabel);
           Exit;
         end;
+        { Pointer arithmetic counts in elements, not bytes. }
+        PointerResult := IsPointerType(DecayType(AExpression.CType)) and
+          (AExpression.BinaryOp in [boAdd, boSub]) and
+          (AExpression.IntValue > 0);
+        PointerDifference := (AExpression.BinaryOp = boSub) and
+          IsPointerType(DecayType(AExpression.Left.CType)) and
+          IsPointerType(DecayType(AExpression.Right.CType)) and
+          (AExpression.IntValue > 0);
+        Scale := LongInt(AExpression.IntValue);
+        if Scale < 1 then Scale := 1;
+
         GenExpr(AExpression.Left);
         EmitPushResult;
         GenExpr(AExpression.Right);
+        if PointerResult and not PointerDifference and (Scale > 1) then
+        begin
+          EmitMoveAccumulatorToLeft;
+          EmitLoadImmediate(Scale);
+          if FTarget.Architecture = archAArch64 then
+            EmitWord($9B007C20)
+          else
+            EmitWord(EncodeRISCVR(1, 10, 5, 0, 10, $33));
+        end;
         EmitPopLeft;
         OperationType := AExpression.OperationType;
         case AExpression.BinaryOp of
@@ -1183,14 +2189,36 @@ begin
           UnsignedOperation := AExpression.CType.IsUnsigned;
         end;
         EmitBinary(AExpression.BinaryOp, UnsignedOperation);
+        if PointerDifference and (Scale > 1) then
+        begin
+          EmitMoveAccumulatorToLeft;
+          EmitLoadImmediate(Scale);
+          EmitBinary(boDiv, False);
+        end;
         EmitNormalize(AExpression.CType);
       end;
     ekAssign: GenAssignment(AExpression);
     ekCall:
       begin
         if AExpression.Text = '' then
-          RaiseCompileError(AExpression.Pos,
-            'cross-target function-pointer calls require the native x86 backend');
+        begin
+          { Indirect call: stage the callee address below the arguments so
+            evaluating them cannot clobber it. }
+          if Length(AExpression.Args) > 8 then
+            RaiseCompileError(AExpression.Pos,
+              'cross-target indirect calls support up to eight arguments');
+          GenExpr(AExpression.Left);
+          EmitPushResult;
+          for I := High(AExpression.Args) downto 0 do
+          begin
+            GenExpr(AExpression.Args[I]);
+            EmitPushResult;
+          end;
+          for I := 0 to High(AExpression.Args) do EmitPopArgument(I);
+          EmitIndirectCall;
+          EmitNormalize(AExpression.CType);
+          Exit;
+        end;
         FunctionDeclaration := FProgram.FindFunction(AExpression.Text);
         DarwinVariadicCall :=
           (FTarget.Architecture = archAArch64) and
@@ -1212,16 +2240,62 @@ begin
         else
         begin
           FixedArgumentCount := Length(AExpression.Args);
-          if FixedArgumentCount > 8 then
-            RaiseCompileError(AExpression.Pos,
-              'cross-target integer calls support up to eight register arguments');
+          if FixedArgumentCount > 8 then FixedArgumentCount := 8;
         end;
         for I := High(AExpression.Args) downto 0 do
         begin
           GenExpr(AExpression.Args[I]);
-          EmitPushResult;
+          { An array argument decays to a pointer; only struct and union
+            values are passed by copy. }
+          if IsAggregateType(AExpression.Args[I].CType) and
+             not IsArrayType(AExpression.Args[I].CType) then
+          begin
+            if StorageSize(AExpression.Args[I].CType) > 16 then
+              RaiseCompileError(AExpression.Pos,
+                'aggregate arguments larger than two words are not implemented ' +
+                'in the cross backend');
+            EmitPushAggregate(StorageSize(AExpression.Args[I].CType));
+          end
+          else
+            EmitPushResult;
         end;
-        for I := 0 to FixedArgumentCount - 1 do EmitPopArgument(I);
+        RegisterIndex := 0;
+        for I := 0 to FixedArgumentCount - 1 do
+        begin
+          if IsAggregateType(AExpression.Args[I].CType) and
+             not IsArrayType(AExpression.Args[I].CType) and
+             (AggregateRegisterCount(AExpression.Args[I].CType) = 2) then
+          begin
+            if RegisterIndex + 1 > 7 then
+              RaiseCompileError(AExpression.Pos,
+                'aggregate argument does not fit the cross register set');
+            EmitPopArgumentPair(RegisterIndex);
+            Inc(RegisterIndex, 2);
+          end
+          else
+          begin
+            EmitPopArgument(RegisterIndex);
+            Inc(RegisterIndex);
+          end;
+        end;
+        StackArgumentCount := Length(AExpression.Args) - FixedArgumentCount;
+        if not DarwinVariadicCall and (StackArgumentCount > 0) then
+        begin
+          { Arguments past the registers are staged in 16-byte slots so the
+            stack stays aligned; the ABI wants them packed at the stack
+            pointer, so compact them in place before the call. }
+          for I := 0 to StackArgumentCount - 1 do
+            if FTarget.Architecture = archAArch64 then
+            begin
+              EmitWord($F94003E0 or (LongWord(I * 2) shl 10) or 9);
+              EmitWord($F90003E0 or (LongWord(I) shl 10) or 9);
+            end
+            else
+            begin
+              EmitWord(EncodeRISCVI(I * 16, 2, 3, 6, $03));
+              EmitWord(EncodeRISCVS(I * 8, 6, 2, 3));
+            end;
+        end;
         VariadicArgumentCount := Length(AExpression.Args) - FixedArgumentCount;
         if DarwinVariadicCall and (VariadicArgumentCount > 1) then
           for I := 1 to VariadicArgumentCount - 1 do
@@ -1248,7 +2322,38 @@ begin
           EmitCall(FunctionLabel);
         if DarwinVariadicCall and (VariadicArgumentCount > 0) then
           EmitWord($910003FF or
-            (LongWord(VariadicArgumentCount * 16) shl 10));
+            (LongWord(VariadicArgumentCount * 16) shl 10))
+        else if StackArgumentCount > 0 then
+        begin
+          if FTarget.Architecture = archAArch64 then
+            EmitWord($910003FF or (LongWord(StackArgumentCount * 16) shl 10))
+          else
+            EmitWord(EncodeRISCVI(StackArgumentCount * 16, 2, 0, 2, $13));
+        end;
+        if IsAggregateType(AExpression.CType) then
+        begin
+          { Spill the returned words into a frame slot so the result behaves
+            like any other aggregate, which is addressed rather than held. }
+          Offset := AllocateTemporarySlot;
+          if AggregateRegisterCount(AExpression.CType) = 2 then
+            Offset := AllocateTemporarySlot - 8;
+          if FTarget.Architecture = archAArch64 then
+          begin
+            EmitWord($F9000000 or (LongWord(Offset div 8) shl 10) or
+              (LongWord(29) shl 5));
+            if AggregateRegisterCount(AExpression.CType) = 2 then
+              EmitWord($F9000001 or (LongWord((Offset + 8) div 8) shl 10) or
+                (LongWord(29) shl 5));
+          end
+          else
+          begin
+            EmitWord(EncodeRISCVS(Offset, 10, 8, 3));
+            if AggregateRegisterCount(AExpression.CType) = 2 then
+              EmitWord(EncodeRISCVS(Offset + 8, 11, 8, 3));
+          end;
+          EmitLocalAddress(Offset);
+          Exit;
+        end;
         EmitNormalize(AExpression.CType);
       end;
     ekConditional:
@@ -1282,28 +2387,112 @@ end;
 procedure TCrossIntegerBackend.GenStmt(AStatement: TStmt);
 var
   I, Offset, SavedCount, ElseLabel, EndLabel, CondLabel,
-    BodyLabel, ContinueLabel: LongInt;
+    BodyLabel, ContinueLabel, DefaultLabel: LongInt;
+  SwitchEntries: TCrossSwitchEntryArray;
 begin
   if AStatement = nil then Exit;
   case AStatement.Kind of
     skEmpty, skStaticAssert: ;
     skExpr: GenExpr(AStatement.Expr);
     skDecl:
+      if not AStatement.IsStatic then
       begin
         AddLocal(AStatement.Name, AStatement.CType, Offset);
-        if AStatement.Expr <> nil then GenExpr(AStatement.Expr)
-        else EmitLoadImmediate(0);
-        EmitNormalize(AStatement.CType);
-        EmitStoreLocal(Offset);
+        if IsAggregateType(AStatement.CType) then
+        begin
+          EmitZeroLocalBlock(Offset, StorageSize(AStatement.CType));
+          if AStatement.Expr <> nil then
+            InitializeLocalAt(Offset, 0, AStatement.CType, AStatement.Expr,
+              AStatement.Pos);
+        end
+        else
+        begin
+          if AStatement.Expr <> nil then GenExpr(AStatement.Expr)
+          else EmitLoadImmediate(0);
+          EmitNormalize(AStatement.CType);
+          EmitStoreLocal(Offset);
+        end;
       end;
     skReturn:
       begin
         if AStatement.Expr <> nil then GenExpr(AStatement.Expr)
         else EmitLoadImmediate(0);
-        EmitNormalize(FCurrentReturnType);
+        if IsAggregateType(FCurrentReturnType) then
+        begin
+          { The accumulator holds the aggregate's address; the ABI returns its
+            words in the first one or two result registers. }
+          EmitMoveAccumulatorToLeft;
+          if FTarget.Architecture = archAArch64 then
+          begin
+            if AggregateRegisterCount(FCurrentReturnType) = 2 then
+              EmitWord($F9400421);
+            EmitWord($F9400020);
+          end
+          else
+          begin
+            if AggregateRegisterCount(FCurrentReturnType) = 2 then
+              EmitWord(EncodeRISCVI(8, 5, 3, 11, $03));
+            EmitWord(EncodeRISCVI(0, 5, 3, 10, $03));
+          end;
+        end
+        else
+          EmitNormalize(FCurrentReturnType);
         EmitJump(FEpilogueLabel);
       end;
+    skLabel:
+      begin
+        BindLabel(FindUserLabel(AStatement.Name));
+        GenStmt(AStatement.Body);
+      end;
+    skGoto:
+      EmitJump(FindUserLabel(AStatement.Name));
+    skCase, skDefault: GenStmt(AStatement.Body);
+    skSwitch:
+      begin
+        EndLabel := NewLabel;
+        SetLength(SwitchEntries, 0);
+        CollectSwitchEntries(AStatement.Body, SwitchEntries);
+        DefaultLabel := -1;
+        for I := 0 to High(SwitchEntries) do
+        begin
+          SwitchEntries[I].TargetLabel := NewLabel;
+          if SwitchEntries[I].IsDefault then
+            DefaultLabel := SwitchEntries[I].TargetLabel;
+        end;
+        { The selector lives in a frame slot so each comparison can reload it
+          without leaving anything on the expression stack when a case is
+          entered by branch. }
+        Offset := AllocateTemporarySlot;
+        GenExpr(AStatement.Expr);
+        EmitStoreLocal(Offset);
+        for I := 0 to High(SwitchEntries) do
+          if not SwitchEntries[I].IsDefault then
+          begin
+            EmitLoadLocal(Offset);
+            EmitMoveAccumulatorToLeft;
+            EmitLoadImmediate(SwitchEntries[I].Value);
+            EmitBinary(boEqual, False);
+            EmitJumpIfNonZero(SwitchEntries[I].TargetLabel);
+          end;
+        if DefaultLabel >= 0 then EmitJump(DefaultLabel)
+        else EmitJump(EndLabel);
+        if Length(FContinueLabels) > 0 then
+          PushLoop(EndLabel, FContinueLabels[High(FContinueLabels)])
+        else
+          PushLoop(EndLabel, -1);
+        GenSwitchBody(AStatement.Body, SwitchEntries);
+        PopLoop;
+        BindLabel(EndLabel);
+      end;
     skBlock:
+      { A comma declaration such as `int i, s;` is a group of declarations, not
+        a nested scope; its names stay visible in the enclosing block. }
+      if AStatement.IsDeclarationGroup then
+      begin
+        for I := 0 to High(AStatement.Children) do
+          GenStmt(AStatement.Children[I]);
+      end
+      else
       begin
         SavedCount := Length(FLocals);
         EnterScope;
@@ -1393,18 +2582,17 @@ end;
 procedure TCrossIntegerBackend.GenFunction(AFunction: TFunction;
   ALabel: LongInt);
 var
-  I, Offset, LocalBytes: LongInt;
+  I, Offset, LocalBytes, IncomingOffset, RegisterIndex: LongInt;
 begin
-  RequireScalar(AFunction.ReturnType, AFunction.Pos, 'function return');
+  RequireRegisterValue(AFunction.ReturnType, AFunction.Pos, 'function return');
   FCurrentReturnType := AFunction.ReturnType;
   if AFunction.IsVariadic then
     RaiseCompileError(AFunction.Pos,
       'variadic functions require a hosted target backend');
-  if Length(AFunction.Params) > 8 then
-    RaiseCompileError(AFunction.Pos,
-      'cross-target integer functions support up to eight parameters');
-  LocalBytes := (Length(AFunction.Params) +
-    CountDeclarations(AFunction.Body)) * 8;
+  { Parameters, locals (aggregates at full size), switch selectors and a
+    margin for alignment padding. }
+  LocalBytes := Length(AFunction.Params) * 16 +
+    CountLocalBytes(AFunction.Body) + CountSwitchSlots(AFunction.Body) * 16 + 64;
   if FTarget.Architecture = archAArch64 then
   begin
     FFrameSize := AlignUp(LocalBytes, 16);
@@ -1418,7 +2606,10 @@ begin
       RaiseCompileError(AFunction.Pos, 'RISC-V cross-target frame is too large');
   end;
   FNextLocalOffset := 0;
+  FCurrentFunctionName := AFunction.Name;
   SetLength(FLocals, 0);
+  SetLength(FUserLabels, 0);
+  ReserveUserLabels(AFunction.Body);
   FScopeDepth := 0;
   BindLabel(ALabel);
   if FTarget.Architecture = archAArch64 then
@@ -1436,18 +2627,58 @@ begin
     EmitWord(EncodeRISCVI(0, 2, 0, 8, $13));
   end;
 
+  RegisterIndex := 0;
   for I := 0 to High(AFunction.Params) do
   begin
-    RequireScalar(AFunction.Params[I].CType, AFunction.Pos,
+    RequireRegisterValue(AFunction.Params[I].CType, AFunction.Pos,
       'function parameter');
     AddLocal(AFunction.Params[I].Name, AFunction.Params[I].CType, Offset);
-    if FTarget.Architecture = archAArch64 then
+    if IsAggregateType(AFunction.Params[I].CType) then
     begin
-      if I <> 0 then
-        EmitWord($AA0003E0 or (LongWord(I) shl 16));
+      if StorageSize(AFunction.Params[I].CType) > 16 then
+        RaiseCompileError(AFunction.Pos,
+          'aggregate parameters larger than two words are not implemented ' +
+          'in the cross backend');
+      { The incoming words are spilled straight into the parameter's slot. }
+      if FTarget.Architecture = archAArch64 then
+        EmitWord($F9000000 or (LongWord(Offset div 8) shl 10) or
+          (LongWord(29) shl 5) or LongWord(RegisterIndex))
+      else
+        EmitWord(EncodeRISCVS(Offset, 10 + RegisterIndex, 8, 3));
+      Inc(RegisterIndex);
+      if AggregateRegisterCount(AFunction.Params[I].CType) = 2 then
+      begin
+        if FTarget.Architecture = archAArch64 then
+          EmitWord($F9000000 or (LongWord((Offset + 8) div 8) shl 10) or
+            (LongWord(29) shl 5) or LongWord(RegisterIndex))
+        else
+          EmitWord(EncodeRISCVS(Offset + 8, 10 + RegisterIndex, 8, 3));
+        Inc(RegisterIndex);
+      end;
+      Continue;
+    end;
+    if RegisterIndex < 8 then
+    begin
+      if FTarget.Architecture = archAArch64 then
+      begin
+        if RegisterIndex <> 0 then
+          EmitWord($AA0003E0 or (LongWord(RegisterIndex) shl 16));
+      end
+      else if RegisterIndex <> 0 then
+        EmitWord(EncodeRISCVI(0, 10 + RegisterIndex, 0, 10, $13));
+      Inc(RegisterIndex);
     end
-    else if I <> 0 then
-      EmitWord(EncodeRISCVI(0, 10 + I, 0, 10, $13));
+    else
+    begin
+      { Arguments past the registers were placed by the caller just above this
+        frame. }
+      if FTarget.Architecture = archAArch64 then
+        IncomingOffset := FFrameSize + 16 + (RegisterIndex - 8) * 8
+      else
+        IncomingOffset := FFrameSize + (RegisterIndex - 8) * 8;
+      EmitLoadLocal(IncomingOffset);
+      Inc(RegisterIndex);
+    end;
     EmitNormalize(AFunction.Params[I].CType);
     EmitStoreLocal(Offset);
   end;
@@ -1677,6 +2908,7 @@ begin
   Layout := ComputeStaticELFLayout(FTarget, QWord(FText.Size),
     QWord(FData.Size), 0);
   ResolveGlobalFixups(Layout.DataAddress);
+  ResolveFunctionAddressFixups(Layout.TextAddress);
   WriteStaticELF64Executable(AFileName, FTarget, FText, FData, 0,
     FSyscallSites);
   AStats.TextBytes := FText.Size;

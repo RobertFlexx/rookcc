@@ -16,6 +16,17 @@ tests/*
 !tests/target_format_matrix.py
 !tests/native_linker_driver_contract.py
 !tests/native_host_smoke.py
+!tests/c_differential.py
+!tests/c/
+!tests/c/*.c
+!tests/cross_differential.py
+!tests/cross/
+!tests/cross/*.c
+
+/bench/*
+!/bench/compare.py
+!/bench/programs/
+!/bench/programs/*.c
 
 /scripts/*
 !/scripts/build.sh
