@@ -99,3 +99,4 @@ the license is mit
 
 originally made with 3 people over the span of years for an educational reason.
 but it aims to be auditable, simple architecture, and cross-arch compilation.
+i did most of the work to get it working, and where it is now. (RobertFlexx)
