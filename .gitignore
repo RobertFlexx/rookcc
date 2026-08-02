@@ -1,0 +1,17 @@
+/build/
+*.o
+*.ppu
+*.a
+*.or
+*.rst
+/a.out
+/mud
+/repl
+/repltxt
+/examples/*.out
+/tests/tmp/
+tests/
+
+/scripts/*
+!/scripts/build.sh
+!/scripts/install.sh

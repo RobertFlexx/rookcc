@@ -1,0 +1,83 @@
+.TH rcc 1 "august 2026" "rookcc 1.0.0" "user commands"
+.SH name
+rcc \- standalone native c compiler
+.SH use
+.B rcc
+.RI [ options ] " file.c ..."
+.SH description
+rcc preprocesses parses checks optimizes and writes native output in one program
+
+it does not start another compiler assembler or linker
+.SH options
+.TP
+.BI -o " file"
+write output to file
+.TP
+.B -E
+preprocess only
+.TP
+.B -S
+write a machine code listing when the target supports it
+.TP
+.B -c
+write an elf relocatable object
+.TP
+.B -run
+compile and run a temporary native executable
+.TP
+.B --check
+parse check and optimize without writing output
+.TP
+.B --emit-ir
+write verified target independent ir
+.TP
+.BI -std= mode
+select c90 c99 c11 c17 c23 gnu99 gnu11 gnu17 gnu23 or rcc
+.TP
+.BI --target= target
+select x86_64 aarch64 or riscv64
+.TP
+.BI --sysroot= dir
+use a target sysroot
+.TP
+.BR -O0 , " -O1" , " -O2" , " -O3" , " -Og" , " -Os" , " -Oz" , " -Ofast"
+select optimization policy
+.TP
+.BR -I , " -iquote" , " -isystem" , " -D" , " -U"
+control the preprocessor
+.TP
+.BR -L , " -l" , " -R" , " -Wl,-rpath,dir"
+control native elf library and archive resolution
+.TP
+.B #pragma rcc link name
+request a shared library from the source file
+.TP
+.B -static
+write an executable without a program interpreter
+.TP
+.B -fPIC
+with \fB-c\fR write an x86 64 pic object
+.TP
+.B -g
+write dwarf 4 function line and symbol data for x86 64 output
+.TP
+.B --print-targets
+list targets
+.TP
+.B --print-backends
+list backend scope
+.TP
+.B --print-toolchain
+show compiler registries
+.TP
+.B --version
+show version and target information
+.TP
+.BR -h , " --help"
+show complete help
+.SH gnu assembly
+gnu modes accept asm __asm and __asm__ with operands constraints clobbers volatile and asm goto
+
+supported templates are encoded by the x86 64 backend
+.SH files
+the default resource tree is /usr/local/share/rcc

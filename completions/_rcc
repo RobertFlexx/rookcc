@@ -1,0 +1,32 @@
+#compdef rcc rookcc
+
+_arguments \
+  '(-o *)-o[write output]:file:_files' \
+  '-E[preprocess only]' \
+  '-S[emit machine-code listing]' \
+  '-c[emit relocatable object]' \
+  '-run[compile and run a native executable]' \
+  '-static[emit an interpreter-free executable]' \
+  '-fPIC[emit pic code with -c]' \
+  '-g[emit dwarf 4 debug data]' \
+  '--check[parse, verify, and optimize only]' \
+  '--emit-ir[emit verified ir]' \
+  '--emit-tokens[emit lexer tokens]' \
+  '-I[add include directory]:directory:_directories' \
+  '-D[define macro]:definition:' \
+  '-U[undefine macro]:name:' \
+  '-L[add library directory]:directory:_directories' \
+  '-l[link shared library or archive]:library:' \
+  '--target=[select target]:target:(x86_64 aarch64 riscv64)' \
+  '--sysroot=[select sysroot]:directory:_directories' \
+  '--resource-dir=[select resource tree]:directory:_directories' \
+  '--print-targets[list targets]' \
+  '--print-target-info[describe selected target]' \
+  '--print-backends[list native backends]' \
+  '--print-toolchain[show compiler registries]' \
+  '--print-optimizations[show optimization catalog]' \
+  '--print-conformance[show conformance catalog]' \
+  '--print-builtins[show builtin catalog]' \
+  '--version[show version]' \
+  '(-h --help)'{-h,--help}'[show help]' \
+  '*:source or object:_files'
