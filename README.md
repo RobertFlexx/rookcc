@@ -1,4 +1,5 @@
-rookcc
+
+<img width="1728" height="866" alt="rookcc" src="https://github.com/user-attachments/assets/7afbe89e-0d6a-45ae-b8a9-e92c26041ada" />
 
 rookcc is a small c compiler for linux and the command is rcc
 
