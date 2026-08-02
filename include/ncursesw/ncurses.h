@@ -412,6 +412,11 @@ extern WINDOW *wgetparent(const WINDOW *window);
 extern int wgetdelay(const WINDOW *window);
 extern int wgetscrreg(const WINDOW *window, int *top, int *bottom);
 
+#define getyx(win, y, x)    ((y) = getcury(win), (x) = getcurx(win))
+#define getbegyx(win, y, x) ((y) = getbegy(win), (x) = getbegx(win))
+#define getmaxyx(win, y, x) ((y) = getmaxy(win), (x) = getmaxx(win))
+#define getparyx(win, y, x) ((y) = getpary(win), (x) = getparx(win))
+
 
 extern int addch(const chtype character);
 extern int waddch(WINDOW *window, const chtype character);
@@ -446,6 +451,9 @@ extern int winsertln(WINDOW *window);
 extern int insdelln(int count);
 extern int winsdelln(WINDOW *window, int count);
 extern int hline(chtype character, int count);
+extern int mvhline(int row, int column, chtype character, int count);
+extern int mvwhline(WINDOW *window, int row, int column,
+                    chtype character, int count);
 extern int whline(WINDOW *window, chtype character, int count);
 extern int vline(chtype character, int count);
 extern int wvline(WINDOW *window, chtype character, int count);
