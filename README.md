@@ -9,6 +9,8 @@ once built rcc does its own preprocessing parsing type checking optimization mac
 
 when the selected target exactly matches the host architecture and operating system rcc also behaves as a normal compiler driver. on macos bsd and non x86 linux hosts it invokes the platform compiler driver only for the final sdk startup file and system library link. it never sends c source to that driver.
 
+---------------------------
+
 [pawnasm](https://github.com/RobertFlexx/pawnasm) is also a relative to this project. if you **JUST** want an assembler as a separate package.
 
 (you will need [ofrontplus](https://github.com/Oleg-N-Cher/OfrontPlus) to compile pawnasm)
