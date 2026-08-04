@@ -176,3 +176,9 @@ im maintaining this huge project **myself**, and i can only do so much so fast.
 originally made with 3 people over the span of years for an educational/school reason.
 but it aims to be auditable, simple architecture, and cross-arch compilation.
 i did most of the work to get it working, and where it is now. (RobertFlexx)
+
+## Credits
+thanks to [Kokonico](https://github.com/Kokonico) for the logo!
+
+## more
+https://kokonico.me
