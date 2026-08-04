@@ -13,9 +13,7 @@
 tests/
 !tests/
 tests/*
-!tests/target_format_matrix.py
-!tests/native_linker_driver_contract.py
-!tests/native_host_smoke.py
+
 
 /bench/
 

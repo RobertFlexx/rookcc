@@ -443,10 +443,12 @@ begin
   else
     Base := 'type';
   end;
+  if AType.IsConst then Base := 'const ' + Base;
+  if AType.IsVolatile then Base := 'volatile ' + Base;
   if AType.IsUnsigned and IsIntegerType(AType) then Base := 'unsigned ' + Base;
   Result := Base;
   if AType.PointerDepth > 0 then
-    Result := Result + StringOfChar('*', AType.PointerDepth);
+    Result := Result + ' ' + StringOfChar('*', AType.PointerDepth);
 end;
 
 end.

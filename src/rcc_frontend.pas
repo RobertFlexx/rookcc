@@ -4601,7 +4601,8 @@ var
 
     if At(tkLBrace) then Result := ParsePrimary
     else Result := ParseAssignment;
-    Result.CType := AType;
+    if Result.Kind <> ekCast then
+      Result.CType := AType;
   end;
 
   procedure AddGlobalDeclaration(const AType: TCType; const AName: string;

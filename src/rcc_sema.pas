@@ -5,7 +5,7 @@ unit rcc_sema;
 interface
 
 uses
-  rcc_types;
+  rcc_types, rcc_conversions;
 
 procedure AnalyzeProgram(AProgram: TProgram);
 
@@ -44,6 +44,15 @@ type
     function EvaluateIntegerConstant(E: TExpr; out AValue: Int64): Boolean;
     function CompatibleGenericType(const A, B: TCType): Boolean;
     procedure AdoptExpression(ADestination, ASource: TExpr);
+    procedure CheckAssignmentTypes(E: TExpr);
+    procedure CheckCompoundAssignmentTypes(E: TExpr);
+    procedure CheckReturnStatement(S: TStmt);
+    procedure CheckInitializerTypes(E: TExpr; const AExpectedType: TCType);
+    procedure CheckArgumentConversion(AExpr: TExpr; const AFunctionName: string;
+      AArgumentIndex: LongInt; const AParamType: TCType);
+    procedure CheckComparisonTypes(E: TExpr);
+    function RelationalPointerTypesAllowed(const ALeft, ARight: TCType): Boolean;
+    procedure CheckConditionalTypes(E: TExpr);
     procedure AnalyzeExpr(E: TExpr);
     procedure AnalyzeInitializer(E: TExpr; const AExpectedType: TCType);
     procedure AnalyzeStmt(S: TStmt);
@@ -508,10 +517,20 @@ var
   Designator: string;
 begin
   if E = nil then Exit;
+  if E.Kind = ekCast then
+  begin
+    { Preserve the cast's own target type: seeding E.CType with the expected
+      declarator type would silently retype the cast, hiding conversions that
+      the cast is supposed to express (e.g. `char *d = (const char *)0;`). }
+    AnalyzeExpr(E);
+    CheckInitializerTypes(E, AExpectedType);
+    Exit;
+  end;
   E.CType := AExpectedType;
   if E.Kind <> ekCompoundLit then
   begin
     AnalyzeExpr(E);
+    CheckInitializerTypes(E, AExpectedType);
     Exit;
   end;
 
@@ -568,6 +587,381 @@ begin
   end
   else
     for I := 0 to High(E.Args) do AnalyzeExpr(E.Args[I]);
+end;
+
+procedure TSemanticAnalyzer.CheckAssignmentTypes(E: TExpr);
+var
+  ConversionClass: TConversionClass;
+  Problem: TConversionProblem;
+  DestType, SourceType: TCType;
+begin
+  if E.Right = nil then Exit;
+  DestType := E.Left.CType;
+  SourceType := E.Right.CType;
+  if IsArrayType(DestType) then
+    RaiseCompileError(E.Pos, 'assignment to expression with array type');
+  if (SourceType.Kind = ctVoid) and (SourceType.PointerDepth = 0) then
+    RaiseCompileError(E.Pos, 'void value not ignored as it ought to be');
+  Problem := cpNone;
+  ConversionClass := ClassifyConversion(DestType, SourceType,
+    IsNullPointerConstant(E.Right), @Problem);
+  case ConversionClass of
+    ccConstraintViolation:
+      case Problem of
+        cpPointerTargetQualifiers:
+          RaiseCompileError(E.Pos, 'assignment ' +
+            PointerTargetQualifierMessage(DestType, SourceType));
+        cpNestedPointerQualifiers:
+          RaiseCompileError(E.Pos, 'assignment to ''' +
+            TypeName(DecayType(DestType)) +
+            ''' from incompatible pointer type ''' +
+            TypeName(DecayType(SourceType)) + '''');
+        cpFunctionObjectPointer:
+          RaiseCompileError(E.Pos,
+            'conversion between function pointer and object pointer is not ' +
+            'permitted');
+        cpFunctionPointerMismatch:
+          RaiseCompileError(E.Pos, 'incompatible function pointer types');
+      else
+        RaiseCompileError(E.Pos, 'assignment to ''' +
+          TypeName(DecayType(DestType)) + ''' from ''' +
+          TypeName(DecayType(SourceType)) + ''' without a cast');
+      end;
+    ccInvalid:
+      RaiseCompileError(E.Pos, 'incompatible types when assigning to ''' +
+        TypeName(DecayType(DestType)) + ''' from ''' +
+        TypeName(DecayType(SourceType)) + '''');
+  else
+    ;
+  end;
+end;
+
+function CompoundAssignmentOperatorName(AOp: TAssignOp): string;
+begin
+  case AOp of
+    aoAdd: Result := '+=';
+    aoSub: Result := '-=';
+    aoMul: Result := '*=';
+    aoDiv: Result := '/=';
+    aoMod: Result := '%=';
+    aoBitAnd: Result := '&=';
+    aoBitOr: Result := '|=';
+    aoBitXor: Result := '^=';
+    aoShiftLeft: Result := '<<=';
+    aoShiftRight: Result := '>>=';
+  else
+    Result := '=';
+  end;
+end;
+
+procedure TSemanticAnalyzer.CheckCompoundAssignmentTypes(E: TExpr);
+var
+  DestType, SourceType: TCType;
+  OperatorName: string;
+begin
+  DestType := DecayType(E.Left.CType);
+  SourceType := DecayType(E.Right.CType);
+  OperatorName := CompoundAssignmentOperatorName(E.AssignOp);
+  if IsArrayType(E.Left.CType) then
+    RaiseCompileError(E.Pos, 'invalid operands to ''' + OperatorName +
+      ''' (have array type)');
+  if IsPointerType(DestType) then
+  begin
+    if (E.AssignOp in [aoAdd, aoSub]) and IsIntegerType(SourceType) then Exit;
+    RaiseCompileError(E.Pos, 'invalid operands to ''' + OperatorName +
+      ''' (have ''' + TypeName(DestType) + ''' and ''' + TypeName(SourceType) +
+      ''')');
+  end;
+  if not IsArithmeticType(DestType) then
+    RaiseCompileError(E.Pos, 'invalid operands to ''' + OperatorName +
+      ''' (have ''' + TypeName(DestType) + ''' and ''' + TypeName(SourceType) +
+      ''')');
+  if E.AssignOp in [aoShiftLeft, aoShiftRight] then
+  begin
+    if not IsIntegerType(SourceType) then
+      RaiseCompileError(E.Pos, 'right operand of ''' + OperatorName +
+        ''' must have integer type');
+  end
+  else if not IsArithmeticType(SourceType) then
+    RaiseCompileError(E.Pos, 'invalid operands to ''' + OperatorName +
+      ''' (have ''' + TypeName(DestType) + ''' and ''' + TypeName(SourceType) +
+      ''')');
+end;
+
+procedure TSemanticAnalyzer.CheckReturnStatement(S: TStmt);
+var
+  ReturnType, ExprType: TCType;
+  ConversionClass: TConversionClass;
+  Problem: TConversionProblem;
+begin
+  if FCurrentFunction = nil then Exit;
+  ReturnType := FCurrentFunction.ReturnType;
+  if ReturnType.Kind = ctVoid then
+  begin
+    if (S.Expr <> nil) and (S.Expr.CType.Kind <> ctVoid) then
+      RaiseCompileError(S.Pos, 'void function should not return a value');
+    Exit;
+  end;
+  if S.Expr = nil then
+    RaiseCompileError(S.Pos, 'non-void function should return a value');
+  ExprType := S.Expr.CType;
+  if (ExprType.Kind = ctVoid) and (ExprType.PointerDepth = 0) then
+    RaiseCompileError(S.Pos, 'void value not ignored as it ought to be');
+  Problem := cpNone;
+  ConversionClass := ClassifyConversion(ReturnType, ExprType,
+    IsNullPointerConstant(S.Expr), @Problem);
+  case ConversionClass of
+    ccConstraintViolation:
+      case Problem of
+        cpPointerTargetQualifiers:
+          RaiseCompileError(S.Pos, 'returning pointer ' +
+            PointerTargetQualifierMessage(ReturnType, ExprType));
+        cpNestedPointerQualifiers:
+          RaiseCompileError(S.Pos, 'returning ''' +
+            TypeName(DecayType(ExprType)) +
+            ''' from a function with return type ''' + TypeName(ReturnType) +
+            ''' with incompatible pointer type');
+        cpFunctionObjectPointer:
+          RaiseCompileError(S.Pos,
+            'conversion between function pointer and object pointer is not ' +
+            'permitted');
+        cpFunctionPointerMismatch:
+          RaiseCompileError(S.Pos, 'incompatible function pointer types');
+      else
+        RaiseCompileError(S.Pos, 'returning ''' +
+          TypeName(DecayType(ExprType)) +
+          ''' from a function with return type ''' + TypeName(ReturnType) +
+          ''' without a cast');
+      end;
+    ccInvalid:
+      RaiseCompileError(S.Pos, 'incompatible types when returning ''' +
+        TypeName(DecayType(ExprType)) + ''' from a function with return type ''' +
+        TypeName(ReturnType) + '''');
+  else
+    ;
+  end;
+end;
+
+procedure TSemanticAnalyzer.CheckInitializerTypes(E: TExpr;
+  const AExpectedType: TCType);
+var
+  ConversionClass: TConversionClass;
+  Problem: TConversionProblem;
+  SourceType: TCType;
+begin
+  if E = nil then Exit;
+  SourceType := E.CType;
+  if (SourceType.Kind = ctVoid) and (SourceType.PointerDepth = 0) then
+    RaiseCompileError(E.Pos, 'void value not ignored as it ought to be');
+  Problem := cpNone;
+  ConversionClass := ClassifyConversion(AExpectedType, SourceType,
+    IsNullPointerConstant(E), @Problem);
+  case ConversionClass of
+    ccConstraintViolation:
+      case Problem of
+        cpPointerTargetQualifiers:
+          RaiseCompileError(E.Pos, 'initialization ' +
+            PointerTargetQualifierMessage(AExpectedType, SourceType));
+        cpNestedPointerQualifiers:
+          RaiseCompileError(E.Pos, 'initializing ''' +
+            TypeName(AExpectedType) + ''' from incompatible pointer type ''' +
+            TypeName(DecayType(SourceType)) + '''');
+        cpFunctionObjectPointer:
+          RaiseCompileError(E.Pos,
+            'conversion between function pointer and object pointer is not ' +
+            'permitted');
+        cpFunctionPointerMismatch:
+          RaiseCompileError(E.Pos, 'incompatible function pointer types');
+      else
+        RaiseCompileError(E.Pos, 'initializing ''' + TypeName(AExpectedType) +
+          ''' from ''' + TypeName(DecayType(SourceType)) + ''' without a cast');
+      end;
+    ccInvalid:
+      RaiseCompileError(E.Pos, 'incompatible types when initializing ''' +
+        TypeName(AExpectedType) + ''' from ''' +
+        TypeName(DecayType(SourceType)) + '''');
+  else
+    ;
+  end;
+end;
+
+procedure TSemanticAnalyzer.CheckArgumentConversion(AExpr: TExpr;
+  const AFunctionName: string; AArgumentIndex: LongInt;
+  const AParamType: TCType);
+var
+  ConversionClass: TConversionClass;
+  Problem: TConversionProblem;
+  ParamType, SourceType: TCType;
+begin
+  if AExpr = nil then Exit;
+  ParamType := DecayType(AParamType);
+  SourceType := AExpr.CType;
+  if (SourceType.Kind = ctVoid) and (SourceType.PointerDepth = 0) then
+    RaiseCompileError(AExpr.Pos, 'void value not ignored as it ought to be');
+  Problem := cpNone;
+  ConversionClass := ClassifyConversion(ParamType, SourceType,
+    IsNullPointerConstant(AExpr), @Problem);
+  case ConversionClass of
+    ccConstraintViolation:
+      case Problem of
+        cpPointerTargetQualifiers:
+          RaiseCompileError(AExpr.Pos, 'passing argument ' +
+            IntToStr(AArgumentIndex) + ' of ''' + AFunctionName + ''' ' +
+            PointerTargetQualifierMessage(ParamType, SourceType));
+        cpNestedPointerQualifiers:
+          RaiseCompileError(AExpr.Pos, 'passing argument ' +
+            IntToStr(AArgumentIndex) + ' of ''' + AFunctionName +
+            ''' with type ''' + TypeName(ParamType) +
+            ''' from incompatible type ''' + TypeName(DecayType(SourceType)) +
+            '''');
+        cpFunctionObjectPointer:
+          RaiseCompileError(AExpr.Pos,
+            'conversion between function pointer and object pointer is not ' +
+            'permitted');
+        cpFunctionPointerMismatch:
+          RaiseCompileError(AExpr.Pos, 'incompatible function pointer types ' +
+            'for argument ' + IntToStr(AArgumentIndex) + ' of ''' +
+            AFunctionName + '''');
+      else
+        RaiseCompileError(AExpr.Pos, 'passing argument ' +
+          IntToStr(AArgumentIndex) + ' of ''' + AFunctionName +
+          ''' with type ''' + TypeName(ParamType) + ''' from ''' +
+          TypeName(DecayType(SourceType)) + ''' without a cast');
+      end;
+    ccInvalid:
+      RaiseCompileError(AExpr.Pos, 'incompatible type for argument ' +
+        IntToStr(AArgumentIndex) + ' of ''' + AFunctionName + '''');
+  else
+    ;
+  end;
+end;
+
+function TSemanticAnalyzer.RelationalPointerTypesAllowed(const ALeft,
+  ARight: TCType): Boolean;
+var
+  LeftPointee, RightPointee: TCType;
+  LeftVoid, RightVoid: Boolean;
+begin
+  LeftPointee := PointeeType(ALeft);
+  RightPointee := PointeeType(ARight);
+  { C11 6.5.8p2 allows relational comparisons only between pointers to
+    qualified or unqualified versions of compatible object types, so pointers
+    to functions never qualify. }
+  if (LeftPointee.Kind = ctFunction) or (RightPointee.Kind = ctFunction) then
+    Exit(False);
+  LeftVoid := (LeftPointee.Kind = ctVoid) and (LeftPointee.PointerDepth = 0);
+  RightVoid := (RightPointee.Kind = ctVoid) and (RightPointee.PointerDepth = 0);
+  { A pointer to void is not a pointer to an object type, so a mixed
+    void/object relational comparison is a constraint violation; GCC and Clang
+    accept two void pointers as an extension, and so does RCC. }
+  if LeftVoid or RightVoid then Exit(LeftVoid and RightVoid);
+  Result := ClassifyConversion(ALeft, ARight, False, nil, False) in
+    [ccValid, ccWarning];
+end;
+
+procedure TSemanticAnalyzer.CheckComparisonTypes(E: TExpr);
+var
+  LeftType, RightType: TCType;
+  LeftNull, RightNull: Boolean;
+begin
+  LeftType := PromotedExpressionType(E.Left);
+  RightType := PromotedExpressionType(E.Right);
+  if IsArithmeticType(LeftType) and IsArithmeticType(RightType) then Exit;
+
+  if IsPointerType(LeftType) and IsPointerType(RightType) then
+  begin
+    if E.BinaryOp in [boEqual, boNotEqual] then
+    begin
+      { Equality asks only for compatible pointed-to types (qualifiers need
+        not match), the same rule C applies to conditional expressions.}
+      if ClassifyConversion(LeftType, RightType, False, nil, False) in
+        [ccValid, ccWarning] then Exit;
+    end
+    else if RelationalPointerTypesAllowed(LeftType, RightType) then Exit;
+    RaiseCompileError(E.Pos,
+      'comparison of distinct pointer types lacks a cast');
+  end;
+
+  if IsPointerType(LeftType) xor IsPointerType(RightType) then
+  begin
+    if E.BinaryOp in [boEqual, boNotEqual] then
+    begin
+      LeftNull := IsNullPointerConstant(E.Left);
+      RightNull := IsNullPointerConstant(E.Right);
+      if (IsPointerType(LeftType) and RightNull) or
+        (IsPointerType(RightType) and LeftNull) then Exit;
+    end;
+    RaiseCompileError(E.Pos, 'comparison between pointer and integer');
+  end;
+end;
+
+procedure TSemanticAnalyzer.CheckConditionalTypes(E: TExpr);
+var
+  LeftType, RightType: TCType;
+  LeftNull, RightNull: Boolean;
+begin
+  LeftType := DecayType(E.Right.CType);
+  RightType := DecayType(E.Third.CType);
+  LeftNull := IsNullPointerConstant(E.Right);
+  RightNull := IsNullPointerConstant(E.Third);
+
+  if IsArithmeticType(LeftType) and IsArithmeticType(RightType) then
+  begin
+    E.CType := ArithmeticResultType(LeftType, RightType);
+    Exit;
+  end;
+
+  if (LeftType.Kind = ctVoid) and (LeftType.PointerDepth = 0) and
+    (RightType.Kind = ctVoid) and (RightType.PointerDepth = 0) then
+  begin
+    { Two genuine void expressions; `void *` operands have PointerDepth 1 and
+      are pointers, handled by the pointer branch below. }
+    E.CType := MakeType(ctVoid);
+    Exit;
+  end;
+
+  if IsPointerType(LeftType) and IsPointerType(RightType) then
+  begin
+    { C only requires compatible pointed-to types here; qualification need
+      not be preserved, but function pointers and object pointers still do
+      not mix and incompatible pointed-to types are rejected. }
+    if not (ClassifyConversion(LeftType, RightType, False, nil, False) in
+      [ccValid, ccWarning]) then
+      RaiseCompileError(E.Pos,
+        'pointer type mismatch in conditional expression');
+    if (LeftType.Kind = ctVoid) and (LeftType.PointerDepth = 0) then
+      E.CType := LeftType
+    else if (RightType.Kind = ctVoid) and (RightType.PointerDepth = 0) then
+      E.CType := RightType
+    else
+      E.CType := LeftType;
+    { C11 6.5.15p6: the result is a pointer to an appropriately qualified
+      version of the composite type, so the result carries the union of the
+      operands' pointer-target qualifiers regardless of operand order. }
+    E.CType.IsConst := LeftType.IsConst or RightType.IsConst;
+    E.CType.IsVolatile := LeftType.IsVolatile or RightType.IsVolatile;
+    Exit;
+  end;
+
+  if IsPointerType(LeftType) and RightNull and IsIntegerType(RightType) then
+  begin
+    E.CType := LeftType;
+    Exit;
+  end;
+  if IsPointerType(RightType) and LeftNull and IsIntegerType(LeftType) then
+  begin
+    E.CType := RightType;
+    Exit;
+  end;
+
+  if (LeftType.Kind in [ctStruct, ctUnion]) and TypesEqual(LeftType, RightType) then
+  begin
+    E.CType := LeftType;
+    Exit;
+  end;
+
+  RaiseCompileError(E.Pos,
+    'incompatible operand types in conditional expression');
 end;
 
 procedure TSemanticAnalyzer.AnalyzeExpr(E: TExpr);
@@ -753,6 +1147,7 @@ begin
           boGreater, boGreaterEqual] then
         begin
           E.CType := MakeType(ctInt);
+          CheckComparisonTypes(E);
           if IsArithmeticType(LeftType) and IsArithmeticType(RightType) then
             E.OperationType := ArithmeticResultType(LeftType, RightType)
           else if IsPointerType(LeftType) then
@@ -811,6 +1206,10 @@ begin
         if not E.Left.IsLValue then
           RaiseCompileError(E.Pos, 'left side of assignment is not modifiable');
         E.CType := E.Left.CType;
+        if E.AssignOp = aoAssign then
+          CheckAssignmentTypes(E)
+        else
+          CheckCompoundAssignmentTypes(E);
       end;
 
     ekCall:
@@ -874,7 +1273,13 @@ begin
             RaiseCompileError(E.Pos, WithSuggestion(
               'call to undeclared function ''' + E.Text + '''',
               SuggestSymbol(E.Text)));
-          for I := 0 to High(E.Args) do AnalyzeExpr(E.Args[I]);
+          for I := 0 to High(E.Args) do
+          begin
+            AnalyzeExpr(E.Args[I]);
+            if I <= High(FunctionDecl.Params) then
+              CheckArgumentConversion(E.Args[I], FunctionDecl.Name, I + 1,
+                FunctionDecl.Params[I].CType);
+          end;
           E.CType := FunctionDecl.ReturnType;
           if (not FunctionDecl.IsVariadic) and
             (Length(E.Args) <> Length(FunctionDecl.Params)) then
@@ -904,6 +1309,10 @@ begin
               (Length(E.Args) < FunctionParameterCount(LeftType)) then
               RaiseCompileError(E.Pos,
                 'too few arguments to variadic function pointer');
+            for I := 0 to High(E.Args) do
+              if I < FunctionParameterCount(LeftType) then
+                CheckArgumentConversion(E.Args[I], 'function pointer', I + 1,
+                  FunctionParameterType(LeftType, I));
           end
           else
             E.CType := MakeType(ctInt);
@@ -915,10 +1324,8 @@ begin
         AnalyzeExpr(E.Left);
         AnalyzeExpr(E.Right);
         AnalyzeExpr(E.Third);
-        if TypesEqual(E.Right.CType, E.Third.CType) then
-          E.CType := E.Right.CType
-        else
-          E.CType := ArithmeticResultType(E.Right.CType, E.Third.CType);
+        CheckConditionalTypes(E);
+        E.OperationType := E.CType;
       end;
 
     ekPreInc, ekPreDec, ekPostInc, ekPostDec:
@@ -1078,8 +1485,7 @@ begin
     skReturn:
       begin
         AnalyzeExpr(S.Expr);
-        if (S.Expr <> nil) and (FCurrentFunction <> nil) then
-          S.Expr.CType := S.Expr.CType;
+        CheckReturnStatement(S);
       end;
     skBlock:
       begin
@@ -1154,8 +1560,10 @@ end;
 
 procedure TSemanticAnalyzer.InstallFileSymbols;
 var
-  I: LongInt;
+  I, J: LongInt;
   FunctionType: TCType;
+  OwnedReturnType: PCType;
+  ParameterList: PFunctionParameterList;
 begin
   for I := 0 to High(FProgram.Globals) do
     AddSymbol(FProgram.Globals[I].Name, FProgram.Globals[I].CType,
@@ -1163,6 +1571,18 @@ begin
   for I := 0 to High(FProgram.Functions) do
   begin
     FunctionType := MakeType(ctFunction);
+    New(OwnedReturnType);
+    OwnedReturnType^ := FProgram.Functions[I].ReturnType;
+    FProgram.OwnMemberType(OwnedReturnType);
+    FunctionType.ReturnType := OwnedReturnType;
+    New(ParameterList);
+    SetLength(ParameterList^.Items, Length(FProgram.Functions[I].Params));
+    for J := 0 to High(FProgram.Functions[I].Params) do
+      ParameterList^.Items[J] := FProgram.Functions[I].Params[J].CType;
+    FProgram.OwnFunctionParameterList(ParameterList);
+    FunctionType.ParamTypes := ParameterList;
+    FunctionType.ParamCount := Length(FProgram.Functions[I].Params);
+    FunctionType.IsVariadic := FProgram.Functions[I].IsVariadic;
     AddSymbol(FProgram.Functions[I].Name, FunctionType, symFunction,
       FProgram.Functions[I].Pos);
   end;

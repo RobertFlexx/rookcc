@@ -32,7 +32,8 @@ optimized:
 	@printf 'optimized rcc: %s (%s bytes)\n' "$(BIN)" \
 		"$$(wc -c < "$(BIN)")"
 
-test: test-platform-support test-c-differential test-cross-differential
+test: test-platform-support test-c-differential test-cross-differential \
+	test-semantic-conversions
 
 test-platform-support: test-target-formats test-native-driver test-native-host
 
@@ -50,6 +51,9 @@ test-cross-differential: $(BIN)
 	else \
 	  printf 'skipping cross differential suite: tests/cross_differential.py not present\n'; \
 	fi
+
+test-semantic-conversions: $(BIN)
+	python3 tests/semantic_conversions.py "$(abspath $(BIN))"
 
 bench: $(BIN)
 	@if [ -f bench/compare.py ]; then \
