@@ -122,8 +122,7 @@ install: $(BIN)
 	install -d "$(DESTDIR)$(PREFIX)/share/fish/vendor_completions.d"
 	install -m644 completions/rcc.fish "$(DESTDIR)$(PREFIX)/share/fish/vendor_completions.d/rcc.fish"
 	install -d "$(DOC_DIR)"
-	install -m644 README.md LICENSE RELEASE_HARDENING.md \
-		RELEASE_NOTES_2.0.0.md VERIFICATION_2.0.0.md "$(DOC_DIR)/"
+	install -m644 README.md LICENSE "$(DOC_DIR)/"
 	@if [ "$(INSTALL_ROOKCC)" = "1" ]; then \
 	  $(MAKE) --no-print-directory install-rookcc; \
 	fi
