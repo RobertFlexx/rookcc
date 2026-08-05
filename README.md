@@ -1,7 +1,7 @@
 <img width="1728" height="866" alt="rookcc" src="https://github.com/user-attachments/assets/7afbe89e-0d6a-45ae-b8a9-e92c26041ada" />
 
 rookcc is a small c compiler with native linux bsd and macos cross target
-output and the command is rcc
+output and the command is rcc. it makes cross compilation easy, and not bulky. you can easily cross compile to different operating systems and cpu architectures with rookcc very easily compared to other compilers.
 
 the compiler is written in free pascal and builds into one native program
 
