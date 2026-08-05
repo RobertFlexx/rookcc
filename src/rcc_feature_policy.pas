@@ -36,8 +36,8 @@ begin
   Result := nil;
   AddDefine(Result, '__ROOKCC__');
   AddDefine(Result, '__ROOKCC_VERSION__', IntToStr(RCCVersionNumber));
-  AddDefine(Result, '__ROOKCC_MAJOR__', '1');
-  AddDefine(Result, '__ROOKCC_MINOR__', '2');
+  AddDefine(Result, '__ROOKCC_MAJOR__', '2');
+  AddDefine(Result, '__ROOKCC_MINOR__', '0');
   AddDefine(Result, '__ROOKCC_PATCH__', '0');
   AddDefine(Result, '__ROOKCC_TARGET__', '1');
 

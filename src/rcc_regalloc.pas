@@ -62,12 +62,6 @@ begin
   Result := (AValue + AAlignment - 1) and not (AAlignment - 1);
 end;
 
-procedure AppendInteger(var AValues: array of LongInt; AValue: LongInt);
-begin
-
-
-end;
-
 procedure AddRegister(var ARegisters: TRegisterArray; ARegister: LongInt);
 var
   N: LongInt;

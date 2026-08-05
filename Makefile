@@ -3,7 +3,6 @@ FPCFLAGS ?= -Mobjfpc -Sh -O2 -XX -Xs -CX
 PREFIX ?= /usr/local
 DESTDIR ?=
 INSTALL_ROOKCC ?= 0
-# make optimized is redundant, i only did it for testing. dont use it in basic use. waste of time basically
 OPTIMIZED_FPCFLAGS ?= -Mobjfpc -Sh -O3 -Si -XX -Xs -CX
 
 BUILD_DIR := build
@@ -18,7 +17,10 @@ DOC_DIR := $(DESTDIR)$(PREFIX)/share/doc/rcc
 
 .PHONY: all optimized test test-platform-support test-target-formats \
 	test-native-driver test-native-host test-c-differential \
-	test-cross-differential bench package package-check release-check \
+	test-cross-differential test-semantic-conversions test-release-hardening \
+	test-standard-modes test-parser-fuzz test-determinism test-examples \
+	test-source-integrity bench package \
+	package-check release-check release-gate \
 	install install-rookcc uninstall clean
 
 all: $(BIN)
@@ -32,37 +34,48 @@ optimized:
 	@printf 'optimized rcc: %s (%s bytes)\n' "$(BIN)" \
 		"$$(wc -c < "$(BIN)")"
 
-test: test-platform-support test-c-differential test-cross-differential \
-	test-semantic-conversions
+test: test-source-integrity test-platform-support test-release-hardening \
+	test-standard-modes test-semantic-conversions test-c-differential \
+	test-cross-differential test-parser-fuzz test-determinism test-examples
 
 test-platform-support: test-target-formats test-native-driver test-native-host
 
 test-c-differential: $(BIN)
-	@if [ -f tests/c_differential.py ]; then \
-	  python3 tests/c_differential.py "$(abspath $(BIN))"; \
-	else \
-	  printf 'skipping C differential suite: tests/c_differential.py not present\n'; \
-	fi
+	python3 tests/c_differential.py "$(abspath $(BIN))"
 
 
 test-cross-differential: $(BIN)
-	@if [ -f tests/cross_differential.py ]; then \
-	  python3 tests/cross_differential.py "$(abspath $(BIN))"; \
-	else \
-	  printf 'skipping cross differential suite: tests/cross_differential.py not present\n'; \
-	fi
+	python3 tests/cross_differential.py "$(abspath $(BIN))"
 
 test-semantic-conversions: $(BIN)
 	python3 tests/semantic_conversions.py "$(abspath $(BIN))"
 
+test-release-hardening: $(BIN)
+	python3 tests/release_hardening.py "$(abspath $(BIN))"
+
+test-standard-modes: $(BIN)
+	python3 tests/standard_modes.py "$(abspath $(BIN))"
+
+test-parser-fuzz: $(BIN)
+	python3 tests/parser_fuzz.py "$(abspath $(BIN))"
+
+test-source-integrity:
+	python3 tests/source_integrity.py
+
+test-determinism: $(BIN)
+	python3 tests/determinism.py "$(abspath $(BIN))"
+
+test-examples: $(BIN)
+	python3 tests/examples_smoke.py "$(abspath $(BIN))"
+
 bench: $(BIN)
-	@if [ -f bench/compare.py ]; then \
-	  python3 bench/compare.py --rcc "$(abspath $(BIN))"; \
-	else \
-	  printf 'skipping benchmarks: bench/compare.py not present\n'; \
-	fi
+	python3 bench/compare.py --rcc "$(abspath $(BIN))" \
+	  --json-out "$(abspath $(BUILD_DIR))/benchmark.json"
 
 release-check: test package-check
+
+release-gate:
+	./scripts/release_gate.sh
 
 package:
 	./scripts/package.sh
@@ -109,7 +122,8 @@ install: $(BIN)
 	install -d "$(DESTDIR)$(PREFIX)/share/fish/vendor_completions.d"
 	install -m644 completions/rcc.fish "$(DESTDIR)$(PREFIX)/share/fish/vendor_completions.d/rcc.fish"
 	install -d "$(DOC_DIR)"
-	install -m644 README.md LICENSE "$(DOC_DIR)/"
+	install -m644 README.md LICENSE RELEASE_HARDENING.md \
+		RELEASE_NOTES_2.0.0.md VERIFICATION_2.0.0.md "$(DOC_DIR)/"
 	@if [ "$(INSTALL_ROOKCC)" = "1" ]; then \
 	  $(MAKE) --no-print-directory install-rookcc; \
 	fi

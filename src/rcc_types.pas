@@ -42,7 +42,8 @@ type
     kwIf, kwElse, kwWhile, kwDo, kwFor,
     kwSwitch, kwCase, kwDefault,
     kwBreak, kwContinue, kwReturn, kwGoto, kwAsm, kwTypeof,
-    kwSizeof, kwAlignof, kwAlignas, kwStaticAssert, kwGeneric, kwNullptr
+    kwSizeof, kwAlignof, kwAlignas, kwStaticAssert, kwGeneric, kwNullptr,
+    kwGNUAttribute
   );
 
   TToken = record
@@ -83,6 +84,8 @@ type
     IsBitField: Boolean;
     BitOffset: LongInt;
     BitWidth: LongInt;
+    AlignmentOverride: LongInt;
+    IsPacked: Boolean;
   end;
   TStructMemberArray = array of TStructMember;
 
@@ -93,6 +96,8 @@ type
     Size: LongInt;
     Align: LongInt;
     IsUnion: Boolean;
+    IsPacked: Boolean;
+    ExplicitAlign: LongInt;
   end;
 
   TEnumConstant = record
@@ -106,6 +111,9 @@ type
     IsUnsigned: Boolean;
     IsConst: Boolean;
     IsVolatile: Boolean;
+    IsPacked: Boolean;
+    AlignmentOverride: LongInt;
+    SuppressUnusedWarning: Boolean;
     PointerDepth: LongInt;
     ArrayLength: LongInt;
     StructInfo: PStructMembers;
@@ -219,6 +227,8 @@ type
     { Member named by a designated initializer, kept apart from Text because a
       string literal stores its own value there. }
     Designator: string;
+    HasIndexDesignator: Boolean;
+    IndexDesignator: Int64;
     BitOffset: LongInt;
     BitWidth: LongInt;
     BitStorageSize: LongInt;
@@ -376,6 +386,7 @@ type
     OptimizeDebug: Boolean;
     Standard: TCStandard;
     WarningLevel: TWarningLevel;
+    DisabledWarnings: TStringArray;
     EmitMode: TEmitMode;
     ColorMode: TColorMode;
     Verbose: Boolean;
@@ -414,6 +425,8 @@ function IsIntegerType(const AType: TCType): Boolean;
 function IsScalarType(const AType: TCType): Boolean;
 function CStandardName(AStandard: TCStandard): string;
 function CStandardVersion(AStandard: TCStandard): string;
+function CStandardRevision(AStandard: TCStandard): LongInt;
+function CStandardAtLeast(AStandard: TCStandard; ARevision: LongInt): Boolean;
 function IsGNUStandard(AStandard: TCStandard): Boolean;
 
 implementation
@@ -448,6 +461,9 @@ begin
   IsLValue := False;
   IsFunctionDesignator := False;
   IsBitField := False;
+  Designator := '';
+  HasIndexDesignator := False;
+  IndexDesignator := 0;
   BitOffset := 0;
   BitWidth := 0;
   BitStorageSize := 0;
@@ -658,6 +674,9 @@ begin
   Result.IsUnsigned := AUnsigned;
   Result.IsConst := False;
   Result.IsVolatile := False;
+  Result.IsPacked := False;
+  Result.AlignmentOverride := 0;
+  Result.SuppressUnusedWarning := False;
   Result.PointerDepth := APointerDepth;
   Result.ArrayLength := 0;
   Result.StructInfo := nil;
@@ -765,6 +784,45 @@ begin
     if A.StructInfo^.Name <> B.StructInfo^.Name then Exit(False);
     if A.StructInfo^.IsUnion <> B.StructInfo^.IsUnion then Exit(False);
     if A.StructInfo^.Size <> B.StructInfo^.Size then Exit(False);
+    if A.StructInfo^.Align <> B.StructInfo^.Align then Exit(False);
+    if A.StructInfo^.IsPacked <> B.StructInfo^.IsPacked then Exit(False);
+    if A.StructInfo^.ExplicitAlign <> B.StructInfo^.ExplicitAlign then Exit(False);
+    if Length(A.StructInfo^.Members) <> Length(B.StructInfo^.Members) then
+      Exit(False);
+    for I := 0 to High(A.StructInfo^.Members) do
+    begin
+      if A.StructInfo^.Members[I].Name <> B.StructInfo^.Members[I].Name then
+        Exit(False);
+      if A.StructInfo^.Members[I].Offset <> B.StructInfo^.Members[I].Offset then
+        Exit(False);
+      if A.StructInfo^.Members[I].Width <> B.StructInfo^.Members[I].Width then
+        Exit(False);
+      if A.StructInfo^.Members[I].IsBitField <>
+         B.StructInfo^.Members[I].IsBitField then Exit(False);
+      if A.StructInfo^.Members[I].BitOffset <>
+         B.StructInfo^.Members[I].BitOffset then Exit(False);
+      if A.StructInfo^.Members[I].BitWidth <>
+         B.StructInfo^.Members[I].BitWidth then Exit(False);
+      if A.StructInfo^.Members[I].AlignmentOverride <>
+         B.StructInfo^.Members[I].AlignmentOverride then Exit(False);
+      if A.StructInfo^.Members[I].IsPacked <>
+         B.StructInfo^.Members[I].IsPacked then Exit(False);
+      if (A.StructInfo^.Members[I].CType = nil) <>
+         (B.StructInfo^.Members[I].CType = nil) then Exit(False);
+      if (A.StructInfo^.Members[I].CType <> nil) and
+         (B.StructInfo^.Members[I].CType <> nil) then
+      begin
+        { Compare the member's immediate representation without descending into
+          tagged aggregate definitions, which may be self-referential through
+          pointers. The enclosing tag/layout checks above catch ABI conflicts. }
+        if PCType(A.StructInfo^.Members[I].CType)^.Kind <>
+           PCType(B.StructInfo^.Members[I].CType)^.Kind then Exit(False);
+        if PCType(A.StructInfo^.Members[I].CType)^.PointerDepth <>
+           PCType(B.StructInfo^.Members[I].CType)^.PointerDepth then Exit(False);
+        if PCType(A.StructInfo^.Members[I].CType)^.IsUnsigned <>
+           PCType(B.StructInfo^.Members[I].CType)^.IsUnsigned then Exit(False);
+      end;
+    end;
   end;
   if A.Kind = ctFunction then
   begin
@@ -832,26 +890,34 @@ end;
 function CTypeAlign(const AType: TCType): LongInt;
 var
   ElementType: TCType;
+  NaturalAlign: LongInt;
 begin
-  if AType.PointerDepth > 0 then Exit(8);
-  case AType.Kind of
-    ctVoid, ctChar, ctBool: Result := 1;
-    ctShort: Result := 2;
-    ctInt, ctFloat, ctEnum: Result := 4;
-    ctLong, ctLongLong, ctDouble, ctPointer: Result := 8;
-    ctLongDouble: Result := ActiveLongDoubleAlignment;
-    ctArray:
-      begin
-        ElementType := ArrayElementType(AType);
-        Result := CTypeAlign(ElementType);
-      end;
-    ctStruct, ctUnion:
-      if AType.StructInfo <> nil then Result := AType.StructInfo^.Align
-      else Result := 1;
-    ctFunction: Result := 1;
+  if AType.PointerDepth > 0 then
+    NaturalAlign := 8
   else
-    Result := 8;
-  end;
+    case AType.Kind of
+      ctVoid, ctChar, ctBool: NaturalAlign := 1;
+      ctShort: NaturalAlign := 2;
+      ctInt, ctFloat, ctEnum: NaturalAlign := 4;
+      ctLong, ctLongLong, ctDouble, ctPointer: NaturalAlign := 8;
+      ctLongDouble: NaturalAlign := ActiveLongDoubleAlignment;
+      ctArray:
+        begin
+          ElementType := ArrayElementType(AType);
+          NaturalAlign := CTypeAlign(ElementType);
+        end;
+      ctStruct, ctUnion:
+        if AType.StructInfo <> nil then NaturalAlign := AType.StructInfo^.Align
+        else NaturalAlign := 1;
+      ctFunction: NaturalAlign := 1;
+    else
+      NaturalAlign := 8;
+    end;
+
+  if AType.IsPacked then NaturalAlign := 1;
+  if AType.AlignmentOverride > NaturalAlign then
+    NaturalAlign := AType.AlignmentOverride;
+  Result := NaturalAlign;
 end;
 
 function IsArithmeticType(const AType: TCType): Boolean;
@@ -903,6 +969,25 @@ begin
   else
     Result := '201710L';
   end;
+end;
+
+function CStandardRevision(AStandard: TCStandard): LongInt;
+begin
+  case AStandard of
+    csC90: Result := 1990;
+    csC99, csGNU99: Result := 1999;
+    csC11, csGNU11: Result := 2011;
+    csC17, csGNU17: Result := 2017;
+    csC23, csGNU23: Result := 2023;
+    csRCC: Result := 2017;
+  else
+    Result := 2017;
+  end;
+end;
+
+function CStandardAtLeast(AStandard: TCStandard; ARevision: LongInt): Boolean;
+begin
+  Result := CStandardRevision(AStandard) >= ARevision;
 end;
 
 function IsGNUStandard(AStandard: TCStandard): Boolean;

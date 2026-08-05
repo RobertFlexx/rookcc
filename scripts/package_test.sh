@@ -17,13 +17,15 @@ tar -xzf "$A/$NAME.tar.gz" -C "$TMP/tar"
 unzip -q "$A/$NAME.zip" -d "$TMP/zip"
 diff -qr "$TMP/tar/$NAME" "$TMP/zip/$NAME" >/dev/null || { printf 'FAIL package-check: archive trees differ\n' >&2; exit 1; }
 (cd "$TMP/tar/$NAME" && sha256sum -c MANIFEST.sha256 >/dev/null)
-[[ $(find "$TMP/tar/$NAME" -type f -name '*.md' | wc -l) -eq 1 ]] || { printf 'FAIL package-check: source package must contain only README.md\n' >&2; exit 1; }
+for document in README.md RELEASE_HARDENING.md RELEASE_NOTES_2.0.0.md VERIFICATION_2.0.0.md; do
+  [[ -f "$TMP/tar/$NAME/$document" ]] || { printf 'FAIL package-check: omitted %s\n' "$document" >&2; exit 1; }
+done
 
 while IFS= read -r path; do
   case "$path" in */build/*|*/dist/*|*/tests/tmp/*|*/__pycache__/*|*.pyc|*.ppu|*.o|*.a|*.so|*.exe) printf 'FAIL package-check: generated artifact leaked: %s\n' "$path" >&2; exit 1;; esac
 done < <(find "$TMP/tar/$NAME" -type f | LC_ALL=C sort)
 
-for required in README.md Makefile scripts/build.sh scripts/install.sh scripts/package.sh scripts/package_test.sh tests/target_format_matrix.py tests/native_linker_driver_contract.py tests/native_host_smoke.py src/rcc_native_linker.pas src/rcc_macho.pas src/rcc_object_writer.pas include/rcc/capabilities.h; do
+for required in README.md RELEASE_HARDENING.md RELEASE_NOTES_2.0.0.md VERIFICATION_2.0.0.md Makefile scripts/build.sh scripts/install.sh scripts/package.sh scripts/package_test.sh scripts/release_gate.sh tests/target_format_matrix.py tests/native_linker_driver_contract.py tests/native_host_smoke.py tests/c_differential.py tests/cross_differential.py tests/semantic_conversions.py tests/standard_modes.py tests/release_hardening.py tests/parser_fuzz.py tests/determinism.py tests/examples_smoke.py tests/source_integrity.py bench/compare.py src/rcc_native_linker.pas src/rcc_macho.pas src/rcc_object_writer.pas include/rcc/capabilities.h; do
   [[ -f $TMP/tar/$NAME/$required ]] || { printf 'FAIL package-check: omitted %s\n' "$required" >&2; exit 1; }
 done
 for forbidden in scripts/rcc-driver.sh scripts/release_status.py scripts/source_feature_scan.py src/rcc_release_gate.pas; do

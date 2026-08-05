@@ -77,7 +77,20 @@ type
     gakMayAlias,
     gakNoSanitize,
     gakOptimize,
-    gakTarget
+    gakTarget,
+    gakVectorSize,
+    gakMode,
+    gakMSABI,
+    gakSysVABI,
+    gakStdCall,
+    gakCDecl,
+    gakTransparentUnion,
+    gakCommon,
+    gakNoCommon,
+    gakTLSModel,
+    gakIFunc,
+    gakInterrupt,
+    gakNaked
   );
 
   TGNUAttribute = record
@@ -195,6 +208,19 @@ begin
     gakNoSanitize: Result := 'no_sanitize';
     gakOptimize: Result := 'optimize';
     gakTarget: Result := 'target';
+    gakVectorSize: Result := 'vector_size';
+    gakMode: Result := 'mode';
+    gakMSABI: Result := 'ms_abi';
+    gakSysVABI: Result := 'sysv_abi';
+    gakStdCall: Result := 'stdcall';
+    gakCDecl: Result := 'cdecl';
+    gakTransparentUnion: Result := 'transparent_union';
+    gakCommon: Result := 'common';
+    gakNoCommon: Result := 'nocommon';
+    gakTLSModel: Result := 'tls_model';
+    gakIFunc: Result := 'ifunc';
+    gakInterrupt: Result := 'interrupt';
+    gakNaked: Result := 'naked';
   else
     Result := 'unknown';
   end;
@@ -235,6 +261,19 @@ begin
   else if Pos('no_sanitize', N) = 1 then Result := gakNoSanitize
   else if N = 'optimize' then Result := gakOptimize
   else if N = 'target' then Result := gakTarget
+  else if N = 'vector_size' then Result := gakVectorSize
+  else if N = 'mode' then Result := gakMode
+  else if N = 'ms_abi' then Result := gakMSABI
+  else if N = 'sysv_abi' then Result := gakSysVABI
+  else if N = 'stdcall' then Result := gakStdCall
+  else if N = 'cdecl' then Result := gakCDecl
+  else if N = 'transparent_union' then Result := gakTransparentUnion
+  else if N = 'common' then Result := gakCommon
+  else if N = 'nocommon' then Result := gakNoCommon
+  else if N = 'tls_model' then Result := gakTLSModel
+  else if N = 'ifunc' then Result := gakIFunc
+  else if N = 'interrupt' then Result := gakInterrupt
+  else if N = 'naked' then Result := gakNaked
   else Result := gakUnknown;
 end;
 
@@ -242,7 +281,7 @@ function GNUExtensionSupport(AExtension: TGNUExtension): TGNUSupportLevel;
 begin
   case AExtension of
     geAlternateKeywords: Result := gslParsed;
-    geAttributes: Result := gslParsedAndIgnored;
+    geAttributes: Result := gslLowered;
     geStatementExpressions: Result := gslUnsupported;
     geTypeof: Result := gslLowered;
     geAlignof: Result := gslParsed;
@@ -302,23 +341,24 @@ end;
 
 function GNUAttributeCanBeIgnored(AKind: TGNUAttributeKind): Boolean;
 begin
-  Result := AKind in [gakUnknown, gakCold, gakDeprecated, gakFormat,
+  Result := AKind in [gakCold, gakDeprecated, gakFormat,
     gakHot, gakLeaf, gakMalloc, gakNoInline, gakNoReturn, gakNonNull,
     gakPure, gakSentinel, gakUnused, gakWarnUnusedResult, gakFallthrough,
-    gakFlatten, gakNoSanitize, gakOptimize, gakTarget];
+    gakFlatten, gakNoSanitize];
 end;
 
 function GNUAttributeAffectsABI(AKind: TGNUAttributeKind): Boolean;
 begin
-  Result := AKind in [gakAligned, gakPacked, gakVisibility, gakWeak,
-    gakAlias, gakMayAlias];
+  Result := AKind in [gakVisibility, gakWeak, gakAlias, gakMayAlias,
+    gakVectorSize, gakMode, gakMSABI, gakSysVABI, gakStdCall, gakCDecl,
+    gakTransparentUnion, gakCommon, gakNoCommon, gakTLSModel, gakIFunc];
 end;
 
 function GNUAttributeAffectsCodeGeneration(AKind: TGNUAttributeKind): Boolean;
 begin
   Result := AKind in [gakAlwaysInline, gakConstructor, gakDestructor,
     gakNoInline, gakNoReturn, gakSection, gakUsed, gakCleanup, gakFlatten,
-    gakOptimize, gakTarget];
+    gakOptimize, gakTarget, gakInterrupt, gakNaked];
 end;
 
 function GNUAttributeSummary(const AAttribute: TGNUAttribute): string;

@@ -5,7 +5,7 @@ unit rcc_frontend;
 interface
 
 uses
-  Classes, SysUtils, StrUtils, rcc_types, rcc_typeops;
+  Classes, SysUtils, StrUtils, rcc_types, rcc_typeops, rcc_gnu_compat;
 
 type
   TMacro = record
@@ -93,6 +93,7 @@ type
     FColumn: LongInt;
     FTokenCount: LongInt;
     FTokenCapacity: LongInt;
+    FStandard: TCStandard;
     function Current: Char;
     function Peek(AOffset: LongInt = 1): Char;
     procedure Advance;
@@ -107,7 +108,8 @@ type
       const AText: string; AValue: Int64; AFloatValue: Double;
       const APos: TSourcePos);
   public
-    constructor Create(const ASource, AFileName: string);
+    constructor Create(const ASource, AFileName: string;
+      AStandard: TCStandard);
     function Tokenize: TTokenArray;
   end;
 
@@ -125,18 +127,22 @@ type
     FOwnedFunctionParameterLists: array of PFunctionParameterList;
     FSwitchLabels: array of Int64;
     FSwitchHasDefault: Boolean;
+    FFunctionLabels: rcc_types.TStringArray;
     { Records whether the storage class of the most recently parsed declaration
       specifier list included `static`. }
     FLastTypeWasStatic: Boolean;
     FInSwitch: LongInt;
     FBreakableDepth: LongInt;
     FContinueableDepth: LongInt;
+    FStandard: TCStandard;
     function Current: TToken;
     function Peek(AOffset: LongInt = 1): TToken;
     function At(AKind: TTokenKind): Boolean;
     function Match(AKind: TTokenKind): Boolean;
     function Expect(AKind: TTokenKind; const AWhat: string = ''): TToken;
     function IsTypeStart: Boolean;
+    procedure RequireCStandard(ARevision: LongInt; const AFeature: string;
+      const APos: TSourcePos);
     function FindTypedef(const AName: string; out ACType: TCType): Boolean;
     procedure AddTypedef(const AName: string; const ACType: TCType);
     function FindIntegerConstant(const AName: string; out AValue: Int64): Boolean;
@@ -147,10 +153,17 @@ type
     procedure AddDeclaredType(const AName: string; const ACType: TCType;
       AScopeDepth: LongInt; AIsFunction: Boolean = False);
     procedure EnterScope;
+    procedure RegisterFunctionLabel(const AName: string; const APos: TSourcePos);
     procedure LeaveScope;
     function InferParserExpressionType(E: TExpr; out ACType: TCType): Boolean;
     function EvaluateParserIntegerConstant(E: TExpr; out AValue: Int64): Boolean;
     function FindStruct(const AName: string; out AInfo: PStructMembers): Boolean;
+    function ParseGNUAttributes: TGNUAttributeArray;
+    procedure ApplyTypeAttributes(var ACType: TCType;
+      const AAttributes: TGNUAttributeArray; AAllowPacked: Boolean;
+      AAllowAlignment: Boolean = True);
+    procedure ParsePostDeclaratorAttributes(var ACType: TCType;
+      AAllowPacked: Boolean = False; AAllowAlignment: Boolean = True);
     function ParseDeclarator(var CType: TCType; out AName: string): Boolean;
     function ParseTypeofType: TCType;
     function ParseType(out AWasTypedef: Boolean): TCType;
@@ -186,7 +199,7 @@ type
     function NewOwnedFunctionParameterList: PFunctionParameterList;
     procedure TransferTypeStorage(AProgram: TProgram);
   public
-    constructor Create(const ATokens: TTokenArray);
+    constructor Create(const ATokens: TTokenArray; AStandard: TCStandard);
     destructor Destroy; override;
     function ParseProgram: TProgram;
   end;
@@ -1665,11 +1678,13 @@ end;
 
 
 
-constructor TLexer.Create(const ASource, AFileName: string);
+constructor TLexer.Create(const ASource, AFileName: string;
+  AStandard: TCStandard);
 begin
   inherited Create;
   FSource := ASource;
   FFileName := AFileName;
+  FStandard := AStandard;
   FIndex := 1;
   FLine := 1;
   FColumn := 1;
@@ -1714,6 +1729,9 @@ begin
     while Current in [' ', #9, #10, #13, #12] do Advance;
     if (Current = '/') and (Peek = '/') then
     begin
+      if not CStandardAtLeast(FStandard, 1999) and
+         not IsGNUStandard(FStandard) then
+        RaiseCompileError(Position, '// comments require C99 or newer');
       while not (Current in [#0, #10]) do Advance;
       Continue;
     end;
@@ -1772,6 +1790,9 @@ var
 
   procedure ConsumeDigitSeparator(ABase, ASequenceDigits: LongInt);
   begin
+    if not CStandardAtLeast(FStandard, 2023) and
+       not IsGNUStandard(FStandard) then
+      RaiseCompileError(Position, 'digit separators require C23 or GNU mode');
     if (ASequenceDigits = 0) or not IsBaseDigit(Peek, ABase) then
       RaiseCompileError(Position,
         'digit separator must appear between digits');
@@ -1800,6 +1821,9 @@ begin
   end
   else if (Current = '0') and ((Peek = 'b') or (Peek = 'B')) then
   begin
+    if not CStandardAtLeast(FStandard, 2023) and
+       not IsGNUStandard(FStandard) then
+      RaiseCompileError(P, 'binary integer literals require C23 or GNU mode');
     Base := 2;
     Advance;
     Advance;
@@ -2209,7 +2233,7 @@ end;
 
 
 
-constructor TParser.Create(const ATokens: TTokenArray);
+constructor TParser.Create(const ATokens: TTokenArray; AStandard: TCStandard);
 begin
   inherited Create;
   FTokens := ATokens;
@@ -2218,6 +2242,7 @@ begin
   FBreakableDepth := 0;
   FContinueableDepth := 0;
   FScopeDepth := 0;
+  FStandard := AStandard;
   SetLength(FDeclaredTypes, 0);
 end;
 
@@ -2412,6 +2437,20 @@ begin
   FDeclaredTypes[N].CType := ACType;
   FDeclaredTypes[N].ScopeDepth := AScopeDepth;
   FDeclaredTypes[N].IsFunction := AIsFunction;
+end;
+
+
+procedure TParser.RegisterFunctionLabel(const AName: string;
+  const APos: TSourcePos);
+var
+  I, N: LongInt;
+begin
+  for I := 0 to High(FFunctionLabels) do
+    if FFunctionLabels[I] = AName then
+      RaiseCompileError(APos, 'duplicate label ''' + AName + ''' in function');
+  N := Length(FFunctionLabels);
+  SetLength(FFunctionLabels, N + 1);
+  FFunctionLabels[N] := AName;
 end;
 
 procedure TParser.EnterScope;
@@ -2781,10 +2820,154 @@ begin
     kwVoid, kwChar, kwShort, kwInt, kwLong, kwFloat, kwDouble, kwBool,
     kwSigned, kwUnsigned, kwConst, kwVolatile, kwRestrict,
     kwStatic, kwExtern, kwAuto, kwRegister, kwInline,
-    kwTypedef, kwStruct, kwUnion, kwEnum, kwTypeof: Exit(True);
+    kwTypedef, kwStruct, kwUnion, kwEnum, kwTypeof, kwAlignas,
+    kwGNUAttribute: Exit(True);
     tkIdentifier: Exit(FindTypedef(Current.Text, Dummy));
   end;
   Result := False;
+end;
+
+procedure TParser.RequireCStandard(ARevision: LongInt;
+  const AFeature: string; const APos: TSourcePos);
+begin
+  if not CStandardAtLeast(FStandard, ARevision) then
+    RaiseCompileError(APos, AFeature + ' requires C' +
+      IntToStr(ARevision mod 100) + ' or newer');
+end;
+
+function IsPowerOfTwoAlignment(AValue: Int64): Boolean;
+begin
+  Result := (AValue > 0) and ((QWord(AValue) and (QWord(AValue) - 1)) = 0);
+end;
+
+function TParser.ParseGNUAttributes: TGNUAttributeArray;
+var
+  Attr: TGNUAttribute;
+  N, Depth: LongInt;
+  NestedParens: Boolean;
+  ArgText: string;
+begin
+  SetLength(Result, 0);
+  while At(kwGNUAttribute) do
+  begin
+    Inc(FIndex);
+    Expect(tkLParen, '''('' after __attribute__');
+    NestedParens := Match(tkLParen);
+    while not At(tkRParen) do
+    begin
+      if Match(tkComma) then Continue;
+      if Current.Kind <> tkIdentifier then
+        RaiseCompileError(Current.Pos, 'expected a GNU attribute name');
+      Attr.Name := Current.Text;
+      if SameText(Attr.Name, 'align') then Attr.Name := 'aligned';
+      Attr.Kind := ParseGNUAttributeName(Attr.Name);
+      Attr.SourceText := Attr.Name;
+      SetLength(Attr.Arguments, 0);
+      Inc(FIndex);
+      if Match(tkLParen) then
+      begin
+        Depth := 1;
+        ArgText := '';
+        while (Depth > 0) and not At(tkEOF) do
+        begin
+          if Current.Kind = tkLParen then Inc(Depth)
+          else if Current.Kind = tkRParen then
+          begin
+            Dec(Depth);
+            if Depth = 0 then
+            begin
+              Inc(FIndex);
+              Break;
+            end;
+          end;
+          if Depth > 0 then
+          begin
+            if ArgText <> '' then ArgText := ArgText + ' ';
+            ArgText := ArgText + Current.Text;
+            Inc(FIndex);
+          end;
+        end;
+        if Depth <> 0 then
+          RaiseCompileError(Current.Pos, 'unterminated GNU attribute argument');
+        SetLength(Attr.Arguments, 1);
+        Attr.Arguments[0] := Trim(ArgText);
+        Attr.SourceText := Attr.SourceText + '(' + Trim(ArgText) + ')';
+      end;
+      if Attr.Kind = gakUnknown then
+        RaiseCompileError(Current.Pos, 'unknown GNU attribute ''' + Attr.Name + '''');
+      N := Length(Result);
+      SetLength(Result, N + 1);
+      Result[N] := Attr;
+      if not Match(tkComma) then Break;
+    end;
+    Expect(tkRParen);
+    if NestedParens then Expect(tkRParen);
+  end;
+end;
+
+procedure TParser.ApplyTypeAttributes(var ACType: TCType;
+  const AAttributes: TGNUAttributeArray; AAllowPacked: Boolean;
+  AAllowAlignment: Boolean);
+var
+  I: LongInt;
+  AlignmentValue: Int64;
+begin
+  for I := 0 to High(AAttributes) do
+    case AAttributes[I].Kind of
+      gakPacked:
+        begin
+          if not AAllowPacked then
+            RaiseCompileError(Current.Pos,
+              'GNU packed attribute is only valid on a struct, union, or member');
+          ACType.IsPacked := True;
+        end;
+      gakAligned:
+        begin
+          if not AAllowAlignment then
+            RaiseCompileError(Current.Pos,
+              'GNU aligned attribute on functions is not implemented');
+          if Length(AAttributes[I].Arguments) = 0 then
+            AlignmentValue := 16
+          else if not TryStrToInt64(Trim(AAttributes[I].Arguments[0]),
+            AlignmentValue) then
+            RaiseCompileError(Current.Pos,
+              'GNU aligned attribute requires an integer constant');
+          if not IsPowerOfTwoAlignment(AlignmentValue) or
+             (AlignmentValue > 16) then
+            RaiseCompileError(Current.Pos,
+              'supported alignment must be a power of two between 1 and 16');
+          if AlignmentValue > ACType.AlignmentOverride then
+            ACType.AlignmentOverride := LongInt(AlignmentValue);
+        end;
+      gakUnused:
+        ACType.SuppressUnusedWarning := True;
+      gakCold, gakDeprecated, gakFormat, gakHot, gakLeaf, gakMalloc,
+      gakNoInline, gakNoReturn, gakNonNull, gakPure, gakSentinel,
+      gakWarnUnusedResult, gakFallthrough, gakFlatten, gakNoSanitize:
+        begin
+          { These attributes affect diagnostics or optimization policy only.
+            Accepting them is semantically safe until the corresponding hint is
+            consumed by the warning/optimizer layer. }
+        end;
+    else
+      if GNUAttributeAffectsABI(AAttributes[I].Kind) or
+         GNUAttributeAffectsCodeGeneration(AAttributes[I].Kind) then
+        RaiseCompileError(Current.Pos,
+          'GNU attribute ''' + AAttributes[I].Name +
+          ''' is recognized but not implemented for this declaration');
+    end;
+end;
+
+procedure TParser.ParsePostDeclaratorAttributes(var ACType: TCType;
+  AAllowPacked, AAllowAlignment: Boolean);
+var
+  Attributes: TGNUAttributeArray;
+begin
+  while At(kwGNUAttribute) do
+  begin
+    Attributes := ParseGNUAttributes;
+    ApplyTypeAttributes(ACType, Attributes, AAllowPacked, AAllowAlignment);
+  end;
 end;
 
 function TParser.ParseDeclarator(var CType: TCType; out AName: string): Boolean;
@@ -2797,8 +2980,8 @@ var
   ParamWasTypedef: Boolean;
   ParamList: PFunctionParameterList;
   FunctionVariadic: Boolean;
-  Dimensions: array of Int64;
-  DimensionCount, DimensionIndex: LongInt;
+  Dimensions, GroupedDimensions: array of Int64;
+  DimensionCount, DimensionIndex, GroupedDimensionCount: LongInt;
 begin
   AName := '';
   PointerDepth := CType.PointerDepth;
@@ -2827,6 +3010,34 @@ begin
         AName := Current.Text;
         Inc(FIndex);
       end;
+
+      { Array suffixes inside the grouped pointer belong to the pointer
+        declarator: `int (*table[4])(int)` is an array of four function
+        pointers, not a pointer to a function returning an array. }
+      GroupedDimensionCount := 0;
+      SetLength(GroupedDimensions, 0);
+      while Match(tkLBracket) do
+      begin
+        ArrayLength := 0;
+        if not At(tkRBracket) then
+        begin
+          Expr := ParseConditional;
+          try
+            if not EvaluateParserIntegerConstant(Expr, ArrayLength) then
+              RaiseCompileError(Expr.Pos,
+                'array bound must be an integer constant expression');
+          finally
+            Expr.Free;
+          end;
+          if ArrayLength < 0 then
+            RaiseCompileError(Current.Pos, 'array bound must not be negative');
+        end;
+        Expect(tkRBracket);
+        SetLength(GroupedDimensions, GroupedDimensionCount + 1);
+        GroupedDimensions[GroupedDimensionCount] := ArrayLength;
+        Inc(GroupedDimensionCount);
+      end;
+
       Expect(tkRParen);
       if Match(tkLParen) then
       begin
@@ -2846,6 +3057,7 @@ begin
             ParamType := ParseType(ParamWasTypedef);
             ParamName := '';
             ParseDeclarator(ParamType, ParamName);
+            ParsePostDeclaratorAttributes(ParamType, False);
             if ParamType.Kind = ctArray then ParamType := DecayType(ParamType);
             N := Length(ParamList^.Items);
             SetLength(ParamList^.Items, N + 1);
@@ -2859,6 +3071,12 @@ begin
         CType.ParamTypes := ParamList;
         CType.ParamCount := Length(ParamList^.Items);
         CType.IsVariadic := FunctionVariadic;
+        for DimensionIndex := GroupedDimensionCount - 1 downto 0 do
+        begin
+          ElementType := CType;
+          CType := MakeArrayType(ElementType,
+            GroupedDimensions[DimensionIndex]);
+        end;
         Exit(True);
       end;
       { In `int (*m)[3]` the grouped pointer applies to whatever the suffix
@@ -2957,6 +3175,11 @@ var
   EnumVals: TEnumConstantArray;
   I, N: LongInt;
   StructFound: Boolean;
+  TypeAttributes: TGNUAttributeArray;
+  AlignmentExpr: TExpr;
+  AlignmentValue: Int64;
+  AlignmentType: TCType;
+  AlignmentWasTypedef: Boolean;
 
   procedure CompleteOwnedStructInfos(const AInfo: TStructMembers);
   var
@@ -2981,6 +3204,43 @@ begin
   while True do
   begin
     case Current.Kind of
+      kwGNUAttribute:
+        begin
+          TypeAttributes := ParseGNUAttributes;
+          ApplyTypeAttributes(Result, TypeAttributes, BaseSeen and
+            (Result.Kind in [ctStruct, ctUnion]));
+        end;
+      kwAlignas:
+        begin
+          RequireCStandard(2011, '_Alignas', Current.Pos);
+          Inc(FIndex);
+          Expect(tkLParen);
+          if IsTypeStart then
+          begin
+            AlignmentType := ParseType(AlignmentWasTypedef);
+            ParsePointerTail(AlignmentType);
+            AlignmentValue := CTypeAlign(AlignmentType);
+          end
+          else
+          begin
+            AlignmentExpr := ParseConditional;
+            try
+              if not EvaluateParserIntegerConstant(AlignmentExpr, AlignmentValue) then
+                RaiseCompileError(AlignmentExpr.Pos,
+                  '_Alignas requires an integer constant expression');
+            finally
+              AlignmentExpr.Free;
+            end;
+          end;
+          Expect(tkRParen);
+          if (AlignmentValue <> 0) and
+             (not IsPowerOfTwoAlignment(AlignmentValue) or
+              (AlignmentValue > 16)) then
+            RaiseCompileError(Current.Pos,
+              'supported _Alignas value must be zero or a power of two between 1 and 16');
+          if AlignmentValue > Result.AlignmentOverride then
+            Result.AlignmentOverride := LongInt(AlignmentValue);
+        end;
       kwConst:
         begin
           Result.IsConst := True;
@@ -2991,7 +3251,12 @@ begin
           Result.IsVolatile := True;
           Inc(FIndex);
         end;
-      kwRestrict, kwExtern, kwAuto, kwRegister:
+      kwRestrict:
+        begin
+          RequireCStandard(1999, 'restrict', Current.Pos);
+          Inc(FIndex);
+        end;
+      kwExtern, kwAuto, kwRegister:
         Inc(FIndex);
       kwStatic:
         begin
@@ -2999,7 +3264,10 @@ begin
           Inc(FIndex);
         end;
       kwInline:
-        Inc(FIndex);
+        begin
+          RequireCStandard(1999, 'inline', Current.Pos);
+          Inc(FIndex);
+        end;
       kwTypedef:
         begin
           AWasTypedef := True;
@@ -3023,6 +3291,7 @@ begin
         end;
       kwBool:
         begin
+          RequireCStandard(1999, '_Bool', Current.Pos);
           Result.Kind := ctBool;
           BaseSeen := True;
           Inc(FIndex);
@@ -3048,6 +3317,8 @@ begin
       kwLong:
         begin
           Inc(LongCount);
+          if (LongCount >= 2) and not IsGNUStandard(FStandard) then
+            RequireCStandard(1999, 'long long', Current.Pos);
           if BaseSeen and (Result.Kind = ctDouble) then
             Result.Kind := ctLongDouble
           else if LongCount >= 2 then Result.Kind := ctLongLong
@@ -3145,6 +3416,11 @@ begin
           T := ParseTypeofType;
           T.IsConst := T.IsConst or Result.IsConst;
           T.IsVolatile := T.IsVolatile or Result.IsVolatile;
+          T.IsPacked := T.IsPacked or Result.IsPacked;
+          T.SuppressUnusedWarning := T.SuppressUnusedWarning or
+            Result.SuppressUnusedWarning;
+          if Result.AlignmentOverride > T.AlignmentOverride then
+            T.AlignmentOverride := Result.AlignmentOverride;
           Result := T;
           BaseSeen := True;
         end;
@@ -3152,6 +3428,13 @@ begin
         begin
           if (not BaseSeen) and FindTypedef(Current.Text, T) then
           begin
+            T.IsConst := T.IsConst or Result.IsConst;
+            T.IsVolatile := T.IsVolatile or Result.IsVolatile;
+            T.IsPacked := T.IsPacked or Result.IsPacked;
+            T.SuppressUnusedWarning := T.SuppressUnusedWarning or
+              Result.SuppressUnusedWarning;
+            if Result.AlignmentOverride > T.AlignmentOverride then
+              T.AlignmentOverride := Result.AlignmentOverride;
             Result := T;
             BaseSeen := True;
             Inc(FIndex);
@@ -3246,6 +3529,11 @@ var
   BitWidthValue: Int64;
   BitWidthExpr: TExpr;
   BitOffset: LongInt;
+  StructAttributes, MemberAttributes: TGNUAttributeArray;
+  StructTypeForAttributes: TCType;
+  StructPacked: Boolean;
+  StructExplicitAlign: LongInt;
+  SavedAttributeIndex, ScanIndex, BraceDepth: LongInt;
 begin
   New(Result);
   Result^.Name := '';
@@ -3253,6 +3541,19 @@ begin
   Result^.Size := 0;
   Result^.Align := 1;
   Result^.IsUnion := AIsUnion;
+  Result^.IsPacked := False;
+  Result^.ExplicitAlign := 0;
+  StructPacked := False;
+  StructExplicitAlign := 0;
+
+  if At(kwGNUAttribute) then
+  begin
+    StructAttributes := ParseGNUAttributes;
+    StructTypeForAttributes := MakeType(ctStruct);
+    ApplyTypeAttributes(StructTypeForAttributes, StructAttributes, True);
+    StructPacked := StructTypeForAttributes.IsPacked;
+    StructExplicitAlign := StructTypeForAttributes.AlignmentOverride;
+  end;
 
   if At(tkIdentifier) then
   begin
@@ -3261,6 +3562,37 @@ begin
     Result^.Name := Name;
     if not At(tkLBrace) then Exit;
   end;
+
+  { GNU permits record attributes after the closing brace.  Layout must know
+    about `packed` before assigning member offsets, so inspect that trailing
+    attribute list without consuming it, then parse it normally at the end. }
+  SavedAttributeIndex := FIndex;
+  ScanIndex := FIndex;
+  BraceDepth := 0;
+  while ScanIndex <= High(FTokens) do
+  begin
+    if FTokens[ScanIndex].Kind = tkLBrace then Inc(BraceDepth)
+    else if FTokens[ScanIndex].Kind = tkRBrace then
+    begin
+      Dec(BraceDepth);
+      if BraceDepth = 0 then
+      begin
+        FIndex := ScanIndex + 1;
+        if At(kwGNUAttribute) then
+        begin
+          StructAttributes := ParseGNUAttributes;
+          StructTypeForAttributes := MakeType(ctStruct);
+          ApplyTypeAttributes(StructTypeForAttributes, StructAttributes, True);
+          StructPacked := StructPacked or StructTypeForAttributes.IsPacked;
+          if StructTypeForAttributes.AlignmentOverride > StructExplicitAlign then
+            StructExplicitAlign := StructTypeForAttributes.AlignmentOverride;
+        end;
+        Break;
+      end;
+    end;
+    Inc(ScanIndex);
+  end;
+  FIndex := SavedAttributeIndex;
 
   Expect(tkLBrace);
   SetLength(Members, 0);
@@ -3278,6 +3610,11 @@ begin
       MemberType := BaseMemberType;
       MemberName := '';
       if not At(tkColon) then ParseDeclarator(MemberType, MemberName);
+      if At(kwGNUAttribute) then
+      begin
+        MemberAttributes := ParseGNUAttributes;
+        ApplyTypeAttributes(MemberType, MemberAttributes, True);
+      end;
       IsBitField := Match(tkColon);
       BitOffset := 0;
       BitWidthValue := 0;
@@ -3297,6 +3634,9 @@ begin
         end;
         FieldSize := StorageSize(MemberType);
         FieldAlign := StorageAlign(MemberType);
+        if (StructPacked or MemberType.IsPacked) and
+           (MemberType.AlignmentOverride = 0) then
+          FieldAlign := 1;
         if (BitWidthValue < 0) or (BitWidthValue > FieldSize * 8) then
           RaiseCompileError(Current.Pos, 'bit-field width exceeds its base type');
         if (BitWidthValue = 0) and (MemberName <> '') then
@@ -3350,6 +3690,9 @@ begin
         UnitBitsUsed := 0;
         FieldSize := StorageSize(MemberType);
         FieldAlign := StorageAlign(MemberType);
+        if (StructPacked or MemberType.IsPacked) and
+           (MemberType.AlignmentOverride = 0) then
+          FieldAlign := 1;
         if FieldAlign > MaxAlign then MaxAlign := FieldAlign;
         if AIsUnion then
           Offset := 0
@@ -3366,6 +3709,13 @@ begin
       I := Length(Members);
       SetLength(Members, I + 1);
       Members[I].Name := MemberName;
+      Members[I].AlignmentOverride := MemberType.AlignmentOverride;
+      Members[I].IsPacked := MemberType.IsPacked;
+      { Packing changes the declaration's placement, not the scalar type's
+        natural ABI alignment.  Keep the metadata on the member while storing
+        an unmodified natural type for SysV aggregate classification. }
+      MemberType.IsPacked := False;
+      MemberType.AlignmentOverride := 0;
       MemberTypePtr := NewOwnedMemberType;
       MemberTypePtr^ := MemberType;
       Members[I].CType := MemberTypePtr;
@@ -3378,7 +3728,18 @@ begin
     Expect(tkSemicolon);
   end;
   Expect(tkRBrace);
+  if At(kwGNUAttribute) then
+  begin
+    StructAttributes := ParseGNUAttributes;
+    StructTypeForAttributes := MakeType(ctStruct);
+    ApplyTypeAttributes(StructTypeForAttributes, StructAttributes, True);
+    StructPacked := StructPacked or StructTypeForAttributes.IsPacked;
+    if StructTypeForAttributes.AlignmentOverride > StructExplicitAlign then
+      StructExplicitAlign := StructTypeForAttributes.AlignmentOverride;
+  end;
 
+  if StructPacked and (StructExplicitAlign = 0) then MaxAlign := 1;
+  if StructExplicitAlign > MaxAlign then MaxAlign := StructExplicitAlign;
   if TotalSize > 0 then
     TotalSize := ((TotalSize + MaxAlign - 1) div MaxAlign) * MaxAlign;
 
@@ -3387,6 +3748,8 @@ begin
     Result^.Members[I] := Members[I];
   Result^.Size := TotalSize;
   Result^.Align := MaxAlign;
+  Result^.IsPacked := StructPacked;
+  Result^.ExplicitAlign := StructExplicitAlign;
 end;
 
 function TParser.ParseEnumBody: TEnumConstantArray;
@@ -3442,6 +3805,7 @@ var
   N: LongInt;
 begin
   P := Current.Pos;
+  RequireCStandard(2011, '_Generic', P);
   Expect(kwGeneric);
   Expect(tkLParen);
   Result := TExpr.Create(ekGeneric, P);
@@ -3544,11 +3908,14 @@ var
   IntegerConstantValue: Int64;
   N: LongInt;
   DesignatorName: string;
+  DesignatorIndex: Int64;
+  DesignatorExpr: TExpr;
 begin
   Tok := Current;
   if At(kwGeneric) then Exit(ParseGenericSelection);
   if Match(kwNullptr) then
   begin
+    RequireCStandard(2023, 'nullptr', Tok.Pos);
     Result := TExpr.Create(ekNullptr, Tok.Pos);
     Exit;
   end;
@@ -3614,11 +3981,31 @@ begin
     begin
       if Match(tkDot) then
       begin
+        RequireCStandard(1999, 'designated initializers', Current.Pos);
         { Designated member initializer; sema resolves the name and reorders. }
         DesignatorName := Expect(tkIdentifier, 'initializer member').Text;
         Expect(tkAssign);
         CompoundExpr := ParseAssignment;
         CompoundExpr.Designator := DesignatorName;
+      end
+      else if Match(tkLBracket) then
+      begin
+        RequireCStandard(1999, 'designated initializers', Current.Pos);
+        DesignatorExpr := ParseConditional;
+        try
+          if not EvaluateParserIntegerConstant(DesignatorExpr, DesignatorIndex) then
+            RaiseCompileError(DesignatorExpr.Pos,
+              'array designator must be an integer constant expression');
+        finally
+          DesignatorExpr.Free;
+        end;
+        if DesignatorIndex < 0 then
+          RaiseCompileError(Current.Pos, 'array designator cannot be negative');
+        Expect(tkRBracket);
+        Expect(tkAssign);
+        CompoundExpr := ParseAssignment;
+        CompoundExpr.HasIndexDesignator := True;
+        CompoundExpr.IndexDesignator := DesignatorIndex;
       end
       else
         CompoundExpr := ParseAssignment;
@@ -3953,6 +4340,7 @@ begin
   end;
   if Match(kwAlignof) then
   begin
+    RequireCStandard(2011, '_Alignof', Tok.Pos);
     if At(tkLParen) then
     begin
       SavedIndex := FIndex;
@@ -4119,6 +4507,24 @@ begin
     Result := MakeBinary(boComma, Result, ParseAssignment);
 end;
 
+function InferredArrayInitializerLength(E: TExpr): Int64;
+var
+  I: LongInt;
+  NextIndex, HighestIndex: Int64;
+begin
+  if (E = nil) or (E.Kind <> ekCompoundLit) then Exit(0);
+  NextIndex := 0;
+  HighestIndex := -1;
+  for I := 0 to High(E.Args) do
+  begin
+    if (E.Args[I] <> nil) and E.Args[I].HasIndexDesignator then
+      NextIndex := E.Args[I].IndexDesignator;
+    if NextIndex > HighestIndex then HighestIndex := NextIndex;
+    Inc(NextIndex);
+  end;
+  Result := HighestIndex + 1;
+end;
+
 function TParser.ParseDeclarationStatement(AConsumeSemicolon: Boolean): TStmt;
 var
   Pos: TSourcePos;
@@ -4133,6 +4539,8 @@ var
     Item: TExpr;
     ItemCount: LongInt;
     MemberName: string;
+    DesignatorIndex: Int64;
+    DesignatorExpr: TExpr;
   begin
     if not Match(tkAssign) then Exit(nil);
     if not Match(tkLBrace) then Exit(ParseAssignment);
@@ -4144,10 +4552,30 @@ var
 
       if Match(tkDot) then
       begin
+        RequireCStandard(1999, 'designated initializers', Current.Pos);
         MemberName := Expect(tkIdentifier, 'initializer member').Text;
         Expect(tkAssign);
         Item := ParseAssignment;
         Item.Designator := MemberName;
+      end
+      else if Match(tkLBracket) then
+      begin
+        RequireCStandard(1999, 'designated initializers', Current.Pos);
+        DesignatorExpr := ParseConditional;
+        try
+          if not EvaluateParserIntegerConstant(DesignatorExpr, DesignatorIndex) then
+            RaiseCompileError(DesignatorExpr.Pos,
+              'array designator must be an integer constant expression');
+        finally
+          DesignatorExpr.Free;
+        end;
+        if DesignatorIndex < 0 then
+          RaiseCompileError(Current.Pos, 'array designator cannot be negative');
+        Expect(tkRBracket);
+        Expect(tkAssign);
+        Item := ParseAssignment;
+        Item.HasIndexDesignator := True;
+        Item.IndexDesignator := DesignatorIndex;
       end
       else
         Item := ParseAssignment;
@@ -4171,6 +4599,7 @@ begin
       DeclType := BaseType;
       DeclName := '';
       ParseDeclarator(DeclType, DeclName);
+      ParsePostDeclaratorAttributes(DeclType, False);
       if DeclName = '' then
         RaiseCompileError(Current.Pos, 'declaration requires an identifier');
 
@@ -4191,7 +4620,7 @@ begin
         if (Decl.CType.Kind = ctArray) and (Decl.CType.ArrayLength = 0) then
         begin
           if (Decl.Expr <> nil) and (Decl.Expr.Kind = ekCompoundLit) then
-            Decl.CType.ArrayLength := Length(Decl.Expr.Args)
+            Decl.CType.ArrayLength := InferredArrayInitializerLength(Decl.Expr)
           else if (Decl.Expr <> nil) and (Decl.Expr.Kind = ekString) and
             (Decl.CType.ElementKind = ctChar) and
             (Decl.CType.ElementPointerDepth = 0) then
@@ -4237,6 +4666,7 @@ var
   P: TSourcePos;
 begin
   P := Current.Pos;
+  RequireCStandard(2011, '_Static_assert', P);
   Expect(kwStaticAssert);
   Expect(tkLParen);
   Result := TStmt.Create(skStaticAssert, P);
@@ -4455,7 +4885,10 @@ begin
     Inc(FBreakableDepth);
     Inc(FContinueableDepth);
     if IsTypeStart then
+    begin
+      RequireCStandard(1999, 'declarations in for loops', Current.Pos);
       Result.InitStmt := ParseDeclarationStatement(True)
+    end
     else if Match(tkSemicolon) then
       Result.InitStmt := nil
     else
@@ -4541,6 +4974,7 @@ begin
   begin
     Result := TStmt.Create(skLabel, P);
     Result.Name := Current.Text;
+    RegisterFunctionLabel(Result.Name, Current.Pos);
     Inc(FIndex, 2);
     Exit;
   end;
@@ -4566,6 +5000,7 @@ var
     ParamType := ParseType(DummyTypedef);
     ParamName := '';
     ParseDeclarator(ParamType, ParamName);
+    ParsePostDeclaratorAttributes(ParamType, False);
     if ParamType.Kind = ctArray then ParamType := DecayType(ParamType);
     Param.Name := ParamName;
     Param.CType := ParamType;
@@ -4625,7 +5060,7 @@ var
     begin
       if (Global.Initializer <> nil) and
         (Global.Initializer.Kind = ekCompoundLit) then
-        Global.CType.ArrayLength := Length(Global.Initializer.Args)
+        Global.CType.ArrayLength := InferredArrayInitializerLength(Global.Initializer)
       else if (Global.Initializer <> nil) and
         (Global.Initializer.Kind = ekString) and
         (Global.CType.ElementKind = ctChar) then
@@ -4700,6 +5135,7 @@ begin
     try
       ParseParameterList(Func);
       Expect(tkRParen);
+      ParsePostDeclaratorAttributes(Func.ReturnType, False, False);
       if Match(tkSemicolon) then
       begin
         Func.IsPrototype := True;
@@ -4707,6 +5143,7 @@ begin
         Exit;
       end;
       Func.IsPrototype := False;
+      SetLength(FFunctionLabels, 0);
       for N := 0 to High(Func.Params) do
         AddDeclaredType(Func.Params[N].Name, Func.Params[N].CType,
           FScopeDepth + 1, False);
@@ -4726,6 +5163,7 @@ begin
     DeclName := '';
     FunctionPos := Current.Pos;
     ParseDeclarator(DeclType, DeclName);
+    ParsePostDeclaratorAttributes(DeclType, False);
     if DeclName = '' then
       RaiseCompileError(Current.Pos, 'declaration requires an identifier');
     if WasTypedef then

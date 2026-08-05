@@ -537,7 +537,50 @@ begin
   if IsArrayType(AExpectedType) then
   begin
     ElementType := ElementTypeOf(AExpectedType);
-    ElideSubObjectBraces(E, ElementType, LongInt(AExpectedType.ArrayLength));
+    MemberIndex := -1;
+    for I := 0 to High(E.Args) do
+      if (E.Args[I] <> nil) and E.Args[I].HasIndexDesignator then
+      begin
+        MemberIndex := I;
+        Break;
+      end;
+    if MemberIndex >= 0 then
+    begin
+      if AExpectedType.ArrayLength <= 0 then
+        RaiseCompileError(E.Pos,
+          'array designators require a complete array type at semantic analysis');
+      SetLength(Reordered, LongInt(AExpectedType.ArrayLength));
+      for I := 0 to High(Reordered) do Reordered[I] := nil;
+      NextIndex := 0;
+      for I := 0 to High(E.Args) do
+      begin
+        Item := E.Args[I];
+        if Item = nil then Continue;
+        if Item.HasIndexDesignator then
+        begin
+          if Item.IndexDesignator > High(Reordered) then
+            RaiseCompileError(Item.Pos, 'array designator exceeds array bound');
+          MemberIndex := LongInt(Item.IndexDesignator);
+          Item.HasIndexDesignator := False;
+          NextIndex := MemberIndex + 1;
+        end
+        else
+        begin
+          while (NextIndex <= High(Reordered)) and
+            (Reordered[NextIndex] <> nil) do Inc(NextIndex);
+          MemberIndex := NextIndex;
+          Inc(NextIndex);
+        end;
+        if MemberIndex > High(Reordered) then
+          RaiseCompileError(Item.Pos, 'too many values in array initializer');
+        if Reordered[MemberIndex] <> nil then
+          RaiseCompileError(Item.Pos, 'array element initialized twice');
+        Reordered[MemberIndex] := Item;
+      end;
+      E.Args := Reordered;
+    end
+    else
+      ElideSubObjectBraces(E, ElementType, LongInt(AExpectedType.ArrayLength));
     for I := 0 to High(E.Args) do
       AnalyzeInitializer(E.Args[I], ElementType);
   end

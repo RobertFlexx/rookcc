@@ -1,7 +1,7 @@
 #ifndef _RCC_FEATURES_H
 #define _RCC_FEATURES_H 1
 
-#define __RCC_HEADER_VERSION__ 102000
+#define __RCC_HEADER_VERSION__ 200000
 #ifdef _GNU_SOURCE
 # define __RCC_USE_GNU 1
 # define __RCC_USE_MISC 1
@@ -63,12 +63,28 @@
 #endif
 
 #ifndef __RCC_RESTRICT
-# define __RCC_RESTRICT restrict
+# if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 199901L)
+#  define __RCC_RESTRICT restrict
+# elif defined(__RCC_GNU_DIALECT__)
+#  define __RCC_RESTRICT __restrict__
+# else
+#  define __RCC_RESTRICT
+# endif
 #endif
 
 #define __RCC_BEGIN_DECLS
 #define __RCC_END_DECLS
-#define __RCC_NORETURN
-#define __RCC_UNUSED
+#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
+# define __RCC_NORETURN _Noreturn
+#elif defined(__RCC_GNU_DIALECT__)
+# define __RCC_NORETURN __attribute__((noreturn))
+#else
+# define __RCC_NORETURN
+#endif
+#if defined(__RCC_GNU_DIALECT__)
+# define __RCC_UNUSED __attribute__((unused))
+#else
+# define __RCC_UNUSED
+#endif
 
 #endif

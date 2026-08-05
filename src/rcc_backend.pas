@@ -285,8 +285,8 @@ type
     procedure EmitPopXmm1(const AType: TCType);
     procedure EmitFloatToBool(const AType: TCType);
     procedure EmitFloatingBinary(AOp: TBinaryOp; const AType: TCType);
-    procedure EmitConvertIntegerToFloat(const AType: TCType);
-    procedure EmitConvertFloatToInteger(const AType: TCType);
+    procedure EmitConvertIntegerToFloat(const AFromType, AToType: TCType);
+    procedure EmitConvertFloatToInteger(const AFromType, AToType: TCType);
     procedure EmitConvertFloatWidth(const AFromType, AToType: TCType);
 
     function AddStringLiteral(const S: string): LongInt;
@@ -2728,16 +2728,102 @@ begin
   FText.AddBytes([$0F, $10, $C1]);
 end;
 
-procedure TX64Backend.EmitConvertIntegerToFloat(const AType: TCType);
+procedure TX64Backend.EmitConvertIntegerToFloat(const AFromType,
+  AToType: TCType);
+var
+  NormalLabel, DoneLabel: LongInt;
+
+  procedure EmitSignedConversion;
+  begin
+    if AToType.Kind = ctFloat then FText.Add8($F3) else FText.Add8($F2);
+    FText.AddBytes([$48, $0F, $2A, $C0]);
+  end;
+
 begin
-  if AType.Kind = ctFloat then FText.Add8($F3) else FText.Add8($F2);
-  FText.AddBytes([$48, $0F, $2A, $C0]);
+  if AToType.Kind = ctLongDouble then
+    raise ERCCError.Create(
+      'long double conversion is unsupported by the x86-64 backend');
+
+  { CVTSI2SS/CVTSI2SD interprets its 64-bit source as signed.  Values of
+    unsigned types narrower than 64 bits are already zero-extended and fit in
+    that signed domain.  For a full-width unsigned value, halve-and-round,
+    convert, then double; this is the standard exact lowering used to cover
+    the upper half of the uint64_t range without an out-of-range signed
+    conversion. }
+  if AFromType.IsUnsigned and (StorageSize(AFromType) = 8) and
+     not IsPointerType(AFromType) then
+  begin
+    NormalLabel := NewLabel;
+    DoneLabel := NewLabel;
+    FText.AddBytes([$48, $85, $C0]);       { test rax, rax }
+    EmitJcc($89, NormalLabel);             { jns normal }
+    FText.AddBytes([$48, $89, $C1]);       { mov rcx, rax }
+    FText.AddBytes([$48, $D1, $E8]);       { shr rax, 1 }
+    FText.AddBytes([$83, $E1, $01]);       { and ecx, 1 }
+    FText.AddBytes([$48, $09, $C8]);       { or rax, rcx }
+    EmitSignedConversion;
+    if AToType.Kind = ctFloat then FText.Add8($F3) else FText.Add8($F2);
+    FText.AddBytes([$0F, $58, $C0]);       { addss/addsd xmm0, xmm0 }
+    EmitJump(DoneLabel);
+    BindTextLabel(NormalLabel);
+    EmitSignedConversion;
+    BindTextLabel(DoneLabel);
+  end
+  else
+    EmitSignedConversion;
 end;
 
-procedure TX64Backend.EmitConvertFloatToInteger(const AType: TCType);
+procedure TX64Backend.EmitConvertFloatToInteger(const AFromType,
+  AToType: TCType);
+var
+  SmallLabel, DoneLabel, ThresholdLabel: LongInt;
+
+  procedure EmitSignedConversion;
+  begin
+    if AFromType.Kind = ctFloat then FText.Add8($F3) else FText.Add8($F2);
+    FText.AddBytes([$48, $0F, $2C, $C0]);
+  end;
+
 begin
-  if AType.Kind = ctFloat then FText.Add8($F3) else FText.Add8($F2);
-  FText.AddBytes([$48, $0F, $2C, $C0]);
+  if AFromType.Kind = ctLongDouble then
+    raise ERCCError.Create(
+      'long double conversion is unsupported by the x86-64 backend');
+
+  if AToType.Kind = ctBool then
+  begin
+    EmitFloatToBool(AFromType);
+    Exit;
+  end;
+
+  { CVTTSS2SI/CVTTSD2SI also has only a signed 64-bit destination.  Split
+    an in-range uint64_t conversion at 2^63: values below the boundary use the
+    normal conversion, while values above it subtract the exactly
+    representable boundary and restore the high bit afterwards. }
+  if AToType.IsUnsigned and (StorageSize(AToType) = 8) and
+     not IsPointerType(AToType) then
+  begin
+    ThresholdLabel := AddFloatLiteral(9223372036854775808.0, AFromType);
+    if AFromType.Kind = ctFloat then
+      FText.AddBytes([$F3, $0F, $10, $0D])
+    else
+      FText.AddBytes([$F2, $0F, $10, $0D]);
+    EmitRel32(ThresholdLabel);              { xmm1 := 2^63 }
+    if AFromType.Kind = ctDouble then FText.Add8($66);
+    FText.AddBytes([$0F, $2E, $C1]);        { ucomiss/ucomisd xmm0, xmm1 }
+    SmallLabel := NewLabel;
+    DoneLabel := NewLabel;
+    EmitJcc($82, SmallLabel);               { jb small }
+    if AFromType.Kind = ctFloat then FText.Add8($F3) else FText.Add8($F2);
+    FText.AddBytes([$0F, $5C, $C1]);        { subss/subsd xmm0, xmm1 }
+    EmitSignedConversion;
+    FText.AddBytes([$48, $0F, $BA, $E8, $3F]); { bts rax, 63 }
+    EmitJump(DoneLabel);
+    BindTextLabel(SmallLabel);
+    EmitSignedConversion;
+    BindTextLabel(DoneLabel);
+  end
+  else
+    EmitSignedConversion;
 end;
 
 procedure TX64Backend.EmitConvertFloatWidth(const AFromType, AToType: TCType);
@@ -4399,10 +4485,18 @@ begin
     CountExpressionSpillBytes(E.Third);
   for I := 0 to High(E.Args) do
     Inc(Result, CountExpressionSpillBytes(E.Args[I]));
+  if E.Kind = ekCompoundLit then
+  begin
+    Size := StorageSize(E.CType);
+    if IsAggregateType(E.CType) then
+      Size := LongInt(AlignUp(QWord(Size), 8))
+    else if Size < 8 then
+      Size := 8;
+    Alignment := StorageAlign(E.CType);
+    Inc(Result, Size + Alignment - 1);
+    Exit;
+  end;
   if E.Kind <> ekCall then Exit;
-
-
-
 
   for I := 0 to High(E.Args) do
   begin
@@ -4905,6 +4999,20 @@ begin
         GenExpr(E.Left);
         EmitAddRaxImmediate(LongInt(E.IntValue));
       end;
+    ekCompoundLit:
+      begin
+        ReserveTemporary(StorageSize(E.CType), StorageAlign(E.CType), Offset);
+        if IsAggregateType(E.CType) then
+          InitializeLocal(Offset, E.CType, E, E.Pos)
+        else
+        begin
+          if Length(E.Args) <> 1 then
+            RaiseCompileError(E.Pos,
+              'scalar compound literal requires exactly one initializer');
+          InitializeLocal(Offset, E.CType, E.Args[0], E.Pos);
+        end;
+        EmitAddressLocal(Offset);
+      end;
   else
     RaiseCompileError(E.Pos, 'expression is not assignable');
   end;
@@ -4918,7 +5026,7 @@ begin
   if IsFloatingType(E.CType) then
     EmitConvertFloatWidth(E.CType, ATargetType)
   else
-    EmitConvertIntegerToFloat(ATargetType);
+    EmitConvertIntegerToFloat(E.CType, ATargetType);
 end;
 
 
@@ -5267,7 +5375,7 @@ begin
     EmitPushXmm0(E.Left.CType);
     EmitMovRaxImm(1);
     OneType := E.Left.CType;
-    EmitConvertIntegerToFloat(OneType);
+    EmitConvertIntegerToFloat(E.Left.CType, OneType);
     EmitPopXmm1(OneType);
     if ADelta > 0 then EmitFloatingBinary(boAdd, OneType)
     else EmitFloatingBinary(boSub, OneType);
@@ -6645,12 +6753,11 @@ begin
           if IsFloatingType(E.Left.CType) then
             EmitConvertFloatWidth(E.Left.CType, E.CType)
           else
-            EmitConvertIntegerToFloat(E.CType);
+            EmitConvertIntegerToFloat(E.Left.CType, E.CType);
         end
         else if IsFloatingType(E.Left.CType) then
         begin
-          EmitConvertFloatToInteger(E.Left.CType);
-          if E.CType.Kind = ctBool then EmitNormalizeBool;
+          EmitConvertFloatToInteger(E.Left.CType, E.CType);
         end
         else if not IsAggregateType(E.CType) then
           EmitNormalizeInteger(E.CType);
@@ -6662,8 +6769,10 @@ begin
       end;
     ekSizeof: EmitMovRaxImm(E.IntValue);
     ekCompoundLit:
-      RaiseCompileError(E.Pos,
-        'compound literal values require object materialization');
+      begin
+        GenAddress(E);
+        if not IsAggregateType(E.CType) then EmitLoadAtRax(E.CType);
+      end;
   else
     RaiseCompileError(E.Pos,
       'expression form is unsupported by the x86-64 backend');
@@ -7331,7 +7440,7 @@ begin
           begin
             GenExpr(S.Expr);
             if IsFloatingType(S.Expr.CType) then
-              EmitConvertFloatToInteger(S.Expr.CType);
+              EmitConvertFloatToInteger(S.Expr.CType, FCurrentReturnType);
             EmitNormalizeInteger(FCurrentReturnType);
           end;
         end

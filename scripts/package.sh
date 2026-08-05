@@ -17,9 +17,10 @@ mkdir -p "$STAGE"
 
 ROOT_FILES=(
   .gitignore LICENSE Makefile README.md VERSION
+  RELEASE_HARDENING.md RELEASE_NOTES_2.0.0.md VERIFICATION_2.0.0.md
 )
 ROOT_DIRECTORIES=(
-  completions examples include man scripts src tests
+  bench completions examples include man scripts src tests
 )
 
 copy_file() {
@@ -55,6 +56,7 @@ for directory in "${ROOT_DIRECTORIES[@]}"; do
     case "$rel" in
       build/*|dist/*|tests/tmp/*|*/__pycache__/*|*.pyc|MANIFEST.sha256) continue ;;
     esac
+    { [[ -f "$rel" ]] || [[ -L "$rel" ]]; } || continue
     copy_file "$rel"
   done < <(release_files "$directory")
 done

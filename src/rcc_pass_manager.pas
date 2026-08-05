@@ -142,6 +142,7 @@ begin
     SetLength(Liveness.Blocks, 0);
     SetLength(Liveness.Intervals, 0);
   end;
+
 end;
 
 function TPassManager.PipelineName: string;

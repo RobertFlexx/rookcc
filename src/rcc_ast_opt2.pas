@@ -764,6 +764,9 @@ begin
   Result.IsLValue := E.IsLValue;
   Result.IsFunctionDesignator := E.IsFunctionDesignator;
   Result.IsBitField := E.IsBitField;
+  Result.Designator := E.Designator;
+  Result.HasIndexDesignator := E.HasIndexDesignator;
+  Result.IndexDesignator := E.IndexDesignator;
   Result.BitOffset := E.BitOffset;
   Result.BitWidth := E.BitWidth;
   Result.BitStorageSize := E.BitStorageSize;
@@ -822,6 +825,9 @@ begin
   Result.IsLValue := E.IsLValue;
   Result.IsFunctionDesignator := E.IsFunctionDesignator;
   Result.IsBitField := E.IsBitField;
+  Result.Designator := E.Designator;
+  Result.HasIndexDesignator := E.HasIndexDesignator;
+  Result.IndexDesignator := E.IndexDesignator;
   Result.BitOffset := E.BitOffset;
   Result.BitWidth := E.BitWidth;
   Result.BitStorageSize := E.BitStorageSize;

@@ -10,10 +10,14 @@
 #include <limits.h>
 
 #if defined(__ROOKCC__)
-# define RCC_INLINE inline
-# define RCC_NORETURN
-# define RCC_UNUSED
-# define RCC_RESTRICT restrict
+# if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 199901L)
+#  define RCC_INLINE inline
+# else
+#  define RCC_INLINE
+# endif
+# define RCC_NORETURN __RCC_NORETURN
+# define RCC_UNUSED __RCC_UNUSED
+# define RCC_RESTRICT __RCC_RESTRICT
 # define RCC_LIKELY(value) (value)
 # define RCC_UNLIKELY(value) (value)
 #elif defined(__GNUC__) || defined(__clang__)

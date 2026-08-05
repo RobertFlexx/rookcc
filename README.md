@@ -9,7 +9,7 @@ once built rcc does its own preprocessing parsing type checking optimization mac
 
 when the selected target exactly matches the host architecture and operating system rcc also behaves as a normal compiler driver. on macos bsd and non x86 linux hosts it invokes the platform compiler driver only for the final sdk startup file and system library link. it never sends c source to that driver.
 
-**version 1.2.0**
+**version 2.0.0**
 
 ---------------------------
 

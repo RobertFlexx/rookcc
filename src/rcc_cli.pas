@@ -190,6 +190,7 @@ begin
   SetLength(AOptions.RPaths, 0);
   SetLength(AOptions.ObjectFiles, 0);
   SetLength(AOptions.RunArguments, 0);
+  SetLength(AOptions.DisabledWarnings, 0);
   AOptions.OutputFile := 'a.out';
   AOptions.Sysroot := '';
   AOptions.ResourceDir := '';
@@ -405,7 +406,9 @@ var
           AppendUniqueString(AOptions.Libraries, '@' + Token)
         else if Token = '--enable-new-dtags' then
         begin
-
+          { RCC emits DT_RUNPATH, the new-dtags behavior, whenever an rpath is
+            requested. Accepting this spelling is therefore exact, not a
+            compatibility promise that changes output. }
         end
         else if Token = '--disable-new-dtags' then
           raise ERCCError.Create('error: legacy DT_RPATH emission is not supported')
@@ -416,10 +419,14 @@ var
             raise ERCCError.Create('error: linker option -z requires a keyword');
           Value := LowerCase(Parts[J]);
           if Value = 'now' then AOptions.BindNow := True
-          else if (Value = 'noexecstack') or (Value = 'norelro') then
+          else if Value = 'noexecstack' then
           begin
-
-
+            { PT_GNU_STACK is always emitted without PF_X. }
+          end
+          else if Value = 'norelro' then
+          begin
+            { RCC does not emit a PT_GNU_RELRO segment yet, so this is the
+              current native-linker default. }
           end
           else if Value = 'relro' then
             raise ERCCError.Create('error: -z relro is not available until ' +
@@ -429,22 +436,18 @@ var
               Parts[J] + '''');
         end
         else if Token = '--no-undefined' then
-        begin
-
-
-        end
+          raise ERCCError.Create('error: linker option --no-undefined is not ' +
+            'implemented; RCC refuses to claim an unresolved-symbol policy it ' +
+            'cannot verify for every output mode')
         else if (Token = '--as-needed') or (Token = '--no-as-needed') then
-        begin
-
-
-
-        end
-        else if (Token = '--gc-sections') or (Token = '-O1') or
-          (Token = '-O2') then
-        begin
-
-
-        end
+          raise ERCCError.Create('error: linker option ' + Token + ' is not ' +
+            'implemented; dependency pruning must not be silently ignored')
+        else if Token = '--gc-sections' then
+          raise ERCCError.Create('error: linker option --gc-sections is not ' +
+            'implemented; use compiler dead-code elimination or remove the option')
+        else if (Token = '-O1') or (Token = '-O2') then
+          raise ERCCError.Create('error: linker optimization option ' + Token +
+            ' is not implemented; RCC does not silently downgrade linker policy')
         else if Token <> '' then
           raise ERCCError.Create('error: unsupported linker option ''' +
             Token + '''');
@@ -605,12 +608,22 @@ begin
     else if (A = '-v') or (A = '--verbose') then AOptions.Verbose := True
     else if A = '--stats' then AOptions.ShowStats := True
     else if A = '-Werror' then AOptions.WarningsAsErrors := True
+    else if A = '-Wno-error' then AOptions.WarningsAsErrors := False
     else if A = '-Wall' then AOptions.WarningLevel := wlAll
     else if A = '-Wextra' then AOptions.WarningLevel := wlExtra
     else if (A = '-pedantic') or (A = '-pedantic-errors') then
-      AOptions.WarningLevel := wlPedantic
+    begin
+      AOptions.WarningLevel := wlPedantic;
+      if A = '-pedantic-errors' then AOptions.WarningsAsErrors := True;
+    end
     else if Copy(A, 1, 5) = '-Wno-' then
-
+    begin
+      V := LowerCase(Copy(A, 6, MaxInt));
+      if (V <> 'unused-variable') and (V <> 'unused-parameter') and
+         (V <> 'unreachable-code') and (V <> 'return-type') then
+        raise ERCCError.Create('error: unknown warning option ''' + A + '''');
+      AppendUniqueString(AOptions.DisabledWarnings, V);
+    end
     else if Copy(A, 1, 8) = '--color=' then
     begin
       V := LowerCase(OptionValue(A, '--color='));
@@ -732,8 +745,15 @@ begin
       (A = '-fpie') then AOptions.PositionIndependent := True
     else if (A = '-g') or (Copy(A, 1, 2) = '-g') then AOptions.DebugInfo := True
     else if (A = '-pipe') or (A = '-fno-common') or
-      (A = '-ffunction-sections') or (A = '-fdata-sections') or
-      (A = '-fno-plt') or (A = '-fno-strict-aliasing') then
+      (A = '-fno-strict-aliasing') then
+    begin
+      { -pipe is irrelevant to RCC's in-process pipeline.  RCC already uses
+        non-common definitions and performs no strict-aliasing optimization. }
+    end
+    else if (A = '-ffunction-sections') or (A = '-fdata-sections') or
+      (A = '-fno-plt') then
+      raise ERCCError.Create('error: option ''' + A +
+        ''' requests code-generation behavior not implemented by rcc')
 
     else if A = '-pthread' then
     begin
@@ -808,10 +828,9 @@ begin
     else if Copy(A, 1, 7) = '-mattr=' then
       AOptions.TargetFeatures := OptionValue(A, '-mattr=')
     else if Copy(A, 1, 7) = '-mtune=' then
-
+      raise ERCCError.Create('error: -mtune scheduling is not implemented by rcc')
     else if A = '-pie' then AOptions.PositionIndependent := True
-    else if A = '-no-pie' then
-
+    else if A = '-no-pie' then AOptions.PositionIndependent := False
     else if (A <> '') and (A[1] = '-') then
     begin
       if not TryCompatibilityOption(A) then

@@ -16,7 +16,7 @@ uses
   rcc_verify, rcc_build, rcc_target, rcc_diag, rcc_feature_policy,
   rcc_sema, rcc_arch, rcc_cross_backend, rcc_pass_manager, rcc_ir,
   rcc_ir_verify, rcc_ir_metrics, rcc_platform, rcc_gnu_tokens,
-  rcc_native_linker;
+  rcc_native_linker, rcc_warnings;
 
 procedure AppendString(var AValues: rcc_types.TStringArray; const AValue: string);
 var
@@ -367,6 +367,9 @@ begin
   IRMetrics.TotalCalls := 0;
   IRMetrics.TotalCriticalEdges := 0;
   IRMetrics.HasOpaqueOperations := False;
+  { The formal IR is an explicit verification and inspection pipeline.  The
+    production x86-64 emitter remains the mature AST backend until an IR
+    instruction selector can pass the same differential and ABI gates. }
   NeedFormalIR := (AOptions.EmitMode in [emIR, emCheck]) or
     AOptions.ShowStats;
 
@@ -416,7 +419,7 @@ begin
       end;
 
       PreprocTime := GetTickCount64;
-      Lexer := TLexer.Create(Source, AOptions.Inputs[I]);
+      Lexer := TLexer.Create(Source, AOptions.Inputs[I], AOptions.Standard);
       try
         Tokens := Lexer.Tokenize;
         NormalizeGNUTokens(Tokens, AOptions.Standard);
@@ -431,7 +434,7 @@ begin
         Continue;
       end;
 
-      Parser := TParser.Create(Tokens);
+      Parser := TParser.Create(Tokens, AOptions.Standard);
       try
         ParseTime := GetTickCount64;
         UnitProgram := Parser.ParseProgram;
@@ -467,6 +470,7 @@ begin
     VerifyProgram(ProgramAll, 'merged frontend');
     AnalyzeProgram(ProgramAll);
     VerifyProgram(ProgramAll, 'semantic analysis');
+    AnalyzeWarnings(ProgramAll, AOptions);
     VerifyTime := GetTickCount64;
 
     if AOptions.Verbose then

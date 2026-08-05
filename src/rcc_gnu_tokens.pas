@@ -74,6 +74,7 @@ begin
   Result := I;
 end;
 
+
 function SkipAttributeInvocation(const ATokens: TTokenArray;
   AIndex: LongInt): LongInt;
 var
@@ -90,7 +91,7 @@ procedure NormalizeGNUTokens(var ATokens: TTokenArray;
   AStandard: TCStandard);
 var
   ResultTokens: TTokenArray;
-  I, Count, Capacity: LongInt;
+  I, J, Count, Capacity, AttrEnd: LongInt;
   Canonical: string;
   Kind: TTokenKind;
   Token: TToken;
@@ -121,7 +122,17 @@ begin
        IsIdentifierNamed(Token, '__attribute') or
        IsIdentifierNamed(Token, '__declspec') then
     begin
-      I := SkipAttributeInvocation(ATokens, I);
+      AttrEnd := SkipAttributeInvocation(ATokens, I);
+      Token.Kind := kwGNUAttribute;
+      Token.Text := '__attribute__';
+      AppendToken(ResultTokens, Count, Capacity, Token);
+      J := I + 1;
+      while J < AttrEnd do
+      begin
+        AppendToken(ResultTokens, Count, Capacity, ATokens[J]);
+        Inc(J);
+      end;
+      I := AttrEnd;
       Continue;
     end;
 
