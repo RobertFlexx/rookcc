@@ -11,9 +11,9 @@
 /repl
 /repltxt
 /examples/*.out
+/bench/
 /tests/
-/bench/__pycache__/
-/bench/*.json
+/.github/
 
 # AI tooling and assistant artifacts
 /\.opencode/
