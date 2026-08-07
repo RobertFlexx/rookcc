@@ -12,6 +12,8 @@ when the selected target exactly matches the host architecture and operating sys
 
 [pawnasm](https://github.com/RobertFlexx/pawnasm) is also a relative to this project. if you **JUST** want an assembler as a separate package.
 
+[kld](https://github.com/RobertFlexx/knightlinker) is another relative, serves as a linker for programs.
+
 (you will need [ofrontplus](https://github.com/Oleg-N-Cher/OfrontPlus) to compile pawnasm)
 
 what each backend supports
