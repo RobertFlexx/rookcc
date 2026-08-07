@@ -5,7 +5,7 @@ unit rcc_types;
 interface
 
 uses
-  SysUtils, Classes;
+  SysUtils, Classes, rcc_name_index;
 
 type
   ERCCError = class(Exception);
@@ -114,6 +114,7 @@ type
     IsPacked: Boolean;
     AlignmentOverride: LongInt;
     SuppressUnusedWarning: Boolean;
+    PreserveForLinker: Boolean;
     PointerDepth: LongInt;
     ArrayLength: LongInt;
     StructInfo: PStructMembers;
@@ -332,6 +333,8 @@ type
 
   TProgram = class
   private
+    FFunctionIndex: TNameIndex;
+    FGlobalIndex: TNameIndex;
     FOwnedStructInfos: array of PStructMembers;
     FOwnedMemberTypes: array of PCType;
     FOwnedFunctionParameterLists: array of PFunctionParameterList;
@@ -339,6 +342,7 @@ type
     Functions: TFunctionArray;
     Globals: TGlobalArray;
     StaticAssertions: TStmtArray;
+    constructor Create;
     destructor Destroy; override;
     procedure OwnStructInfo(AInfo: PStructMembers);
     procedure OwnMemberType(AType: PCType);
@@ -347,6 +351,9 @@ type
     procedure AddFunction(AFunction: TFunction);
     procedure AddGlobal(AGlobal: TGlobal);
     procedure AddStaticAssertion(AStatement: TStmt);
+    procedure RebuildNameIndexes;
+    function FindFunctionIndex(const AName: string): LongInt;
+    function FindGlobalIndex(const AName: string): LongInt;
     function FindFunction(const AName: string): TFunction;
     function FindGlobal(const AName: string): TGlobal;
   end;
@@ -383,6 +390,9 @@ type
     TargetFeatures: string;
     OptimizationLevel: LongInt;
     OptimizeSize: Boolean;
+    { 0 = speed/default, 1 = -Os, 2 = -Oz.  Keep OptimizeSize as a
+      compatibility convenience for subsystems that only need a boolean. }
+    SizeOptimizationLevel: LongInt;
     OptimizeDebug: Boolean;
     Standard: TCStandard;
     WarningLevel: TWarningLevel;
@@ -419,6 +429,7 @@ procedure RaiseCompileError(const APos: TSourcePos; const AMessage: string);
 function TypesEqual(const A, B: TCType): Boolean;
 function CTypeSize(const AType: TCType): Int64;
 function CTypeAlign(const AType: TCType): LongInt;
+function ArrayElementType(const AType: TCType): TCType;
 procedure ConfigureCTypeLongDoubleLayout(ASize, AAlignment: LongInt);
 function IsArithmeticType(const AType: TCType): Boolean;
 function IsIntegerType(const AType: TCType): Boolean;
@@ -543,10 +554,19 @@ begin
   inherited Destroy;
 end;
 
+constructor TProgram.Create;
+begin
+  inherited Create;
+  FFunctionIndex := TNameIndex.Create;
+  FGlobalIndex := TNameIndex.Create;
+end;
+
 destructor TProgram.Destroy;
 var
   I: LongInt;
 begin
+  FFunctionIndex.Free;
+  FGlobalIndex.Free;
   for I := 0 to High(Functions) do
     Functions[I].Free;
   for I := 0 to High(Globals) do
@@ -622,20 +642,51 @@ end;
 
 procedure TProgram.AddFunction(AFunction: TFunction);
 var
-  N: LongInt;
+  N, Previous: LongInt;
 begin
+  Previous := -1;
+  if (AFunction <> nil) and (AFunction.Name <> '') then
+    Previous := FindFunctionIndex(AFunction.Name);
+  if Previous >= 0 then
+  begin
+    AFunction.ReturnType.PreserveForLinker :=
+      AFunction.ReturnType.PreserveForLinker or
+      Functions[Previous].ReturnType.PreserveForLinker;
+    Functions[Previous].ReturnType.PreserveForLinker :=
+      AFunction.ReturnType.PreserveForLinker;
+  end;
   N := Length(Functions);
   SetLength(Functions, N + 1);
   Functions[N] := AFunction;
+  if (AFunction <> nil) and (AFunction.Name <> '') and
+     ((Previous < 0) or Functions[Previous].IsPrototype or
+      not AFunction.IsPrototype) then
+    FFunctionIndex.Put(AFunction.Name, N);
 end;
 
 procedure TProgram.AddGlobal(AGlobal: TGlobal);
 var
-  N: LongInt;
+  N, Previous: LongInt;
 begin
+  Previous := -1;
+  if (AGlobal <> nil) and (AGlobal.Name <> '') then
+    Previous := FindGlobalIndex(AGlobal.Name);
+  if Previous >= 0 then
+  begin
+    AGlobal.CType.PreserveForLinker :=
+      AGlobal.CType.PreserveForLinker or
+      Globals[Previous].CType.PreserveForLinker;
+    Globals[Previous].CType.PreserveForLinker :=
+      AGlobal.CType.PreserveForLinker;
+  end;
   N := Length(Globals);
   SetLength(Globals, N + 1);
   Globals[N] := AGlobal;
+  if (AGlobal <> nil) and (AGlobal.Name <> '') and
+     ((Previous < 0) or Globals[Previous].IsExtern or
+      (Globals[Previous].IsTentative and not AGlobal.IsTentative) or
+      AGlobal.HasInitializer) then
+    FGlobalIndex.Put(AGlobal.Name, N);
 end;
 
 procedure TProgram.AddStaticAssertion(AStatement: TStmt);
@@ -647,24 +698,63 @@ begin
   StaticAssertions[N] := AStatement;
 end;
 
+procedure TProgram.RebuildNameIndexes;
+var
+  I, Previous: LongInt;
+begin
+  FFunctionIndex.Clear;
+  FGlobalIndex.Clear;
+  for I := 0 to High(Functions) do
+    if (Functions[I] <> nil) and (Functions[I].Name <> '') then
+    begin
+      Previous := FFunctionIndex.GetOrDefault(Functions[I].Name, -1);
+      if (Previous < 0) or Functions[Previous].IsPrototype or
+         not Functions[I].IsPrototype then
+        FFunctionIndex.Put(Functions[I].Name, I);
+    end;
+  for I := 0 to High(Globals) do
+    if (Globals[I] <> nil) and (Globals[I].Name <> '') then
+    begin
+      Previous := FGlobalIndex.GetOrDefault(Globals[I].Name, -1);
+      if (Previous < 0) or Globals[Previous].IsExtern or
+         (Globals[Previous].IsTentative and not Globals[I].IsTentative) or
+         Globals[I].HasInitializer then
+        FGlobalIndex.Put(Globals[I].Name, I);
+    end;
+end;
+
 function TProgram.FindFunction(const AName: string): TFunction;
 var
   I: LongInt;
 begin
-  for I := 0 to High(Functions) do
-    if Functions[I].Name = AName then
-      Exit(Functions[I]);
+  I := FindFunctionIndex(AName);
+  if I >= 0 then
+    Exit(Functions[I]);
   Result := nil;
+end;
+
+function TProgram.FindFunctionIndex(const AName: string): LongInt;
+begin
+  if not FFunctionIndex.TryGet(AName, Result) or
+     (Result < 0) or (Result >= Length(Functions)) then
+    Result := -1;
 end;
 
 function TProgram.FindGlobal(const AName: string): TGlobal;
 var
   I: LongInt;
 begin
-  for I := 0 to High(Globals) do
-    if Globals[I].Name = AName then
-      Exit(Globals[I]);
+  I := FindGlobalIndex(AName);
+  if I >= 0 then
+    Exit(Globals[I]);
   Result := nil;
+end;
+
+function TProgram.FindGlobalIndex(const AName: string): LongInt;
+begin
+  if not FGlobalIndex.TryGet(AName, Result) or
+     (Result < 0) or (Result >= Length(Globals)) then
+    Result := -1;
 end;
 
 function MakeType(AKind: TCTypeKind; AUnsigned: Boolean;
@@ -677,6 +767,7 @@ begin
   Result.IsPacked := False;
   Result.AlignmentOverride := 0;
   Result.SuppressUnusedWarning := False;
+  Result.PreserveForLinker := False;
   Result.PointerDepth := APointerDepth;
   Result.ArrayLength := 0;
   Result.StructInfo := nil;

@@ -12,7 +12,7 @@ procedure AnalyzeProgram(AProgram: TProgram);
 implementation
 
 uses
-  SysUtils, rcc_typeops;
+  SysUtils, rcc_typeops, rcc_name_index;
 
 type
   TSymbolKind = (symLocal, symGlobal, symFunction);
@@ -22,17 +22,20 @@ type
     CType: TCType;
     Kind: TSymbolKind;
     ScopeDepth: LongInt;
+    PreviousIndex: LongInt;
   end;
 
   TSemanticAnalyzer = class
   private
     FProgram: TProgram;
     FSymbols: array of TSymbol;
+    FSymbolIndex: TNameIndex;
     FScopeDepth: LongInt;
     FCurrentFunction: TFunction;
     procedure AddSymbol(const AName: string; const AType: TCType;
       AKind: TSymbolKind; const APos: TSourcePos);
     function FindSymbol(const AName: string; out ASymbol: TSymbol): Boolean;
+    procedure RestoreSymbolCount(ACount: LongInt);
     function FindFunction(const AName: string): TFunction;
     function EditDistance(const A, B: string): LongInt;
     function SuggestSymbol(const AName: string): string;
@@ -60,6 +63,7 @@ type
     procedure InstallFileSymbols;
   public
     constructor Create(AProgram: TProgram);
+    destructor Destroy; override;
     procedure Run;
   end;
 
@@ -68,25 +72,31 @@ begin
   inherited Create;
   FProgram := AProgram;
   FScopeDepth := 0;
+  FSymbolIndex := TNameIndex.Create;
+end;
+
+destructor TSemanticAnalyzer.Destroy;
+begin
+  FSymbolIndex.Free;
+  inherited Destroy;
 end;
 
 procedure TSemanticAnalyzer.AddSymbol(const AName: string;
   const AType: TCType; AKind: TSymbolKind; const APos: TSourcePos);
 var
-  I, N: LongInt;
+  CurrentIndex, N: LongInt;
 begin
   if AName = '' then Exit;
-  for I := High(FSymbols) downto 0 do
+  CurrentIndex := -1;
+  if FSymbolIndex.TryGet(AName, CurrentIndex) and
+     (CurrentIndex >= 0) and (CurrentIndex < Length(FSymbols)) and
+     (FSymbols[CurrentIndex].ScopeDepth = FScopeDepth) then
   begin
-    if FSymbols[I].ScopeDepth < FScopeDepth then Break;
-    if (FSymbols[I].ScopeDepth = FScopeDepth) and
-      (FSymbols[I].Name = AName) then
-    begin
-      if (FScopeDepth = 0) and
-        (FSymbols[I].Kind = AKind) and TypesEqual(FSymbols[I].CType, AType) then
-        Exit;
-      RaiseCompileError(APos, 'redefinition of ''' + AName + '''');
-    end;
+    if (FScopeDepth = 0) and
+      (FSymbols[CurrentIndex].Kind = AKind) and
+      TypesEqual(FSymbols[CurrentIndex].CType, AType) then
+      Exit;
+    RaiseCompileError(APos, 'redefinition of ''' + AName + '''');
   end;
   N := Length(FSymbols);
   SetLength(FSymbols, N + 1);
@@ -94,6 +104,8 @@ begin
   FSymbols[N].CType := AType;
   FSymbols[N].Kind := AKind;
   FSymbols[N].ScopeDepth := FScopeDepth;
+  FSymbols[N].PreviousIndex := CurrentIndex;
+  FSymbolIndex.Put(AName, N);
 end;
 
 function TSemanticAnalyzer.FindSymbol(const AName: string;
@@ -101,24 +113,31 @@ function TSemanticAnalyzer.FindSymbol(const AName: string;
 var
   I: LongInt;
 begin
-  for I := High(FSymbols) downto 0 do
-    if FSymbols[I].Name = AName then
-    begin
-      ASymbol := FSymbols[I];
-      Exit(True);
-    end;
-  Result := False;
+  Result := FSymbolIndex.TryGet(AName, I) and
+    (I >= 0) and (I < Length(FSymbols));
+  if Result then ASymbol := FSymbols[I];
+end;
+
+procedure TSemanticAnalyzer.RestoreSymbolCount(ACount: LongInt);
+var
+  I, PreviousIndex: LongInt;
+begin
+  if ACount < 0 then ACount := 0;
+  if ACount > Length(FSymbols) then ACount := Length(FSymbols);
+  for I := High(FSymbols) downto ACount do
+  begin
+    PreviousIndex := FSymbols[I].PreviousIndex;
+    if PreviousIndex >= 0 then
+      FSymbolIndex.Put(FSymbols[I].Name, PreviousIndex)
+    else
+      FSymbolIndex.Remove(FSymbols[I].Name);
+  end;
+  SetLength(FSymbols, ACount);
 end;
 
 function TSemanticAnalyzer.FindFunction(const AName: string): TFunction;
-var
-  I: LongInt;
 begin
-
-  for I := High(FProgram.Functions) downto 0 do
-    if FProgram.Functions[I].Name = AName then
-      Exit(FProgram.Functions[I]);
-  Result := nil;
+  Result := FProgram.FindFunction(AName);
 end;
 
 function TSemanticAnalyzer.EditDistance(const A, B: string): LongInt;
@@ -1545,7 +1564,7 @@ begin
           SavedDepth := FScopeDepth;
           Inc(FScopeDepth);
           for I := 0 to High(S.Children) do AnalyzeStmt(S.Children[I]);
-          SetLength(FSymbols, SavedCount);
+          RestoreSymbolCount(SavedCount);
           FScopeDepth := SavedDepth;
         end;
       end;
@@ -1569,7 +1588,7 @@ begin
         AnalyzeExpr(S.Expr);
         AnalyzeExpr(S.Expr2);
         AnalyzeStmt(S.Body);
-        SetLength(FSymbols, SavedCount);
+        RestoreSymbolCount(SavedCount);
         FScopeDepth := SavedDepth;
       end;
     skSwitch:
@@ -1596,7 +1615,7 @@ begin
     AddSymbol(F.Params[I].Name, F.Params[I].CType, symLocal, F.Pos);
   end;
   AnalyzeStmt(F.Body);
-  SetLength(FSymbols, SavedCount);
+  RestoreSymbolCount(SavedCount);
   FScopeDepth := 0;
   FCurrentFunction := nil;
 end;
@@ -1635,6 +1654,8 @@ procedure TSemanticAnalyzer.Run;
 var
   I: LongInt;
 begin
+  FSymbolIndex.Clear;
+  SetLength(FSymbols, 0);
   InstallFileSymbols;
   for I := 0 to High(FProgram.StaticAssertions) do
     AnalyzeStmt(FProgram.StaticAssertions[I]);

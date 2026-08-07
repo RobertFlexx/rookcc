@@ -125,6 +125,10 @@ begin
   ABuffer.Add64(AAlign);
 end;
 
+procedure AddSectionHeader(ABuffer: TByteBuffer; AName, AType: LongWord;
+  AFlags, AAddress, AOffset, ASize: QWord; ALink, AInfo: LongWord;
+  AAlignment, AEntrySize: QWord); forward;
+
 procedure WriteStaticELF64Executable(const AFileName: string;
   const ATarget: TTargetDescriptor; AText, AData: TByteBuffer;
   AEntryOffset: QWord);
@@ -142,10 +146,12 @@ procedure WriteStaticELF64Executable(const AFileName: string;
   ABssSize: QWord);
 var
   Layout: TELFImageLayout;
-  FileBuffer: TByteBuffer;
+  FileBuffer, ShStr: TByteBuffer;
   DataSize, DataMemorySize: QWord;
-  I: LongInt;
-  SiteAddress: QWord;
+  I, SectionCount, ShStrIndex: LongInt;
+  SiteAddress, ShStrOffset, SectionHeaderOffset, BssOffset,
+    BssAddress: QWord;
+  TextName, DataName, BssName, ShStrName: LongWord;
 begin
   if AText = nil then
     raise ERCCError.Create('internal error: nil text buffer for ELF image');
@@ -173,6 +179,7 @@ begin
     Layout.FileSize := Layout.TextOffset + QWord(AText.Size);
   Layout.SyscallTableOffset := AlignELF(Layout.FileSize, 4);
   FileBuffer := TByteBuffer.Create;
+  ShStr := TByteBuffer.Create;
   try
     AddELFIdent(FileBuffer, ATarget);
     FileBuffer.Add16(ET_EXEC);
@@ -233,11 +240,63 @@ begin
         FileBuffer.Add32(ASyscallSites[I].Number);
       end;
     end;
+
+    ShStr.Add8(0);
+    TextName := LongWord(ShStr.Size);
+    ShStr.AddStringZ('.text');
+    DataName := 0;
+    if DataSize <> 0 then
+    begin
+      DataName := LongWord(ShStr.Size);
+      ShStr.AddStringZ('.data');
+    end;
+    BssName := 0;
+    if ABssSize <> 0 then
+    begin
+      BssName := LongWord(ShStr.Size);
+      ShStr.AddStringZ('.bss');
+    end;
+    ShStrName := LongWord(ShStr.Size);
+    ShStr.AddStringZ('.shstrtab');
+    ShStrOffset := QWord(FileBuffer.Size);
+    FileBuffer.Append(ShStr);
+    SectionHeaderOffset := AlignELF(QWord(FileBuffer.Size), 8);
+    while QWord(FileBuffer.Size) < SectionHeaderOffset do FileBuffer.Add8(0);
+
+    SectionCount := 3; { NULL + .text + .shstrtab }
+    if DataSize <> 0 then Inc(SectionCount);
+    if ABssSize <> 0 then Inc(SectionCount);
+    ShStrIndex := SectionCount - 1;
+    AddSectionHeader(FileBuffer, 0, SHT_NULL, 0, 0, 0, 0,
+      0, 0, 0, 0);
+    AddSectionHeader(FileBuffer, TextName, SHT_PROGBITS,
+      SHF_ALLOC or SHF_EXECINSTR, Layout.TextAddress, Layout.TextOffset,
+      QWord(AText.Size), 0, 0, 16, 0);
+    if DataSize <> 0 then
+      AddSectionHeader(FileBuffer, DataName, SHT_PROGBITS,
+        SHF_ALLOC or SHF_WRITE, Layout.DataAddress, Layout.DataOffset,
+        DataSize, 0, 0, 16, 0);
+    if ABssSize <> 0 then
+    begin
+      BssOffset := Layout.DataOffset + AlignELF(DataSize,
+        RCCELFImageBssAlignment);
+      BssAddress := Layout.DataAddress + AlignELF(DataSize,
+        RCCELFImageBssAlignment);
+      AddSectionHeader(FileBuffer, BssName, SHT_NOBITS,
+        SHF_ALLOC or SHF_WRITE, BssAddress, BssOffset, ABssSize,
+        0, 0, RCCELFImageBssAlignment, 0);
+    end;
+    AddSectionHeader(FileBuffer, ShStrName, SHT_STRTAB, 0, 0,
+      ShStrOffset, QWord(ShStr.Size), 0, 0, 1, 0);
+    FileBuffer.Patch64(40, SectionHeaderOffset);
+    FileBuffer.Patch16(60, Word(SectionCount));
+    FileBuffer.Patch16(62, Word(ShStrIndex));
     FileBuffer.SaveToFile(AFileName);
     if fpChmod(PChar(AFileName), &755) <> 0 then
       raise ERCCError.Create('error: cannot mark output executable: ' +
         AFileName);
   finally
+    ShStr.Free;
     FileBuffer.Free;
   end;
 end;

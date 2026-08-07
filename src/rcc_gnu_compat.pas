@@ -304,7 +304,7 @@ begin
     geDesignatedInitializers: Result := gslParsed;
     geVariadicMacros: Result := gslLowered;
     geBinaryLiterals: Result := gslParsed;
-    geHexFloats: Result := gslUnsupported;
+    geHexFloats: Result := gslComplete;
     geOmittedConditionalOperand: Result := gslUnsupported;
   else
     Result := gslUnsupported;

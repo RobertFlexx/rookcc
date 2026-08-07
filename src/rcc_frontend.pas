@@ -5,7 +5,8 @@ unit rcc_frontend;
 interface
 
 uses
-  Classes, SysUtils, StrUtils, rcc_types, rcc_typeops, rcc_gnu_compat;
+  Classes, SysUtils, StrUtils, Math, rcc_types, rcc_typeops, rcc_gnu_compat,
+  rcc_name_index;
 
 type
   TMacro = record
@@ -28,11 +29,13 @@ type
   TTypedefEntry = record
     Name: string;
     CType: TCType;
+    ScopeDepth: LongInt;
   end;
 
   TIntegerConstantEntry = record
     Name: string;
     Value: Int64;
+    ScopeDepth: LongInt;
   end;
 
   TDeclaredTypeEntry = record
@@ -40,6 +43,16 @@ type
     CType: TCType;
     ScopeDepth: LongInt;
     IsFunction: Boolean;
+  end;
+
+  TOrdinaryBindingKind = (obTypedef, obIntegerConstant, obDeclaredType);
+
+  TOrdinaryBinding = record
+    Name: string;
+    Kind: TOrdinaryBindingKind;
+    ItemIndex: LongInt;
+    ScopeDepth: LongInt;
+    PreviousBinding: LongInt;
   end;
 
   TPreprocessor = class
@@ -120,6 +133,8 @@ type
     FTypedefs: array of TTypedefEntry;
     FIntegerConstants: array of TIntegerConstantEntry;
     FDeclaredTypes: array of TDeclaredTypeEntry;
+    FOrdinaryBindings: array of TOrdinaryBinding;
+    FOrdinaryIndex: TNameIndex;
     FScopeDepth: LongInt;
     FStructs: array of TStructMembers;
     FOwnedStructInfos: array of PStructMembers;
@@ -143,6 +158,11 @@ type
     function IsTypeStart: Boolean;
     procedure RequireCStandard(ARevision: LongInt; const AFeature: string;
       const APos: TSourcePos);
+    function CurrentOrdinaryBinding(const AName: string;
+      out ABinding: TOrdinaryBinding): Boolean;
+    procedure PushOrdinaryBinding(const AName: string;
+      AKind: TOrdinaryBindingKind; AItemIndex, AScopeDepth: LongInt);
+    procedure RestoreOrdinaryBindingCount(ACount: LongInt);
     function FindTypedef(const AName: string; out ACType: TCType): Boolean;
     procedure AddTypedef(const AName: string; const ACType: TCType);
     function FindIntegerConstant(const AName: string; out AValue: Int64): Boolean;
@@ -1799,6 +1819,80 @@ var
     Advance;
   end;
 
+  function ParseHexFloatingLiteral(const AText: string;
+    out AResult: Double): Boolean;
+  var
+    Clean: string;
+    I, PIndex, ExponentSign, ExponentValue, FractionDigits,
+      DigitCount, Digit: LongInt;
+    SeenDot: Boolean;
+    Mantissa, Scale: Extended;
+  begin
+    Result := False;
+    AResult := 0.0;
+    Clean := StringReplace(AText, #39, '', [rfReplaceAll]);
+    while (Clean <> '') and
+      (Clean[Length(Clean)] in ['f', 'F', 'l', 'L']) do
+      Delete(Clean, Length(Clean), 1);
+    if (Length(Clean) < 4) or (Clean[1] <> '0') or
+       not (Clean[2] in ['x', 'X']) then Exit;
+    PIndex := 0;
+    for I := 3 to Length(Clean) do
+      if Clean[I] in ['p', 'P'] then
+      begin
+        PIndex := I;
+        Break;
+      end;
+    if PIndex = 0 then Exit;
+
+    Mantissa := 0.0;
+    FractionDigits := 0;
+    DigitCount := 0;
+    SeenDot := False;
+    for I := 3 to PIndex - 1 do
+    begin
+      if Clean[I] = '.' then
+      begin
+        if SeenDot then Exit;
+        SeenDot := True;
+        Continue;
+      end;
+      Digit := DigitValue(Clean[I]);
+      if (Digit < 0) or (Digit >= 16) then Exit;
+      Mantissa := Mantissa * 16.0 + Digit;
+      Inc(DigitCount);
+      if SeenDot then Inc(FractionDigits);
+    end;
+    if DigitCount = 0 then Exit;
+
+    I := PIndex + 1;
+    ExponentSign := 1;
+    if (I <= Length(Clean)) and (Clean[I] in ['+', '-']) then
+    begin
+      if Clean[I] = '-' then ExponentSign := -1;
+      Inc(I);
+    end;
+    if I > Length(Clean) then Exit;
+    ExponentValue := 0;
+    DigitCount := 0;
+    while I <= Length(Clean) do
+    begin
+      if not (Clean[I] in ['0'..'9']) then Exit;
+      if ExponentValue < 100000 then
+        ExponentValue := ExponentValue * 10 + Ord(Clean[I]) - Ord('0');
+      Inc(DigitCount);
+      Inc(I);
+    end;
+    if DigitCount = 0 then Exit;
+    ExponentValue := ExponentSign * ExponentValue - FractionDigits * 4;
+    { Keep malformed or adversarial literals from triggering host floating
+      exceptions while lexing.  This range is far wider than binary64. }
+    if (ExponentValue > 16384) or (ExponentValue < -16384) then Exit;
+    Scale := Power(2.0, ExponentValue);
+    AResult := Double(Mantissa * Scale);
+    Result := True;
+  end;
+
 begin
   Start := FIndex;
   P := Position;
@@ -1816,6 +1910,78 @@ begin
   if (Current = '0') and ((Peek = 'x') or (Peek = 'X')) then
   begin
     Base := 16;
+    Advance;
+    Advance;
+    SequenceDigits := 0;
+    while IsBaseDigit(Current, 16) or (Current = #39) do
+    begin
+      if Current = #39 then
+        ConsumeDigitSeparator(16, SequenceDigits)
+      else
+      begin
+        Inc(SequenceDigits);
+        Advance;
+      end;
+    end;
+    if Current = '.' then
+    begin
+      HasDot := True;
+      Advance;
+      while IsBaseDigit(Current, 16) or (Current = #39) do
+      begin
+        if Current = #39 then
+          ConsumeDigitSeparator(16, SequenceDigits)
+        else
+        begin
+          Inc(SequenceDigits);
+          Advance;
+        end;
+      end;
+    end;
+    if SequenceDigits = 0 then
+      RaiseCompileError(P, 'hexadecimal literal requires digits');
+    if Current in ['p', 'P'] then
+    begin
+      HasExponent := True;
+      Advance;
+      if Current in ['+', '-'] then Advance;
+      Digits := 0;
+      SequenceDigits := 0;
+      while (Current in ['0'..'9']) or (Current = #39) do
+      begin
+        if Current = #39 then
+          ConsumeDigitSeparator(10, SequenceDigits)
+        else
+        begin
+          Inc(Digits);
+          Inc(SequenceDigits);
+          Advance;
+        end;
+      end;
+      if Digits = 0 then
+        RaiseCompileError(P, 'hexadecimal floating exponent requires decimal digits');
+    end;
+    if HasExponent then
+    begin
+      if not CStandardAtLeast(FStandard, 1999) and
+         not IsGNUStandard(FStandard) then
+        RaiseCompileError(P,
+          'hexadecimal floating literals require C99 or GNU mode');
+      if Current in ['f', 'F', 'l', 'L'] then Advance;
+      LiteralText := Copy(FSource, Start, FIndex - Start);
+      if not ParseHexFloatingLiteral(LiteralText, AFloatValue) then
+        RaiseCompileError(P, 'invalid hexadecimal floating literal ' + LiteralText);
+      AIsFloat := True;
+      Result := LiteralText;
+      Exit;
+    end;
+    if HasDot then
+      RaiseCompileError(P,
+        'hexadecimal floating literal requires a p exponent');
+    { The look-ahead above established that this is an integer literal. }
+    FIndex := Start;
+    FLine := P.Line;
+    FColumn := P.Column;
     Advance;
     Advance;
   end
@@ -2243,13 +2409,16 @@ begin
   FContinueableDepth := 0;
   FScopeDepth := 0;
   FStandard := AStandard;
+  FOrdinaryIndex := TNameIndex.Create;
   SetLength(FDeclaredTypes, 0);
+  SetLength(FOrdinaryBindings, 0);
 end;
 
 destructor TParser.Destroy;
 var
   I: LongInt;
 begin
+  FOrdinaryIndex.Free;
   for I := 0 to High(FOwnedStructInfos) do
     if FOwnedStructInfos[I] <> nil then
       Dispose(FOwnedStructInfos[I]);
@@ -2357,86 +2526,172 @@ begin
   Inc(FIndex);
 end;
 
-function TParser.FindTypedef(const AName: string; out ACType: TCType): Boolean;
+function TParser.CurrentOrdinaryBinding(const AName: string;
+  out ABinding: TOrdinaryBinding): Boolean;
 var
   I: LongInt;
 begin
-  for I := High(FTypedefs) downto 0 do
-    if FTypedefs[I].Name = AName then
-    begin
-      ACType := FTypedefs[I].CType;
-      Exit(True);
-    end;
-  Result := False;
+  Result := FOrdinaryIndex.TryGet(AName, I) and
+    (I >= 0) and (I < Length(FOrdinaryBindings));
+  if Result then ABinding := FOrdinaryBindings[I];
+end;
+
+procedure TParser.PushOrdinaryBinding(const AName: string;
+  AKind: TOrdinaryBindingKind; AItemIndex, AScopeDepth: LongInt);
+var
+  N, Previous: LongInt;
+begin
+  if AName = '' then Exit;
+  Previous := -1;
+  FOrdinaryIndex.TryGet(AName, Previous);
+  N := Length(FOrdinaryBindings);
+  SetLength(FOrdinaryBindings, N + 1);
+  FOrdinaryBindings[N].Name := AName;
+  FOrdinaryBindings[N].Kind := AKind;
+  FOrdinaryBindings[N].ItemIndex := AItemIndex;
+  FOrdinaryBindings[N].ScopeDepth := AScopeDepth;
+  FOrdinaryBindings[N].PreviousBinding := Previous;
+  FOrdinaryIndex.Put(AName, N);
+end;
+
+procedure TParser.RestoreOrdinaryBindingCount(ACount: LongInt);
+var
+  I, Previous: LongInt;
+begin
+  if ACount < 0 then ACount := 0;
+  if ACount > Length(FOrdinaryBindings) then
+    ACount := Length(FOrdinaryBindings);
+  for I := High(FOrdinaryBindings) downto ACount do
+  begin
+    Previous := FOrdinaryBindings[I].PreviousBinding;
+    if Previous >= 0 then
+      FOrdinaryIndex.Put(FOrdinaryBindings[I].Name, Previous)
+    else
+      FOrdinaryIndex.Remove(FOrdinaryBindings[I].Name);
+  end;
+  SetLength(FOrdinaryBindings, ACount);
+end;
+
+function TParser.FindTypedef(const AName: string; out ACType: TCType): Boolean;
+var
+  Binding: TOrdinaryBinding;
+  I: LongInt;
+begin
+  Result := CurrentOrdinaryBinding(AName, Binding) and
+    (Binding.Kind = obTypedef);
+  if not Result then Exit;
+  I := Binding.ItemIndex;
+  Result := (I >= 0) and (I < Length(FTypedefs));
+  if Result then ACType := FTypedefs[I].CType;
 end;
 
 procedure TParser.AddTypedef(const AName: string; const ACType: TCType);
 var
   N: LongInt;
+  Binding: TOrdinaryBinding;
 begin
+  if CurrentOrdinaryBinding(AName, Binding) and
+     (Binding.ScopeDepth = FScopeDepth) then
+  begin
+    if (Binding.Kind = obTypedef) and
+       TypesEqual(FTypedefs[Binding.ItemIndex].CType, ACType) then
+      Exit;
+    RaiseCompileError(Current.Pos, 'redefinition of ''' + AName + '''');
+  end;
   N := Length(FTypedefs);
   SetLength(FTypedefs, N + 1);
   FTypedefs[N].Name := AName;
   FTypedefs[N].CType := ACType;
+  FTypedefs[N].ScopeDepth := FScopeDepth;
+  PushOrdinaryBinding(AName, obTypedef, N, FScopeDepth);
 end;
 
 function TParser.FindIntegerConstant(const AName: string;
   out AValue: Int64): Boolean;
 var
+  Binding: TOrdinaryBinding;
   I: LongInt;
 begin
-  for I := High(FIntegerConstants) downto 0 do
-    if FIntegerConstants[I].Name = AName then
-    begin
-      AValue := FIntegerConstants[I].Value;
-      Exit(True);
-    end;
-  Result := False;
+  Result := CurrentOrdinaryBinding(AName, Binding) and
+    (Binding.Kind = obIntegerConstant);
+  if not Result then Exit;
+  I := Binding.ItemIndex;
+  Result := (I >= 0) and (I < Length(FIntegerConstants));
+  if Result then AValue := FIntegerConstants[I].Value;
 end;
 
 procedure TParser.AddIntegerConstant(const AName: string; AValue: Int64;
   const APos: TSourcePos);
 var
-  I, N: LongInt;
+  N: LongInt;
+  Binding: TOrdinaryBinding;
 begin
-  for I := High(FIntegerConstants) downto 0 do
-    if FIntegerConstants[I].Name = AName then
-      RaiseCompileError(APos, 'redefinition of enumerator ''' + AName + '''');
+  if CurrentOrdinaryBinding(AName, Binding) and
+     (Binding.ScopeDepth = FScopeDepth) then
+    RaiseCompileError(APos, 'redefinition of enumerator ''' + AName + '''');
   N := Length(FIntegerConstants);
   SetLength(FIntegerConstants, N + 1);
   FIntegerConstants[N].Name := AName;
   FIntegerConstants[N].Value := AValue;
+  FIntegerConstants[N].ScopeDepth := FScopeDepth;
+  PushOrdinaryBinding(AName, obIntegerConstant, N, FScopeDepth);
 end;
-
 
 function TParser.FindDeclaredType(const AName: string; out ACType: TCType;
   out AIsFunction: Boolean): Boolean;
 var
+  Binding: TOrdinaryBinding;
   I: LongInt;
 begin
-  for I := High(FDeclaredTypes) downto 0 do
-    if FDeclaredTypes[I].Name = AName then
-    begin
-      ACType := FDeclaredTypes[I].CType;
-      AIsFunction := FDeclaredTypes[I].IsFunction;
-      Exit(True);
-    end;
-  AIsFunction := False;
-  Result := False;
+  Result := CurrentOrdinaryBinding(AName, Binding) and
+    (Binding.Kind = obDeclaredType);
+  if not Result then
+  begin
+    AIsFunction := False;
+    Exit;
+  end;
+  I := Binding.ItemIndex;
+  Result := (I >= 0) and (I < Length(FDeclaredTypes));
+  if Result then
+  begin
+    ACType := FDeclaredTypes[I].CType;
+    AIsFunction := FDeclaredTypes[I].IsFunction;
+  end
+  else
+    AIsFunction := False;
 end;
 
 procedure TParser.AddDeclaredType(const AName: string; const ACType: TCType;
   AScopeDepth: LongInt; AIsFunction: Boolean);
 var
   N: LongInt;
+  Binding: TOrdinaryBinding;
 begin
   if AName = '' then Exit;
+  if CurrentOrdinaryBinding(AName, Binding) and
+     (Binding.ScopeDepth = AScopeDepth) then
+  begin
+    if Binding.Kind <> obDeclaredType then
+      RaiseCompileError(Current.Pos, 'redefinition of ''' + AName + '''');
+    { A declaration may be refined later in the same scope, for example when
+      an incomplete array obtains its length from its initializer or when a
+      prototype is followed by a definition.  Update the existing binding
+      rather than stacking another same-scope hash entry. }
+    if (Binding.ItemIndex >= 0) and
+       (Binding.ItemIndex < Length(FDeclaredTypes)) then
+    begin
+      FDeclaredTypes[Binding.ItemIndex].CType := ACType;
+      FDeclaredTypes[Binding.ItemIndex].IsFunction := AIsFunction;
+      Exit;
+    end;
+  end;
   N := Length(FDeclaredTypes);
   SetLength(FDeclaredTypes, N + 1);
   FDeclaredTypes[N].Name := AName;
   FDeclaredTypes[N].CType := ACType;
   FDeclaredTypes[N].ScopeDepth := AScopeDepth;
   FDeclaredTypes[N].IsFunction := AIsFunction;
+  PushOrdinaryBinding(AName, obDeclaredType, N, AScopeDepth);
 end;
 
 
@@ -2460,12 +2715,25 @@ end;
 
 procedure TParser.LeaveScope;
 var
-  N: LongInt;
+  N, BindingCount: LongInt;
 begin
+  BindingCount := Length(FOrdinaryBindings);
+  while (BindingCount > 0) and
+    (FOrdinaryBindings[BindingCount - 1].ScopeDepth >= FScopeDepth) do
+    Dec(BindingCount);
+  RestoreOrdinaryBindingCount(BindingCount);
+
   N := Length(FDeclaredTypes);
   while (N > 0) and (FDeclaredTypes[N - 1].ScopeDepth >= FScopeDepth) do
     Dec(N);
   SetLength(FDeclaredTypes, N);
+  N := Length(FTypedefs);
+  while (N > 0) and (FTypedefs[N - 1].ScopeDepth >= FScopeDepth) do Dec(N);
+  SetLength(FTypedefs, N);
+  N := Length(FIntegerConstants);
+  while (N > 0) and
+    (FIntegerConstants[N - 1].ScopeDepth >= FScopeDepth) do Dec(N);
+  SetLength(FIntegerConstants, N);
   if FScopeDepth > 0 then Dec(FScopeDepth);
 end;
 
@@ -2941,6 +3209,8 @@ begin
         end;
       gakUnused:
         ACType.SuppressUnusedWarning := True;
+      gakUsed:
+        ACType.PreserveForLinker := True;
       gakCold, gakDeprecated, gakFormat, gakHot, gakLeaf, gakMalloc,
       gakNoInline, gakNoReturn, gakNonNull, gakPure, gakSentinel,
       gakWarnUnusedResult, gakFallthrough, gakFlatten, gakNoSanitize:

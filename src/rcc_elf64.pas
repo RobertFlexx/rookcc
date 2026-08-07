@@ -90,6 +90,15 @@ const
   STT_OBJECT = Byte(1);
   STT_FUNC = Byte(2);
 
+  SHT_NULL = LongWord(0);
+  SHT_PROGBITS = LongWord(1);
+  SHT_STRTAB = LongWord(3);
+  SHT_DYNAMIC = LongWord(6);
+  SHT_NOBITS = LongWord(8);
+  SHF_WRITE = QWord(1);
+  SHF_ALLOC = QWord(2);
+  SHF_EXECINSTR = QWord(4);
+
   LinuxInterpreter = '/lib64/ld-linux-x86-64.so.2';
   DefaultHostedLibrary = 'libc.so.6';
 
@@ -131,6 +140,22 @@ procedure AddDynamicEntry(ABuffer: TByteBuffer; ATag, AValue: QWord);
 begin
   ABuffer.Add64(ATag);
   ABuffer.Add64(AValue);
+end;
+
+procedure AddSectionHeader(ABuffer: TByteBuffer; AName, AType: LongWord;
+  AFlags, AAddress, AOffset, ASize: QWord; ALink, AInfo: LongWord;
+  AAlignment, AEntrySize: QWord);
+begin
+  ABuffer.Add32(AName);
+  ABuffer.Add32(AType);
+  ABuffer.Add64(AFlags);
+  ABuffer.Add64(AAddress);
+  ABuffer.Add64(AOffset);
+  ABuffer.Add64(ASize);
+  ABuffer.Add32(ALink);
+  ABuffer.Add32(AInfo);
+  ABuffer.Add64(AAlignment);
+  ABuffer.Add64(AEntrySize);
 end;
 
 function ELFOutputIsHosted(const AImports: TDynamicImportArray;
@@ -319,11 +344,13 @@ procedure WriteELF64Executable(const AFileName: string; AText, AData: TByteBuffe
   const AInterpreter: string; ABssSize: QWord);
 var
   Layout: TELFExecutableLayout;
-  FileBuffer, DataPayload, DynamicBuffer: TByteBuffer;
-  I, ProgramHeaderCount: LongInt;
+  FileBuffer, DataPayload, DynamicBuffer, ShStr: TByteBuffer;
+  I, ProgramHeaderCount, SectionCount, ShStrIndex: LongInt;
   Hosted: Boolean;
   InterpOffset, InterpVA, InterpSize: QWord;
-  DynamicOffset, DataMemorySize: QWord;
+  DynamicOffset, DataMemorySize, ShStrOffset, SectionHeaderOffset,
+    BssOffset, BssVA: QWord;
+  InterpName, TextName, DataName, BssName, ShStrName: LongWord;
   Interpreter: string;
 
 begin
@@ -337,6 +364,7 @@ begin
   DataPayload := TByteBuffer.Create;
   DynamicBuffer := TByteBuffer.Create;
   FileBuffer := TByteBuffer.Create;
+  ShStr := TByteBuffer.Create;
   try
     BuildELF64DataPayload(DataPayload, DynamicBuffer, AText, AData,
       AEntryTextOffset, AImports, ALibraries, ARunPaths, ABindNow,
@@ -378,7 +406,7 @@ begin
     FileBuffer.Add16(64);
     FileBuffer.Add16(56);
     FileBuffer.Add16(ProgramHeaderCount);
-    FileBuffer.Add16(0);
+    FileBuffer.Add16(64);
     FileBuffer.Add16(0);
     FileBuffer.Add16(0);
 
@@ -421,10 +449,79 @@ begin
       while QWord(FileBuffer.Size) < Layout.DataOffset do FileBuffer.Add8(0);
       FileBuffer.Append(DataPayload);
     end;
+
+    { Section headers are not needed by the loader, but standard tooling uses
+      them for size accounting, inspection, and stripping.  Keep the loaded
+      image unchanged and append a compact non-loaded table. }
+    ShStr.Add8(0);
+    InterpName := 0;
+    if Hosted then
+    begin
+      InterpName := LongWord(ShStr.Size);
+      ShStr.AddStringZ('.interp');
+    end;
+    TextName := LongWord(ShStr.Size);
+    ShStr.AddStringZ('.text');
+    DataName := 0;
+    if QWord(DataPayload.Size) <> 0 then
+    begin
+      DataName := LongWord(ShStr.Size);
+      ShStr.AddStringZ('.data');
+    end;
+    BssName := 0;
+    if ABssSize <> 0 then
+    begin
+      BssName := LongWord(ShStr.Size);
+      ShStr.AddStringZ('.bss');
+    end;
+    ShStrName := LongWord(ShStr.Size);
+    ShStr.AddStringZ('.shstrtab');
+
+    ShStrOffset := QWord(FileBuffer.Size);
+    FileBuffer.Append(ShStr);
+    SectionHeaderOffset := AlignELFValue(QWord(FileBuffer.Size), 8);
+    while QWord(FileBuffer.Size) < SectionHeaderOffset do FileBuffer.Add8(0);
+
+    SectionCount := 2; { NULL + .text }
+    if Hosted then Inc(SectionCount); { .interp }
+    if QWord(DataPayload.Size) <> 0 then Inc(SectionCount);
+    if ABssSize <> 0 then Inc(SectionCount);
+    Inc(SectionCount); { .shstrtab }
+    ShStrIndex := SectionCount - 1;
+
+    AddSectionHeader(FileBuffer, 0, SHT_NULL, 0, 0, 0, 0,
+      0, 0, 0, 0);
+    if Hosted then
+      AddSectionHeader(FileBuffer, InterpName, SHT_PROGBITS, SHF_ALLOC,
+        InterpVA, InterpOffset, InterpSize, 0, 0, 1, 0);
+    AddSectionHeader(FileBuffer, TextName, SHT_PROGBITS,
+      SHF_ALLOC or SHF_EXECINSTR, Layout.TextVA, Layout.TextOffset,
+      QWord(AText.Size), 0, 0, 16, 0);
+    if QWord(DataPayload.Size) <> 0 then
+      AddSectionHeader(FileBuffer, DataName, SHT_PROGBITS,
+        SHF_ALLOC or SHF_WRITE, Layout.DataVA, Layout.DataOffset,
+        QWord(DataPayload.Size), 0, 0, 16, 0);
+    if ABssSize <> 0 then
+    begin
+      BssOffset := Layout.DataOffset + AlignELFValue(
+        QWord(DataPayload.Size), RCCELFBssAlignment);
+      BssVA := Layout.DataVA + AlignELFValue(
+        QWord(DataPayload.Size), RCCELFBssAlignment);
+      AddSectionHeader(FileBuffer, BssName, SHT_NOBITS,
+        SHF_ALLOC or SHF_WRITE, BssVA, BssOffset, ABssSize,
+        0, 0, RCCELFBssAlignment, 0);
+    end;
+    AddSectionHeader(FileBuffer, ShStrName, SHT_STRTAB, 0, 0,
+      ShStrOffset, QWord(ShStr.Size), 0, 0, 1, 0);
+
+    FileBuffer.Patch64(40, SectionHeaderOffset);
+    FileBuffer.Patch16(60, Word(SectionCount));
+    FileBuffer.Patch16(62, Word(ShStrIndex));
     FileBuffer.SaveToFile(AFileName);
     if fpChmod(PChar(AFileName), &755) <> 0 then
       raise ERCCError.Create('error: cannot mark output executable: ' + AFileName);
   finally
+    ShStr.Free;
     FileBuffer.Free;
     DynamicBuffer.Free;
     DataPayload.Free;

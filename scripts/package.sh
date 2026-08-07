@@ -17,10 +17,11 @@ mkdir -p "$STAGE"
 
 ROOT_FILES=(
   .gitignore LICENSE Makefile README.md VERSION
-  RELEASE_HARDENING.md RELEASE_NOTES_2.0.0.md VERIFICATION_2.0.0.md
+  RELEASE_HARDENING.md "RELEASE_NOTES_${VERSION}.md" "VERIFICATION_${VERSION}.md"
+  "COMPATIBILITY_${VERSION}.md"
 )
 ROOT_DIRECTORIES=(
-  bench completions examples include man scripts src tests
+  .github bench completions examples include man scripts src tests
 )
 
 copy_file() {

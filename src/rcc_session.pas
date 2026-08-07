@@ -16,7 +16,7 @@ uses
   rcc_verify, rcc_build, rcc_target, rcc_diag, rcc_feature_policy,
   rcc_sema, rcc_arch, rcc_cross_backend, rcc_pass_manager, rcc_ir,
   rcc_ir_verify, rcc_ir_metrics, rcc_platform, rcc_gnu_tokens,
-  rcc_native_linker, rcc_warnings;
+  rcc_native_linker, rcc_warnings, rcc_backend_preflight;
 
 procedure AppendString(var AValues: rcc_types.TStringArray; const AValue: string);
 var
@@ -158,6 +158,7 @@ begin
     ADestination.StaticAssertions[N + I] := ASource.StaticAssertions[I];
     ASource.StaticAssertions[I] := nil;
   end;
+  ADestination.RebuildNameIndexes;
 end;
 
 procedure DumpTokens(const ATokens: TTokenArray; ALines: TStrings);
@@ -471,13 +472,17 @@ begin
     AnalyzeProgram(ProgramAll);
     VerifyProgram(ProgramAll, 'semantic analysis');
     AnalyzeWarnings(ProgramAll, AOptions);
+    { Reject backend limitations before any optimization work.  Syntax-only
+      and IR inspection deliberately remain frontend-only operations. }
+    if AOptions.EmitMode in [emExecutable, emAssembly, emObject] then
+      ValidateBackendSupport(ProgramAll, TargetDescriptor);
     VerifyTime := GetTickCount64;
 
     if AOptions.Verbose then
       WriteLn(StdErr, 'opt    O', AOptions.OptimizationLevel,
         ' standard=', CStandardName(AOptions.Standard));
     OptimizeProgram(ProgramAll, AOptions.OptimizationLevel,
-      AOptions.OptimizeSize, OptStats);
+      AOptions.SizeOptimizationLevel, AOptions.OptimizeDebug, OptStats);
     VerifyProgram(ProgramAll, 'optimization');
     OptTime := GetTickCount64;
 
@@ -488,7 +493,7 @@ begin
     if NeedFormalIR then
     begin
       PassManager := TPassManager.Create(TargetDescriptor,
-        AOptions.OptimizationLevel, AOptions.OptimizeSize);
+        AOptions.OptimizationLevel, AOptions.SizeOptimizationLevel);
       IRModule := PassManager.Build(ProgramAll);
       VerifyIRModule(IRModule, 'formal IR');
       PassManager.RunAnalysis;
@@ -573,12 +578,23 @@ begin
       WriteLn(StdErr, '  branches:       ', OptStats.BranchesSimplified);
       WriteLn(StdErr, '  dead statements:', OptStats.DeadStatementsRemoved:8);
       WriteLn(StdErr, '  opt passes:     ', OptStats.PassesRun);
+      WriteLn(StdErr, '  input AST nodes:', OptStats.InputNodes:8);
+      WriteLn(StdErr, '  functions opt:  ', OptStats.FunctionsOptimized);
+      WriteLn(StdErr, '  cleanup iters:  ', OptStats.CleanupIterations);
+      WriteLn(StdErr, '  cleanup capped:', OptStats.BudgetLimitedFunctions:8);
+      WriteLn(StdErr, '  prop capped:   ', OptStats.PropagationBudgetSkips:8);
       WriteLn(StdErr, '  expr visited:   ', OptStats.ExpressionsVisited);
       WriteLn(StdErr, '  stmt visited:   ', OptStats.StatementsVisited);
       WriteLn(StdErr, '  constants prop: ', OptStats.ConstantsPropagated);
       WriteLn(StdErr, '  loops unrolled: ', OptStats.LoopsUnrolled);
       WriteLn(StdErr, '  strength red:   ', OptStats.StrengthReductions);
       WriteLn(StdErr, '  hoisted exprs:  ', OptStats.ExpressionsHoisted);
+      WriteLn(StdErr, '  calls inlined:  ', OptStats.CallsInlined);
+      WriteLn(StdErr, '  inline rejected:', OptStats.InlineCandidatesRejected:8);
+      WriteLn(StdErr, '  funcs removed:  ', OptStats.FunctionsRemoved);
+      WriteLn(StdErr, '  globals removed:', OptStats.GlobalsRemoved:8);
+      if OptStats.ReachabilityDisabledByAsm then
+        WriteLn(StdErr, '  static DCE:     disabled by inline assembly');
       WriteLn(StdErr, '  IR functions:   ', Length(IRMetrics.Functions));
       WriteLn(StdErr, '  IR blocks:      ', IRMetrics.TotalBlocks);
       WriteLn(StdErr, '  IR instructions:', IRMetrics.TotalInstructions:8);

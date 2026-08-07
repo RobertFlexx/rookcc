@@ -11,16 +11,20 @@
 /repl
 /repltxt
 /examples/*.out
-/tests/tmp/
-/tests/__pycache__/
+/tests/
 /bench/__pycache__/
 /bench/*.json
-/tests/*
-/tests
+
+# AI tooling and assistant artifacts
+/\.opencode/
+/\.cursor/
+/\.vscode/
+/\AGENTS\.md
+/\CLAUDE\.md
+/\COPILOT\.md
+/\.coderabbit\.yaml
+/\.github/copilot-instructions\.md
 
 /scripts/*
 !/scripts/build.sh
 !/scripts/install.sh
-/scripts/package.sh
-/scripts/package_test.sh
-/scripts/release_gate.sh

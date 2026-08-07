@@ -41,6 +41,7 @@ begin
   Result.IsPacked := AElementType.IsPacked;
   Result.AlignmentOverride := AElementType.AlignmentOverride;
   Result.SuppressUnusedWarning := AElementType.SuppressUnusedWarning;
+  Result.PreserveForLinker := AElementType.PreserveForLinker;
   Result.ArrayLength := ALength;
   Result.ElementKind := AElementType.Kind;
   Result.ElementUnsigned := AElementType.IsUnsigned;

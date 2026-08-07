@@ -6,7 +6,7 @@ interface
 
 uses
   Classes, SysUtils, rcc_types, rcc_runtime_catalog, rcc_buffer, rcc_elf64,
-  rcc_typeops, rcc_arch;
+  rcc_typeops, rcc_arch, rcc_name_index;
 
 type
   TBackendStats = record
@@ -92,6 +92,34 @@ type
     ScopeDepth: LongInt;
   end;
 
+  { Scalar values kept in fixed registers.  Ordinals 0/1 are the incoming
+    SysV rdi/rsi parameter registers; ordinals 2..5 are the callee-saved
+    r12..r15 registers used by conservative local promotion. }
+  TRegisterLocal = record
+    Name: string;
+    CType: TCType;
+    RegisterOrdinal: LongInt;
+    ScopeDepth: LongInt;
+  end;
+
+  TRegisterPlan = record
+    Name: string;
+    CType: TCType;
+    RegisterOrdinal: LongInt;
+  end;
+
+  TRegisterCandidate = record
+    Name: string;
+    CType: TCType;
+    DeclarationCount: LongInt;
+    Score: LongInt;
+    LoopScore: LongInt;
+    AddressTaken: Boolean;
+    Unsafe: Boolean;
+    Selected: Boolean;
+  end;
+  TRegisterCandidateArray = array of TRegisterCandidate;
+
   TSwitchEntry = record
     Statement: TStmt;
     TargetLabel: LongInt;
@@ -136,12 +164,9 @@ type
       FDataAddressFixupCapacity: LongInt;
       FDataAddressFixupCount: LongInt;
       FFunctions: array of TNamedLabel;
-      FFunctionHashNames: array of string;
-      FFunctionHashValues: array of LongInt;
-      FFunctionHashSize: LongInt;
-      FFunctionHashCount: LongInt;
-      FFunctionHashBuilt: Boolean;
+      FFunctionIndex: TNameIndex;
       FGlobals: array of TNamedLabel;
+      FGlobalLabelIndex: TNameIndex;
       FExternalDefinitions: array of TExternalDefinition;
       FExternalRelocations: array of TExternalRelocation;
       FExternalThunks: array of TNamedLabel;
@@ -153,6 +178,11 @@ type
       FImports: TDynamicImportArray;
       FStrings: array of TStringLabel;
       FLocals: array of TLocal;
+      FRegisterLocals: array of TRegisterLocal;
+      FRegisterPlans: array of TRegisterPlan;
+      FRegisterSaveCount: LongInt;
+      FUsingCalleeSavedLocals: Boolean;
+      FCurrentFrameless: Boolean;
       FScopeDepth: LongInt;
       FNextLocalSlot: LongInt;
       FStackDepth: LongInt;
@@ -177,9 +207,6 @@ type
     procedure GrowLabelList;
     procedure GrowFixupList;
     procedure GrowDataAddressFixupList;
-    procedure FunctionHashEnsureCapacity;
-    procedure FunctionHashInsert(const AName: string; AValue: LongInt);
-    function FunctionHashLookup(const AName: string): LongInt;
     function FindFunctionLabel(const AName: string): LongInt;
     function NewLabel: LongInt;
     procedure BindTextLabel(ALabel: LongInt);
@@ -363,6 +390,19 @@ type
       out AOffset: LongInt);
     procedure AddLocal(const AName: string; const AType: TCType;
       AIndirectObject: Boolean; out AOffset: LongInt);
+    procedure PlanRegisterLocals(F: TFunction);
+    function FindRegisterPlan(const AName: string;
+      out ARegisterOrdinal: LongInt): Boolean;
+    procedure AddRegisterLocal(const AName: string; const AType: TCType;
+      ARegisterOrdinal: LongInt);
+    function FindRegisterLocal(const AName: string; out ARegisterOrdinal: LongInt;
+      out AType: TCType): Boolean;
+    procedure EmitLoadRegisterLocalToRax(ARegisterOrdinal: LongInt;
+      const AType: TCType);
+    procedure EmitLoadRegisterLocalToRcx(ARegisterOrdinal: LongInt;
+      const AType: TCType);
+    procedure EmitStoreRaxToRegisterLocal(ARegisterOrdinal: LongInt;
+      const AType: TCType);
     function FindLocal(const AName: string; out AOffset: LongInt;
       out AType: TCType; out AIndirectObject: Boolean): Boolean;
     function FindGlobalLabel(const AName: string): LongInt;
@@ -446,6 +486,224 @@ const
 
 
 
+function ExprContainsCall(E: TExpr): Boolean;
+var
+  I: LongInt;
+begin
+  if E = nil then Exit(False);
+  if E.Kind = ekCall then Exit(True);
+  if ExprContainsCall(E.Left) or ExprContainsCall(E.Right) or
+     ExprContainsCall(E.Third) then Exit(True);
+  for I := 0 to High(E.Args) do
+    if ExprContainsCall(E.Args[I]) then Exit(True);
+  Result := False;
+end;
+
+function StmtContainsCallOrAsm(S: TStmt): Boolean;
+var
+  I: LongInt;
+begin
+  if S = nil then Exit(False);
+  if S.Kind = skAsm then Exit(True);
+  if ExprContainsCall(S.Expr) or ExprContainsCall(S.Expr2) or
+     StmtContainsCallOrAsm(S.InitStmt) or StmtContainsCallOrAsm(S.Body) or
+     StmtContainsCallOrAsm(S.ElseBody) then Exit(True);
+  for I := 0 to High(S.Children) do
+    if StmtContainsCallOrAsm(S.Children[I]) then Exit(True);
+  Result := False;
+end;
+
+function FindRegisterCandidate(const ACandidates: TRegisterCandidateArray;
+  const AName: string): LongInt;
+var
+  I: LongInt;
+begin
+  for I := 0 to High(ACandidates) do
+    if ACandidates[I].Name = AName then Exit(I);
+  Result := -1;
+end;
+
+procedure CollectRegisterCandidates(S: TStmt;
+  var ACandidates: TRegisterCandidateArray);
+var
+  I, N: LongInt;
+begin
+  if S = nil then Exit;
+  if S.Kind = skDecl then
+  begin
+    I := FindRegisterCandidate(ACandidates, S.Name);
+    if I < 0 then
+    begin
+      N := Length(ACandidates);
+      SetLength(ACandidates, N + 1);
+      I := N;
+      ACandidates[I].Name := S.Name;
+      ACandidates[I].CType := S.CType;
+      ACandidates[I].DeclarationCount := 0;
+      ACandidates[I].Score := 0;
+      ACandidates[I].LoopScore := 0;
+      ACandidates[I].AddressTaken := False;
+      ACandidates[I].Unsafe := False;
+      ACandidates[I].Selected := False;
+    end;
+    Inc(ACandidates[I].DeclarationCount);
+    if S.IsStatic or S.CType.IsVolatile or
+       not (IsIntegerType(S.CType) or IsPointerType(S.CType)) then
+      ACandidates[I].Unsafe := True;
+  end;
+  CollectRegisterCandidates(S.InitStmt, ACandidates);
+  CollectRegisterCandidates(S.Body, ACandidates);
+  CollectRegisterCandidates(S.ElseBody, ACandidates);
+  for I := 0 to High(S.Children) do
+    CollectRegisterCandidates(S.Children[I], ACandidates);
+end;
+
+procedure ScoreRegisterExpr(E: TExpr; ALoopDepth: LongInt;
+  var ACandidates: TRegisterCandidateArray);
+var
+  I, CandidateIndex, Weight: LongInt;
+begin
+  if E = nil then Exit;
+  if ALoopDepth > 5 then ALoopDepth := 5;
+  Weight := 1 shl ALoopDepth;
+  if (E.Kind = ekAddress) and (E.Left <> nil) and
+     (E.Left.Kind = ekVariable) then
+  begin
+    CandidateIndex := FindRegisterCandidate(ACandidates, E.Left.Text);
+    if CandidateIndex >= 0 then ACandidates[CandidateIndex].AddressTaken := True;
+  end;
+  if E.Kind = ekVariable then
+  begin
+    CandidateIndex := FindRegisterCandidate(ACandidates, E.Text);
+    if CandidateIndex >= 0 then
+    begin
+      Inc(ACandidates[CandidateIndex].Score, Weight);
+      if ALoopDepth > 0 then
+        Inc(ACandidates[CandidateIndex].LoopScore, Weight);
+    end;
+  end;
+  ScoreRegisterExpr(E.Left, ALoopDepth, ACandidates);
+  ScoreRegisterExpr(E.Right, ALoopDepth, ACandidates);
+  ScoreRegisterExpr(E.Third, ALoopDepth, ACandidates);
+  for I := 0 to High(E.Args) do
+    ScoreRegisterExpr(E.Args[I], ALoopDepth, ACandidates);
+end;
+
+procedure ScoreRegisterStmt(S: TStmt; ALoopDepth: LongInt;
+  var ACandidates: TRegisterCandidateArray);
+var
+  I: LongInt;
+begin
+  if S = nil then Exit;
+  if S.Kind = skAsm then
+  begin
+    { Inline assembly can mention local names textually or impose register
+      constraints that the compact native backend does not model yet. }
+    for I := 0 to High(ACandidates) do ACandidates[I].Unsafe := True;
+  end;
+  case S.Kind of
+    skWhile, skDoWhile:
+      begin
+        ScoreRegisterExpr(S.Expr, ALoopDepth + 1, ACandidates);
+        ScoreRegisterStmt(S.Body, ALoopDepth + 1, ACandidates);
+        Exit;
+      end;
+    skFor:
+      begin
+        ScoreRegisterStmt(S.InitStmt, ALoopDepth, ACandidates);
+        ScoreRegisterExpr(S.Expr, ALoopDepth + 1, ACandidates);
+        ScoreRegisterExpr(S.Expr2, ALoopDepth + 1, ACandidates);
+        ScoreRegisterStmt(S.Body, ALoopDepth + 1, ACandidates);
+        Exit;
+      end;
+  end;
+  ScoreRegisterExpr(S.Expr, ALoopDepth, ACandidates);
+  ScoreRegisterExpr(S.Expr2, ALoopDepth, ACandidates);
+  ScoreRegisterStmt(S.InitStmt, ALoopDepth, ACandidates);
+  ScoreRegisterStmt(S.Body, ALoopDepth, ACandidates);
+  ScoreRegisterStmt(S.ElseBody, ALoopDepth, ACandidates);
+  for I := 0 to High(S.Children) do
+    ScoreRegisterStmt(S.Children[I], ALoopDepth, ACandidates);
+  for I := 0 to High(S.AsmOutputs) do
+    ScoreRegisterExpr(S.AsmOutputs[I].Expr, ALoopDepth, ACandidates);
+  for I := 0 to High(S.AsmInputs) do
+    ScoreRegisterExpr(S.AsmInputs[I].Expr, ALoopDepth, ACandidates);
+end;
+
+function ExprRequiresParameterStorage(E: TExpr; const AName: string): Boolean;
+var
+  I: LongInt;
+begin
+  if E = nil then Exit(False);
+  { A register-resident parameter needs memory only when its address can
+    escape.  Assignments and increments are lowered directly back to the
+    resident SysV register. }
+  if (E.Kind = ekAddress) and (E.Left <> nil) and
+     (E.Left.Kind = ekVariable) and (E.Left.Text = AName) then Exit(True);
+  if ExprRequiresParameterStorage(E.Left, AName) or
+     ExprRequiresParameterStorage(E.Right, AName) or
+     ExprRequiresParameterStorage(E.Third, AName) then Exit(True);
+  for I := 0 to High(E.Args) do
+    if ExprRequiresParameterStorage(E.Args[I], AName) then Exit(True);
+  Result := False;
+end;
+
+function StmtRequiresParameterStorage(S: TStmt; const AName: string): Boolean;
+var
+  I: LongInt;
+begin
+  if S = nil then Exit(False);
+  if S.Kind = skAsm then Exit(True);
+  if ExprRequiresParameterStorage(S.Expr, AName) or
+     ExprRequiresParameterStorage(S.Expr2, AName) or
+     StmtRequiresParameterStorage(S.InitStmt, AName) or
+     StmtRequiresParameterStorage(S.Body, AName) or
+     StmtRequiresParameterStorage(S.ElseBody, AName) then Exit(True);
+  for I := 0 to High(S.Children) do
+    if StmtRequiresParameterStorage(S.Children[I], AName) then Exit(True);
+  Result := False;
+end;
+
+function ExprSafeForRegisterParameters(E: TExpr): Boolean;
+var
+  I: LongInt;
+begin
+  if E = nil then Exit(True);
+  if IsFloatingType(E.CType) or IsAggregateType(E.CType) then Exit(False);
+  case E.Kind of
+    ekInteger, ekVariable, ekUnary, ekBinary, ekAssign, ekConditional,
+    ekCast, ekComma, ekSizeof, ekAlignof, ekNullptr, ekPreInc, ekPreDec,
+    ekPostInc, ekPostDec:
+      ;
+  else
+    Exit(False);
+  end;
+  if not ExprSafeForRegisterParameters(E.Left) or
+     not ExprSafeForRegisterParameters(E.Right) or
+     not ExprSafeForRegisterParameters(E.Third) then Exit(False);
+  for I := 0 to High(E.Args) do
+    if not ExprSafeForRegisterParameters(E.Args[I]) then Exit(False);
+  Result := True;
+end;
+
+function StmtSafeForRegisterParameters(S: TStmt): Boolean;
+var
+  I: LongInt;
+begin
+  if S = nil then Exit(True);
+  if S.Kind = skAsm then Exit(False);
+  if (S.Kind = skDecl) and
+     not (IsIntegerType(S.CType) or IsPointerType(S.CType)) then Exit(False);
+  if not ExprSafeForRegisterParameters(S.Expr) or
+     not ExprSafeForRegisterParameters(S.Expr2) or
+     not StmtSafeForRegisterParameters(S.InitStmt) or
+     not StmtSafeForRegisterParameters(S.Body) or
+     not StmtSafeForRegisterParameters(S.ElseBody) then Exit(False);
+  for I := 0 to High(S.Children) do
+    if not StmtSafeForRegisterParameters(S.Children[I]) then Exit(False);
+  Result := True;
+end;
+
 constructor TX64Backend.Create(AProgram: TProgram;
   const AOptions: TCompilerOptions);
 begin
@@ -456,6 +714,8 @@ begin
   FText := TByteBuffer.Create;
   FData := TByteBuffer.Create;
   FListing := TStringList.Create;
+  FFunctionIndex := TNameIndex.Create(128);
+  FGlobalLabelIndex := TNameIndex.Create(128);
   FCurrentIsVariadic := False;
   FCurrentVarArgSaveOffset := 0;
   FCurrentVarArgGPOffset := 0;
@@ -465,6 +725,8 @@ end;
 
 destructor TX64Backend.Destroy;
 begin
+  FGlobalLabelIndex.Free;
+  FFunctionIndex.Free;
   FListing.Free;
   FData.Free;
   FText.Free;
@@ -517,73 +779,6 @@ begin
   if FDataAddressFixupCapacity = 0 then FDataAddressFixupCapacity := 1024
   else FDataAddressFixupCapacity := FDataAddressFixupCapacity * 2;
   SetLength(FDataAddressFixups, FDataAddressFixupCapacity);
-end;
-
-procedure TX64Backend.FunctionHashEnsureCapacity;
-var
-  OldNames: array of string;
-  OldValues: array of LongInt;
-  OldSize, I, J, K: LongInt;
-begin
-  if FFunctionHashSize = 0 then FFunctionHashSize := 1024;
-  while FFunctionHashCount * 2 > FFunctionHashSize do
-    FFunctionHashSize := FFunctionHashSize * 2;
-  OldSize := Length(FFunctionHashNames);
-  if OldSize >= FFunctionHashSize then Exit;
-  OldNames := FFunctionHashNames;
-  OldValues := FFunctionHashValues;
-  SetLength(FFunctionHashNames, 0);
-  SetLength(FFunctionHashValues, 0);
-  SetLength(FFunctionHashNames, FFunctionHashSize);
-  SetLength(FFunctionHashValues, FFunctionHashSize);
-  FFunctionHashCount := 0;
-  for I := 0 to OldSize - 1 do
-    if OldNames[I] <> '' then
-    begin
-      K := 2166136261 + Ord(OldNames[I][1]);
-      for J := 2 to Length(OldNames[I]) do
-        K := (K xor Ord(OldNames[I][J])) * 16777619;
-      K := K and (FFunctionHashSize - 1);
-      while FFunctionHashNames[K] <> '' do
-        K := (K + 1) and (FFunctionHashSize - 1);
-      FFunctionHashNames[K] := OldNames[I];
-      FFunctionHashValues[K] := OldValues[I];
-      Inc(FFunctionHashCount);
-    end;
-end;
-
-procedure TX64Backend.FunctionHashInsert(const AName: string; AValue: LongInt);
-var
-  K, J: LongInt;
-begin
-  FunctionHashEnsureCapacity;
-  K := 2166136261 + Ord(AName[1]);
-  for J := 2 to Length(AName) do
-    K := (K xor Ord(AName[J])) * 16777619;
-  K := K and (FFunctionHashSize - 1);
-  while FFunctionHashNames[K] <> '' do
-    K := (K + 1) and (FFunctionHashSize - 1);
-  FFunctionHashNames[K] := AName;
-  FFunctionHashValues[K] := AValue;
-  Inc(FFunctionHashCount);
-end;
-
-function TX64Backend.FunctionHashLookup(const AName: string): LongInt;
-var
-  K, J: LongInt;
-begin
-  Result := -1;
-  if FFunctionHashSize = 0 then Exit;
-  K := 2166136261 + Ord(AName[1]);
-  for J := 2 to Length(AName) do
-    K := (K xor Ord(AName[J])) * 16777619;
-  K := K and (FFunctionHashSize - 1);
-  while FFunctionHashNames[K] <> '' do
-  begin
-    if FFunctionHashNames[K] = AName then
-      Exit(FFunctionHashValues[K]);
-    K := (K + 1) and (FFunctionHashSize - 1);
-  end;
 end;
 
 function TX64Backend.NewLabel: LongInt;
@@ -947,15 +1142,8 @@ begin
 end;
 
 function TX64Backend.FindFunctionLabel(const AName: string): LongInt;
-var
-  I: LongInt;
 begin
-  if FFunctionHashSize = 0 then
-  begin
-    for I := 0 to High(FFunctions) do
-      FunctionHashInsert(FFunctions[I].Name, FFunctions[I].LabelID);
-  end;
-  Result := FunctionHashLookup(AName);
+  Result := FFunctionIndex.GetOrDefault(AName, -1);
 end;
 
 function TX64Backend.FindNamedLabel(const AList: array of TNamedLabel;
@@ -1715,15 +1903,12 @@ var
   I: LongInt;
   Declared: Boolean;
 begin
+  { Function declarations are indexed by TProgram.  This path is reached for
+    every unresolved call while emitting a translation unit, so a linear scan
+    here turned external-call-heavy files into another avoidable O(n^2) case. }
+  Declared := FProgram.FindFunctionIndex(AName) >= 0;
   if FOptions.EmitMode = emObject then
   begin
-    Declared := False;
-    for I := 0 to High(FProgram.Functions) do
-      if FProgram.Functions[I].Name = AName then
-      begin
-        Declared := True;
-        Break;
-      end;
     if not Declared then
     begin
       RaiseCompileError(APos, 'call to undeclared function ''' + AName + '''');
@@ -1750,13 +1935,6 @@ begin
     Exit;
   end;
 
-  Declared := False;
-  for I := 0 to High(FProgram.Functions) do
-    if FProgram.Functions[I].Name = AName then
-    begin
-      Declared := True;
-      Break;
-    end;
   if not Declared then
   begin
     RaiseCompileError(APos, 'call to undeclared function ''' + AName + '''');
@@ -2114,15 +2292,36 @@ end;
 function TX64Backend.TryLoadOperandToRcx(E: TExpr;
   const ALocalType: TCType): Boolean;
 var
-  TargetOffset, TargetLabel: LongInt;
+  TargetOffset, TargetLabel, RegisterOrdinal: LongInt;
+  RegisterType, ExistingType: TCType;
+  ImmediateValue: Int64;
+  IndirectLocal: Boolean;
 begin
   Result := False;
   if FOptions.OptimizationLevel < 1 then Exit;
   if E = nil then Exit;
+  if (E.Kind = ekInteger) and IsIntegerType(ALocalType) then
+  begin
+    ImmediateValue := ConvertIntegerValue(E.IntValue, ALocalType);
+    EmitMovRcxImm(ImmediateValue);
+    InvalidateRaxState;
+    Exit(True);
+  end;
   if IsFloatingType(E.CType) or IsFloatingType(ALocalType) then Exit;
   if StorageSize(E.CType) <> StorageSize(ALocalType) then Exit;
   if E.CType.IsUnsigned <> ALocalType.IsUnsigned then Exit;
   if E.CType.Kind = ctBool then Exit;
+  if E.Kind = ekVariable then
+  begin
+    { A stack local may shadow a register-resident parameter. }
+    if not FindLocal(E.Text, TargetOffset, ExistingType, IndirectLocal) and
+       FindRegisterLocal(E.Text, RegisterOrdinal, RegisterType) then
+    begin
+      if StorageSize(RegisterType) <> 8 then Exit(False);
+      EmitLoadRegisterLocalToRcx(RegisterOrdinal, RegisterType);
+      Exit(True);
+    end;
+  end;
   if not TryResolveDirectTarget(E, TargetOffset, TargetLabel) then Exit;
   if TargetLabel >= 0 then EmitLoadMemoryTyped(E.CType, $0D, 0, TargetLabel)
   else EmitLoadMemoryTyped(E.CType, $8D, -TargetOffset, -1);
@@ -2399,17 +2598,121 @@ begin
     while U > 1 do begin U := U shr 1; Inc(Shift); end;
 end;
 
+function RotateOperandSafe(E: TExpr): Boolean;
+begin
+  if E = nil then Exit(True);
+  if E.CType.IsVolatile then Exit(False);
+  case E.Kind of
+    ekInteger:
+      Result := True;
+    ekVariable:
+      Result := not E.CType.IsVolatile;
+    ekUnary, ekCast:
+      Result := RotateOperandSafe(E.Left);
+    ekBinary:
+      Result := RotateOperandSafe(E.Left) and RotateOperandSafe(E.Right);
+  else
+    { Calls, assignments, increments, dereferences and address expressions can
+      observe state, produce side effects, or access volatile storage. }
+    Result := False;
+  end;
+end;
+
+function SameRotateOperand(A, B: TExpr): Boolean;
+begin
+  if (A = nil) or (B = nil) then Exit(A = B);
+  if not RotateOperandSafe(A) or not RotateOperandSafe(B) then Exit(False);
+  if (A.Kind <> B.Kind) or not TypesEqual(A.CType, B.CType) then Exit(False);
+  case A.Kind of
+    ekInteger:
+      Result := A.IntValue = B.IntValue;
+    ekVariable:
+      Result := A.Text = B.Text;
+    ekUnary:
+      Result := (A.UnaryOp = B.UnaryOp) and
+        SameRotateOperand(A.Left, B.Left);
+    ekBinary:
+      Result := (A.BinaryOp = B.BinaryOp) and
+        SameRotateOperand(A.Left, B.Left) and
+        SameRotateOperand(A.Right, B.Right);
+    ekCast:
+      Result := SameRotateOperand(A.Left, B.Left);
+  else
+    Result := False;
+  end;
+end;
+
+function TryMatchRotate(E: TExpr; out AValue: TExpr;
+  out ACount: Byte; out ARotateLeft: Boolean): Boolean;
+var
+  LeftShift, RightShift: TExpr;
+  LeftCount, RightCount, Width: Int64;
+begin
+  Result := False;
+  AValue := nil;
+  ACount := 0;
+  ARotateLeft := True;
+  if (E = nil) or (E.Kind <> ekBinary) or
+     not (E.BinaryOp in [boBitOr, boBitXor]) then Exit;
+  Width := StorageSize(E.CType) * 8;
+  if (Width <> 32) and (Width <> 64) then Exit;
+
+  if (E.Left <> nil) and (E.Left.Kind = ekBinary) and
+     (E.Left.BinaryOp = boShiftLeft) and
+     (E.Right <> nil) and (E.Right.Kind = ekBinary) and
+     (E.Right.BinaryOp = boShiftRight) then
+  begin
+    LeftShift := E.Left;
+    RightShift := E.Right;
+    ARotateLeft := True;
+  end
+  else if (E.Left <> nil) and (E.Left.Kind = ekBinary) and
+          (E.Left.BinaryOp = boShiftRight) and
+          (E.Right <> nil) and (E.Right.Kind = ekBinary) and
+          (E.Right.BinaryOp = boShiftLeft) then
+  begin
+    RightShift := E.Left;
+    LeftShift := E.Right;
+    ARotateLeft := False;
+  end
+  else
+    Exit;
+
+  if (LeftShift.Right = nil) or (RightShift.Right = nil) or
+     (LeftShift.Right.Kind <> ekInteger) or
+     (RightShift.Right.Kind <> ekInteger) or
+     not SameRotateOperand(LeftShift.Left, RightShift.Left) or
+     not RightShift.OperationType.IsUnsigned then Exit;
+  LeftCount := LeftShift.Right.IntValue mod Width;
+  RightCount := RightShift.Right.IntValue mod Width;
+  if LeftCount < 0 then Inc(LeftCount, Width);
+  if RightCount < 0 then Inc(RightCount, Width);
+  if (LeftCount = 0) or (RightCount = 0) or
+     (LeftCount + RightCount <> Width) then Exit;
+
+  AValue := LeftShift.Left;
+  if ARotateLeft then ACount := Byte(LeftCount)
+  else ACount := Byte(RightCount);
+  Result := True;
+end;
+
 procedure TX64Backend.EmitImmediateOperation(AOp: TBinaryOp; V: Int64;
   AUnsigned: Boolean; out AHandled: Boolean);
 var
   Shift: Byte;
+  Divisor, Mask: Int64;
+  NegativeDivisor: Boolean;
 begin
   AHandled := False;
   if (V < Low(LongInt)) or (V > High(LongInt)) then Exit;
   case AOp of
     boAdd:
       begin
-        if FOptions.OptimizeSize and (V >= -128) and (V <= 127) then
+        if V = 0 then
+        begin
+          { Identity operation: emit nothing. }
+        end
+        else if (V >= -128) and (V <= 127) then
           FText.AddBytes([$48, $83, $C0, Byte(LongWord(V) and $FF)])
         else
         begin
@@ -2420,7 +2723,11 @@ begin
       end;
     boSub:
       begin
-        if FOptions.OptimizeSize and (V >= -128) and (V <= 127) then
+        if V = 0 then
+        begin
+          { Identity operation: emit nothing. }
+        end
+        else if (V >= -128) and (V <= 127) then
           FText.AddBytes([$48, $83, $E8, Byte(LongWord(V) and $FF)])
         else
         begin
@@ -2431,7 +2738,13 @@ begin
       end;
     boBitAnd:
       begin
-        if FOptions.OptimizeSize and (V >= -128) and (V <= 127) then
+        if V = -1 then
+        begin
+          { Identity operation: emit nothing. }
+        end
+        else if V = 0 then
+          FText.AddBytes([$31, $C0])
+        else if (V >= -128) and (V <= 127) then
           FText.AddBytes([$48, $83, $E0, Byte(LongWord(V) and $FF)])
         else
         begin
@@ -2442,7 +2755,11 @@ begin
       end;
     boBitOr:
       begin
-        if FOptions.OptimizeSize and (V >= -128) and (V <= 127) then
+        if V = 0 then
+        begin
+          { Identity operation: emit nothing. }
+        end
+        else if (V >= -128) and (V <= 127) then
           FText.AddBytes([$48, $83, $C8, Byte(LongWord(V) and $FF)])
         else
         begin
@@ -2453,7 +2770,13 @@ begin
       end;
     boBitXor:
       begin
-        if FOptions.OptimizeSize and (V >= -128) and (V <= 127) then
+        if V = 0 then
+        begin
+          { Identity operation: emit nothing. }
+        end
+        else if V = -1 then
+          FText.AddBytes([$48, $F7, $D0])
+        else if (V >= -128) and (V <= 127) then
           FText.AddBytes([$48, $83, $F0, Byte(LongWord(V) and $FF)])
         else
         begin
@@ -2464,27 +2787,34 @@ begin
       end;
     boMul:
       begin
-        if (FOptions.OptimizationLevel >= 2) and IsPowerOfTwo(V, Shift) then
+        if (FOptions.OptimizationLevel >= 1) and (V = 0) then
+        begin
+          FText.AddBytes([$31, $C0]);
+          AHandled := True;
+        end
+        else if (FOptions.OptimizationLevel >= 1) and (V = 1) then
+          AHandled := True
+        else if (FOptions.OptimizationLevel >= 1) and IsPowerOfTwo(V, Shift) then
         begin
           if Shift > 0 then FText.AddBytes([$48, $C1, $E0, Shift]);
           AHandled := True;
         end
-        else if (FOptions.OptimizationLevel >= 3) and (V = -1) then
+        else if (FOptions.OptimizationLevel >= 1) and (V = -1) then
         begin
           FText.AddBytes([$48, $F7, $D8]);
           AHandled := True;
         end
-        else if (FOptions.OptimizationLevel >= 3) and (V = 3) then
+        else if (FOptions.OptimizationLevel >= 1) and (V = 3) then
         begin
           FText.AddBytes([$48, $8D, $04, $40]);
           AHandled := True;
         end
-        else if (FOptions.OptimizationLevel >= 3) and (V = 5) then
+        else if (FOptions.OptimizationLevel >= 1) and (V = 5) then
         begin
           FText.AddBytes([$48, $8D, $04, $80]);
           AHandled := True;
         end
-        else if (FOptions.OptimizationLevel >= 3) and (V = 9) then
+        else if (FOptions.OptimizationLevel >= 1) and (V = 9) then
         begin
           FText.AddBytes([$48, $8D, $04, $C0]);
           AHandled := True;
@@ -2498,41 +2828,111 @@ begin
       end;
     boDiv:
       begin
-        if (FOptions.OptimizationLevel >= 2) and AUnsigned and
-           IsPowerOfTwo(V, Shift) then
+        if FOptions.OptimizationLevel < 1 then Exit;
+        if AUnsigned then
         begin
-          if Shift > 0 then FText.AddBytes([$48, $C1, $E8, Shift]);
-          AHandled := True;
+          if IsPowerOfTwo(V, Shift) then
+          begin
+            if Shift > 0 then FText.AddBytes([$48, $C1, $E8, Shift]);
+            AHandled := True;
+          end;
+          Exit;
         end;
+        if V = -1 then
+        begin
+          FText.AddBytes([$48, $F7, $D8]);
+          AHandled := True;
+          Exit;
+        end;
+        NegativeDivisor := V < 0;
+        if NegativeDivisor then Divisor := -V else Divisor := V;
+        if not IsPowerOfTwo(Divisor, Shift) then Exit;
+        if Shift > 0 then
+        begin
+          Mask := Divisor - 1;
+          FText.AddBytes([$48, $89, $C2]);       { mov rdx,rax }
+          FText.AddBytes([$48, $C1, $FA, $3F]); { sar rdx,63 }
+          if Mask <= 127 then
+            FText.AddBytes([$48, $83, $E2, Byte(Mask)])
+          else
+          begin
+            FText.AddBytes([$48, $81, $E2]);
+            FText.AddI32(LongInt(Mask));
+          end;
+          FText.AddBytes([$48, $01, $D0]);       { add rax,rdx }
+          FText.AddBytes([$48, $C1, $F8, Shift]);
+        end;
+        if NegativeDivisor then FText.AddBytes([$48, $F7, $D8]);
+        AHandled := True;
       end;
     boMod:
       begin
-        if (FOptions.OptimizationLevel >= 2) and AUnsigned and
-           IsPowerOfTwo(V, Shift) then
+        if FOptions.OptimizationLevel < 1 then Exit;
+        if AUnsigned then
         begin
-          if V = 1 then FText.AddBytes([$31, $C0])
-          else if (V - 1) <= 127 then
-            FText.AddBytes([$48, $83, $E0, Byte(V - 1)])
+          if IsPowerOfTwo(V, Shift) then
+          begin
+            if V = 1 then FText.AddBytes([$31, $C0])
+            else if (V - 1) <= 127 then
+              FText.AddBytes([$48, $83, $E0, Byte(V - 1)])
+            else
+            begin
+              FText.AddBytes([$48, $25]);
+              FText.AddI32(LongInt(V - 1));
+            end;
+            AHandled := True;
+          end;
+          Exit;
+        end;
+        if V < 0 then Divisor := -V else Divisor := V;
+        if not IsPowerOfTwo(Divisor, Shift) then Exit;
+        if Shift = 0 then
+          FText.AddBytes([$31, $C0])
+        else
+        begin
+          Mask := Divisor - 1;
+          FText.AddBytes([$48, $89, $C2]);       { original in rdx }
+          FText.AddBytes([$48, $89, $C1]);       { bias source in rcx }
+          FText.AddBytes([$48, $C1, $F9, $3F]); { sar rcx,63 }
+          if Mask <= 127 then
+            FText.AddBytes([$48, $83, $E1, Byte(Mask)])
           else
           begin
-            FText.AddBytes([$48, $25]);
-            FText.AddI32(LongInt(V - 1));
+            FText.AddBytes([$48, $81, $E1]);
+            FText.AddI32(LongInt(Mask));
           end;
-          AHandled := True;
+          FText.AddBytes([$48, $01, $C8]);       { add rax,rcx }
+          FText.AddBytes([$48, $C1, $F8, Shift]);
+          FText.AddBytes([$48, $C1, $E0, Shift]);
+          FText.AddBytes([$48, $29, $C2]);       { sub rdx,rax }
+          FText.AddBytes([$48, $89, $D0]);       { mov rax,rdx }
         end;
+        AHandled := True;
       end;
     boShiftLeft:
-      begin FText.AddBytes([$48, $C1, $E0, Byte(V and 63)]); AHandled := True; end;
+      begin
+        if (V and 63) <> 0 then
+          FText.AddBytes([$48, $C1, $E0, Byte(V and 63)]);
+        AHandled := True;
+      end;
     boShiftRight:
       begin
-        if AUnsigned then FText.AddBytes([$48, $C1, $E8, Byte(V and 63)])
-        else FText.AddBytes([$48, $C1, $F8, Byte(V and 63)]);
+        if (V and 63) <> 0 then
+          if AUnsigned then FText.AddBytes([$48, $C1, $E8, Byte(V and 63)])
+          else FText.AddBytes([$48, $C1, $F8, Byte(V and 63)]);
         AHandled := True;
       end;
     boEqual, boNotEqual, boLess, boLessEqual, boGreater, boGreaterEqual:
       begin
-        FText.AddBytes([$48, $3D]);
-        FText.AddI32(LongInt(V));
+        if V = 0 then
+          FText.AddBytes([$48, $85, $C0])
+        else if (V >= -128) and (V <= 127) then
+          FText.AddBytes([$48, $83, $F8, Byte(LongWord(V) and $FF)])
+        else
+        begin
+          FText.AddBytes([$48, $3D]);
+          FText.AddI32(LongInt(V));
+        end;
         case AOp of
           boEqual: EmitSetCC($94);
           boNotEqual: EmitSetCC($95);
@@ -3276,7 +3676,7 @@ begin
   begin
     G := FProgram.Globals[I];
     if G.IsExtern then Continue;
-    if FindNamedLabel(FGlobals, G.Name) >= 0 then
+    if FGlobalLabelIndex.GetOrDefault(G.Name, -1) >= 0 then
       RaiseCompileError(G.Pos, 'duplicate global ''' + G.Name + '''');
     L := NewLabel;
     if G.Initializer = nil then
@@ -3297,6 +3697,7 @@ begin
     SetLength(FGlobals, N + 1);
     FGlobals[N].Name := G.Name;
     FGlobals[N].LabelID := L;
+    FGlobalLabelIndex.Put(G.Name, L);
   end;
 end;
 
@@ -3309,15 +3710,14 @@ begin
   begin
     F := FProgram.Functions[I];
     if F.IsPrototype then Continue;
-    FunctionHashEnsureCapacity;
-    if FunctionHashLookup(F.Name) >= 0 then
+    if FFunctionIndex.GetOrDefault(F.Name, -1) >= 0 then
       RaiseCompileError(F.Pos, 'duplicate function definition ''' + F.Name + '''');
     L := NewLabel;
     N := Length(FFunctions);
     SetLength(FFunctions, N + 1);
     FFunctions[N].Name := F.Name;
     FFunctions[N].LabelID := L;
-    FunctionHashInsert(F.Name, L);
+    FFunctionIndex.Put(F.Name, L);
   end;
 end;
 
@@ -4527,7 +4927,8 @@ var
 begin
   if S = nil then Exit(0);
   Result := 0;
-  if S.Kind = skDecl then
+  if (S.Kind = skDecl) and not S.IsStatic and
+     not FindRegisterPlan(S.Name, I) then
   begin
     Size := StorageSize(S.CType);
     if IsAggregateType(S.CType) then
@@ -4597,6 +4998,188 @@ begin
   FLocals[N].ScopeDepth := FScopeDepth;
 end;
 
+procedure TX64Backend.PlanRegisterLocals(F: TFunction);
+var
+  Candidates: TRegisterCandidateArray;
+  I, J, BestIndex, BestScore, N, MaxPlans, MinimumScore: LongInt;
+  ParameterConflict: Boolean;
+begin
+  SetLength(FRegisterPlans, 0);
+  FRegisterSaveCount := 0;
+  FUsingCalleeSavedLocals := False;
+  if (F = nil) or (FOptions.OptimizationLevel < 1) or
+     FOptions.DebugInfo or F.IsVariadic then Exit;
+  if FOptions.SizeOptimizationLevel > 0 then
+  begin
+    MaxPlans := 2;
+    MinimumScore := 10;
+  end
+  else if FOptions.OptimizationLevel = 1 then
+  begin
+    MaxPlans := 3;
+    MinimumScore := 5;
+  end
+  else
+  begin
+    MaxPlans := 4;
+    MinimumScore := 3;
+  end;
+
+  SetLength(Candidates, 0);
+  CollectRegisterCandidates(F.Body, Candidates);
+  ScoreRegisterStmt(F.Body, 0, Candidates);
+  for I := 0 to High(Candidates) do
+  begin
+    ParameterConflict := False;
+    for J := 0 to High(F.Params) do
+      if F.Params[J].Name = Candidates[I].Name then
+      begin
+        ParameterConflict := True;
+        Break;
+      end;
+    if ParameterConflict then Candidates[I].Unsafe := True;
+  end;
+
+  { r12-r15 are callee-saved under the SysV ABI and are otherwise unused by
+    the compact expression emitter.  A weighted use count favors induction
+    variables and loop-carried state without requiring a full SSA allocator. }
+  for J := 0 to MaxPlans - 1 do
+  begin
+    BestIndex := -1;
+    BestScore := MinimumScore - 1;
+    for I := 0 to High(Candidates) do
+      if not Candidates[I].Selected and not Candidates[I].Unsafe and
+         not Candidates[I].AddressTaken and
+         (Candidates[I].DeclarationCount = 1) and
+         (Candidates[I].Score > BestScore) and
+         (((FOptions.SizeOptimizationLevel > 0) and
+           (Candidates[I].LoopScore > 0) and
+           (Candidates[I].Score >= MinimumScore)) or
+          ((FOptions.SizeOptimizationLevel = 0) and
+           ((Candidates[I].Score >= MinimumScore) or
+            ((FOptions.OptimizationLevel >= 2) and
+             (Candidates[I].LoopScore > 0) and
+             (Candidates[I].Score > 1))))) then
+      begin
+        BestIndex := I;
+        BestScore := Candidates[I].Score;
+      end;
+    if BestIndex < 0 then Break;
+    Candidates[BestIndex].Selected := True;
+    N := Length(FRegisterPlans);
+    SetLength(FRegisterPlans, N + 1);
+    FRegisterPlans[N].Name := Candidates[BestIndex].Name;
+    FRegisterPlans[N].CType := Candidates[BestIndex].CType;
+    FRegisterPlans[N].RegisterOrdinal := 2 + N;
+  end;
+  if Length(FRegisterPlans) > 0 then
+  begin
+    if Length(FRegisterPlans) <= 2 then FRegisterSaveCount := 2
+    else FRegisterSaveCount := 4;
+  end;
+  FUsingCalleeSavedLocals := FRegisterSaveCount > 0;
+end;
+
+function TX64Backend.FindRegisterPlan(const AName: string;
+  out ARegisterOrdinal: LongInt): Boolean;
+var
+  I: LongInt;
+begin
+  for I := 0 to High(FRegisterPlans) do
+    if FRegisterPlans[I].Name = AName then
+    begin
+      ARegisterOrdinal := FRegisterPlans[I].RegisterOrdinal;
+      Exit(True);
+    end;
+  ARegisterOrdinal := -1;
+  Result := False;
+end;
+
+procedure TX64Backend.AddRegisterLocal(const AName: string;
+  const AType: TCType; ARegisterOrdinal: LongInt);
+var
+  I, N: LongInt;
+begin
+  for I := High(FRegisterLocals) downto 0 do
+    if (FRegisterLocals[I].Name = AName) and
+       (FRegisterLocals[I].ScopeDepth = FScopeDepth) then
+      RaiseCompileError(FCurrentDeclPos,
+        'duplicate local variable ''' + AName + '''');
+  N := Length(FRegisterLocals);
+  SetLength(FRegisterLocals, N + 1);
+  FRegisterLocals[N].Name := AName;
+  FRegisterLocals[N].CType := AType;
+  FRegisterLocals[N].RegisterOrdinal := ARegisterOrdinal;
+  FRegisterLocals[N].ScopeDepth := FScopeDepth;
+end;
+
+function TX64Backend.FindRegisterLocal(const AName: string;
+  out ARegisterOrdinal: LongInt; out AType: TCType): Boolean;
+var
+  I: LongInt;
+begin
+  for I := High(FRegisterLocals) downto 0 do
+    if FRegisterLocals[I].Name = AName then
+    begin
+      ARegisterOrdinal := FRegisterLocals[I].RegisterOrdinal;
+      AType := FRegisterLocals[I].CType;
+      Exit(True);
+    end;
+  ARegisterOrdinal := -1;
+  AType := MakeType(ctInt);
+  Result := False;
+end;
+
+procedure TX64Backend.EmitLoadRegisterLocalToRax(ARegisterOrdinal: LongInt;
+  const AType: TCType);
+begin
+  case ARegisterOrdinal of
+    0: FText.AddBytes([$48, $89, $F8]); { mov rax,rdi }
+    1: FText.AddBytes([$48, $89, $F0]); { mov rax,rsi }
+    2: FText.AddBytes([$4C, $89, $E0]); { mov rax,r12 }
+    3: FText.AddBytes([$4C, $89, $E8]); { mov rax,r13 }
+    4: FText.AddBytes([$4C, $89, $F0]); { mov rax,r14 }
+    5: FText.AddBytes([$4C, $89, $F8]); { mov rax,r15 }
+  else
+    raise ERCCError.Create('internal error: unsupported resident register');
+  end;
+  EmitNormalizeInteger(AType);
+end;
+
+procedure TX64Backend.EmitLoadRegisterLocalToRcx(ARegisterOrdinal: LongInt;
+  const AType: TCType);
+begin
+  case ARegisterOrdinal of
+    0: FText.AddBytes([$48, $89, $F9]); { mov rcx,rdi }
+    1: FText.AddBytes([$48, $89, $F1]); { mov rcx,rsi }
+    2: FText.AddBytes([$4C, $89, $E1]); { mov rcx,r12 }
+    3: FText.AddBytes([$4C, $89, $E9]); { mov rcx,r13 }
+    4: FText.AddBytes([$4C, $89, $F1]); { mov rcx,r14 }
+    5: FText.AddBytes([$4C, $89, $F9]); { mov rcx,r15 }
+  else
+    raise ERCCError.Create('internal error: unsupported resident register');
+  end;
+  { Register locals are normalized when written. }
+  InvalidateRaxState;
+end;
+
+procedure TX64Backend.EmitStoreRaxToRegisterLocal(ARegisterOrdinal: LongInt;
+  const AType: TCType);
+begin
+  EmitNormalizeInteger(AType);
+  case ARegisterOrdinal of
+    0: FText.AddBytes([$48, $89, $C7]); { mov rdi,rax }
+    1: FText.AddBytes([$48, $89, $C6]); { mov rsi,rax }
+    2: FText.AddBytes([$49, $89, $C4]); { mov r12,rax }
+    3: FText.AddBytes([$49, $89, $C5]); { mov r13,rax }
+    4: FText.AddBytes([$49, $89, $C6]); { mov r14,rax }
+    5: FText.AddBytes([$49, $89, $C7]); { mov r15,rax }
+  else
+    raise ERCCError.Create('internal error: unsupported resident register');
+  end;
+  { The assignment expression still yields the normalized value in rax. }
+end;
+
 function TX64Backend.FindLocal(const AName: string; out AOffset: LongInt;
   out AType: TCType; out AIndirectObject: Boolean): Boolean;
 var
@@ -4618,18 +5201,14 @@ end;
 
 function TX64Backend.FindGlobalLabel(const AName: string): LongInt;
 begin
-  Result := FindNamedLabel(FGlobals, AName);
+  Result := FGlobalLabelIndex.GetOrDefault(AName, -1);
   if Result < 0 then
     Result := FindExternalDefinition(AName, ELF_STT_OBJECT);
 end;
 
 function TX64Backend.FindGlobal(const AName: string): TGlobal;
-var
-  I: LongInt;
 begin
-  for I := High(FProgram.Globals) downto 0 do
-    if FProgram.Globals[I].Name = AName then Exit(FProgram.Globals[I]);
-  Result := nil;
+  Result := FProgram.FindGlobal(AName);
 end;
 
 procedure TX64Backend.EnterScope;
@@ -4640,6 +5219,9 @@ end;
 procedure TX64Backend.LeaveScope(ASavedCount: LongInt);
 begin
   SetLength(FLocals, ASavedCount);
+  while (Length(FRegisterLocals) > 0) and
+        (FRegisterLocals[High(FRegisterLocals)].ScopeDepth >= FScopeDepth) do
+    SetLength(FRegisterLocals, Length(FRegisterLocals) - 1);
   Dec(FScopeDepth);
 end;
 
@@ -4945,6 +5527,9 @@ begin
         end
         else
         begin
+          if FindRegisterLocal(E.Text, L, LocalType) then
+            RaiseCompileError(E.Pos,
+              'internal error: addressable parameter was kept in a register');
           L := FindStaticLocalLabel(E.Text);
           if L < 0 then L := FindGlobalLabel(E.Text);
           if L >= 0 then EmitAddressGlobal(L)
@@ -5071,18 +5656,25 @@ begin
     boGreaterEqual: if Unsigned then AJccOpcode := $83 else AJccOpcode := $8D;
   end;
 
-  if (FOptions.OptimizationLevel >= 1) and (E.Right.Kind = ekInteger) and
-     (not IsIntegerType(LocalType) or
-       ((StorageSize(E.Right.CType) = StorageSize(LocalType)) and
-        (E.Right.CType.IsUnsigned = LocalType.IsUnsigned))) then
+  if (FOptions.OptimizationLevel >= 1) and (E.Right.Kind = ekInteger) then
   begin
-    Value := E.Right.IntValue;
+    if IsIntegerType(LocalType) then
+      Value := ConvertIntegerValue(E.Right.IntValue, LocalType)
+    else
+      Value := E.Right.IntValue;
     if (Value >= Low(LongInt)) and (Value <= High(LongInt)) then
     begin
       GenExpr(E.Left);
       if IsIntegerType(LocalType) then EmitNormalizeInteger(LocalType);
-      FText.AddBytes([$48, $3D]);
-      FText.AddI32(LongInt(Value));
+      if Value = 0 then
+        FText.AddBytes([$48, $85, $C0])
+      else if (Value >= -128) and (Value <= 127) then
+        FText.AddBytes([$48, $83, $F8, Byte(LongWord(Value) and $FF)])
+      else
+      begin
+        FText.AddBytes([$48, $3D]);
+        FText.AddI32(LongInt(Value));
+      end;
       Exit(True);
     end;
   end;
@@ -5181,9 +5773,112 @@ end;
 procedure TX64Backend.GenAssignment(E: TExpr);
 var
   Op: TBinaryOp;
-  L, Pad, Scale, TargetOffset, TargetLabel: LongInt;
-  Indirect, Direct: Boolean;
+  L, Pad, Scale, TargetOffset, TargetLabel, RegisterOrdinal,
+    LocalOffset: LongInt;
+  ImmediateValue, ShiftValue: Int64;
+  Indirect, Direct, IndirectLocal, Handled: Boolean;
+  LocalType, RegisterType: TCType;
+
+  function CompoundBinaryOp: TBinaryOp;
+  begin
+    case E.AssignOp of
+      aoAdd: Result := boAdd;
+      aoSub: Result := boSub;
+      aoMul: Result := boMul;
+      aoDiv: Result := boDiv;
+      aoMod: Result := boMod;
+      aoBitAnd: Result := boBitAnd;
+      aoBitOr: Result := boBitOr;
+      aoBitXor: Result := boBitXor;
+      aoShiftLeft: Result := boShiftLeft;
+      aoShiftRight: Result := boShiftRight;
+    else
+      Result := boAdd;
+    end;
+  end;
 begin
+  if (E.Left.Kind = ekVariable) and
+     not FindLocal(E.Left.Text, LocalOffset, LocalType, IndirectLocal) and
+     FindRegisterLocal(E.Left.Text, RegisterOrdinal, RegisterType) then
+  begin
+    if E.AssignOp = aoAssign then
+      GenExpr(E.Right)
+    else
+    begin
+      Op := CompoundBinaryOp;
+      { Fold x op= (x shift constant) without staging either operand.  This is
+        the common xorshift/bit-mixing form and remains valid for all promoted
+        non-volatile integer locals because the left object is evaluated once. }
+      if IsIntegerType(E.Left.CType) and
+         (E.AssignOp in [aoAdd, aoSub, aoBitAnd, aoBitOr, aoBitXor]) and
+         (E.Right <> nil) and (E.Right.Kind = ekBinary) and
+         (E.Right.BinaryOp in [boShiftLeft, boShiftRight]) and
+         (E.Right.Left <> nil) and (E.Right.Left.Kind = ekVariable) and
+         (E.Right.Left.Text = E.Left.Text) and
+         (E.Right.Right <> nil) and (E.Right.Right.Kind = ekInteger) then
+      begin
+        EmitLoadRegisterLocalToRax(RegisterOrdinal, RegisterType);
+        FText.AddBytes([$48, $89, $C1]); { mov rcx,rax }
+        ShiftValue := E.Right.Right.IntValue and 63;
+        if ShiftValue <> 0 then
+          if E.Right.BinaryOp = boShiftLeft then
+            FText.AddBytes([$48, $C1, $E1, Byte(ShiftValue)])
+          else if E.Right.OperationType.IsUnsigned then
+            FText.AddBytes([$48, $C1, $E9, Byte(ShiftValue)])
+          else
+            FText.AddBytes([$48, $C1, $F9, Byte(ShiftValue)]);
+        EmitBinaryOperation(Op, E.Left.CType.IsUnsigned);
+        EmitStoreRaxToRegisterLocal(RegisterOrdinal, E.Left.CType);
+        Exit;
+      end;
+
+      EmitLoadRegisterLocalToRax(RegisterOrdinal, RegisterType);
+      Scale := 1;
+      if IsPointerType(DecayType(E.Left.CType)) and
+         (E.AssignOp in [aoAdd, aoSub]) then
+      begin
+        { Pointer increments still require pointee scaling before combination. }
+        EmitPushRax;
+        GenExpr(E.Right);
+        Scale := StorageSize(PointeeType(DecayType(E.Left.CType)));
+        EmitScaleRax(Scale);
+        FText.AddBytes([$48, $89, $C1]);
+        FText.Add8($58);
+        Dec(FStackDepth, 8);
+        EmitBinaryOperation(Op, E.Left.CType.IsUnsigned);
+      end
+      else
+      begin
+        Handled := False;
+        if (E.Right <> nil) and (E.Right.Kind = ekInteger) and
+           IsIntegerType(E.Left.CType) then
+        begin
+          if Op in [boShiftLeft, boShiftRight] then
+            ImmediateValue := E.Right.IntValue
+          else
+            ImmediateValue := ConvertIntegerValue(E.Right.IntValue,
+              E.Left.CType);
+          EmitImmediateOperation(Op, ImmediateValue,
+            E.Left.CType.IsUnsigned, Handled);
+        end;
+        if not Handled then
+        begin
+          if not TryLoadOperandToRcx(E.Right, E.Left.CType) then
+          begin
+            EmitPushRax;
+            GenExpr(E.Right);
+            FText.AddBytes([$48, $89, $C1]);
+            FText.Add8($58);
+            Dec(FStackDepth, 8);
+          end;
+          EmitBinaryOperation(Op, E.Left.CType.IsUnsigned);
+        end;
+      end;
+    end;
+    EmitStoreRaxToRegisterLocal(RegisterOrdinal, E.Left.CType);
+    Exit;
+  end;
+
   if E.Left.IsBitField then
   begin
     GenAddress(E.Left);
@@ -5335,9 +6030,24 @@ end;
 
 procedure TX64Backend.GenIncDec(E: TExpr; ADelta: LongInt; APost: Boolean);
 var
-  Delta, TargetOffset, TargetLabel: LongInt;
-  OneType: TCType;
+  Delta, TargetOffset, TargetLabel, RegisterOrdinal, LocalOffset: LongInt;
+  OneType, LocalType, RegisterType: TCType;
+  IndirectLocal: Boolean;
 begin
+  if (E.Left.Kind = ekVariable) and
+     not FindLocal(E.Left.Text, LocalOffset, LocalType, IndirectLocal) and
+     FindRegisterLocal(E.Left.Text, RegisterOrdinal, RegisterType) then
+  begin
+    Delta := ADelta;
+    if E.IntValue > 1 then Delta := Delta * LongInt(E.IntValue);
+    EmitLoadRegisterLocalToRax(RegisterOrdinal, RegisterType);
+    if APost then FText.AddBytes([$48, $89, $C2]); { mov rdx,rax }
+    EmitAddRaxImmediate(Delta);
+    EmitStoreRaxToRegisterLocal(RegisterOrdinal, E.Left.CType);
+    if APost then FText.AddBytes([$48, $89, $D0]); { mov rax,rdx }
+    Exit;
+  end;
+
   if E.Left.IsBitField then
   begin
     GenAddress(E.Left);
@@ -5657,7 +6367,8 @@ var
   I, J, Size, Alignment, ReturnOffset, StackBytes, Pad, TotalStack,
     StackOffset, RegisterOrdinal, L, IntegerReturnIndex,
     SSEReturnIndex, CalleeOffset, FixedParameterCount: LongInt;
-  Indirect, ExpressionCall, Variadic: Boolean;
+  Indirect, ExpressionCall, Variadic, DirectSingleGP,
+    DirectCalleeRegister: Boolean;
   ExpectedType, ReturnType: TCType;
 
   function GPRegisterOrdinal(ARegisterNumber: LongInt): LongInt;
@@ -5761,9 +6472,7 @@ begin
     ReturnType := FunctionReturnTypeOf(AFunctionType);
     FixedParameterCount := FunctionParameterCount(AFunctionType);
     Variadic := FunctionIsVariadic(AFunctionType);
-    ReserveTemporary(8, 8, CalleeOffset);
-    GenExpr(E.Left);
-    EmitStoreLocal(CalleeOffset);
+    CalleeOffset := 0;
   end
   else
   begin
@@ -5793,9 +6502,34 @@ begin
   Layout := BuildFunctionABILayout(ReturnType, ParameterTypes,
     Variadic, FTarget);
   try
+    DirectSingleGP := False;
+    if (Length(E.Args) = 1) and not Variadic and
+       not Layout.UsesHiddenReturnPointer then
+      DirectSingleGP := not IsAggregateType(ParameterTypes[0]) and
+        not IsFloatingType(ParameterTypes[0]) and
+        (Layout.Parameters[0].Kind <> alkStack) and
+        (Length(Layout.Parameters[0].Parts) = 1) and
+        (Layout.Parameters[0].Parts[0].ValueClass = ascInteger);
+    { Preserve a simple indirect target in caller-scratch r11 while lowering a
+      call-free single argument.  This removes two frame accesses from common
+      function-table and callback dispatch without changing evaluation order. }
+    DirectCalleeRegister := ExpressionCall and DirectSingleGP and
+      not ExprContainsCall(E.Args[0]);
+    if ExpressionCall then
+    begin
+      GenExpr(E.Left);
+      if DirectCalleeRegister then
+        FText.AddBytes([$49, $89, $C3]) { mov r11,rax }
+      else
+      begin
+        ReserveTemporary(8, 8, CalleeOffset);
+        EmitStoreLocal(CalleeOffset);
+      end;
+    end;
     SetLength(StageOffsets, Length(E.Args));
     for I := 0 to High(E.Args) do
     begin
+      if DirectSingleGP then Continue;
       ExpectedType := ParameterTypes[I];
       if IsAggregateType(ExpectedType) then
       begin
@@ -5819,27 +6553,35 @@ begin
 
 
 
-    for I := 0 to High(E.Args) do
+    if DirectSingleGP then
     begin
-      ExpectedType := ParameterTypes[I];
-      if IsAggregateType(ExpectedType) then
+      GenExpr(E.Args[0]);
+      RegisterOrdinal := GPRegisterOrdinal(
+        Layout.Parameters[0].Parts[0].RegisterNumber);
+      EmitMoveRaxToArg(RegisterOrdinal);
+    end
+    else
+      for I := 0 to High(E.Args) do
       begin
-        GenExpr(E.Args[I]);
-        EmitCopyRaxToLocal(StageOffsets[I], StorageSize(ExpectedType));
-      end
-      else if IsFloatingType(ExpectedType) then
-      begin
-        GenExprAsFloating(E.Args[I], ExpectedType);
-        EmitAddressLocal(StageOffsets[I]);
-        FText.AddBytes([$48, $89, $C1]);
-        EmitStoreRaxAtRcx(ExpectedType);
-      end
-      else
-      begin
-        GenExpr(E.Args[I]);
-        EmitStoreLocal(StageOffsets[I]);
+        ExpectedType := ParameterTypes[I];
+        if IsAggregateType(ExpectedType) then
+        begin
+          GenExpr(E.Args[I]);
+          EmitCopyRaxToLocal(StageOffsets[I], StorageSize(ExpectedType));
+        end
+        else if IsFloatingType(ExpectedType) then
+        begin
+          GenExprAsFloating(E.Args[I], ExpectedType);
+          EmitAddressLocal(StageOffsets[I]);
+          FText.AddBytes([$48, $89, $C1]);
+          EmitStoreRaxAtRcx(ExpectedType);
+        end
+        else
+        begin
+          GenExpr(E.Args[I]);
+          EmitStoreLocal(StageOffsets[I]);
+        end;
       end;
-    end;
 
     StackBytes := LongInt(Layout.StackArgumentBytes);
     Pad := (16 - ((FStackDepth + StackBytes) and 15)) and 15;
@@ -5880,6 +6622,7 @@ begin
 
     for I := 0 to High(E.Args) do
     begin
+      if DirectSingleGP then Continue;
       Location := Layout.Parameters[I];
       if Location.Kind = alkStack then Continue;
       if IsAggregateType(ParameterTypes[I]) then
@@ -5914,8 +6657,11 @@ begin
 
     if ExpressionCall then
     begin
-      FText.AddBytes([$4C, $8B, $9D]);
-      FText.AddI32(-CalleeOffset);
+      if not DirectCalleeRegister then
+      begin
+        FText.AddBytes([$4C, $8B, $9D]);
+        FText.AddI32(-CalleeOffset);
+      end;
       FText.Add8($B8);
       FText.Add32(LongWord(Layout.FloatingRegistersUsed));
       FText.AddBytes([$41, $FF, $D3]);
@@ -6256,12 +7002,7 @@ begin
   if TryGenPlainPrintf(E) then Exit;
   CalleeDecl := nil;
   if E.Text <> '' then
-    for I := High(FProgram.Functions) downto 0 do
-      if FProgram.Functions[I].Name = E.Text then
-      begin
-        CalleeDecl := FProgram.Functions[I];
-        Break;
-      end;
+    CalleeDecl := FProgram.FindFunction(E.Text);
   if CalleeDecl <> nil then
   begin
     GenAggregateABICall(E, CalleeDecl, MakeType(ctVoid));
@@ -6410,12 +7151,22 @@ begin
     EmitPushRax;
   end;
 
-  for I := 0 to RegisterArgs - 1 do
+  if RegisterArgs = 1 then
   begin
-    GenerateArgument(I);
-    EmitPushRax;
+    { With one register argument there is no later argument evaluation that
+      can clobber it, so avoid the stage-to-stack/push/pop sequence. }
+    GenerateArgument(0);
+    EmitMoveRaxToArg(0);
+  end
+  else
+  begin
+    for I := 0 to RegisterArgs - 1 do
+    begin
+      GenerateArgument(I);
+      EmitPushRax;
+    end;
+    for I := RegisterArgs - 1 downto 0 do EmitPopArg(I);
   end;
-  for I := RegisterArgs - 1 downto 0 do EmitPopArg(I);
 
   if ExpressionCall then
   begin
@@ -6462,7 +7213,10 @@ procedure TX64Backend.GenExpr(E: TExpr);
 var
   Offset, L, FalseLabel, EndLabel, I, Scale: LongInt;
   Handled, IsPointerResult, IsPointerDifference, UnsignedOperation: Boolean;
+  RotateLeft: Boolean;
   LocalType: TCType;
+  RotateValue: TExpr;
+  RotateCount: Byte;
   GlobalDecl: TGlobal;
   IndirectLocal: Boolean;
   ImmediateValue: Int64;
@@ -6522,6 +7276,8 @@ begin
             if not IsAggregateType(E.CType) then EmitLoadAtRax(E.CType);
           end;
         end
+        else if FindRegisterLocal(E.Text, L, LocalType) then
+          EmitLoadRegisterLocalToRax(L, E.CType)
         else
         begin
           L := FindStaticLocalLabel(E.Text);
@@ -6629,6 +7385,28 @@ begin
           Exit;
         end;
 
+        if (FOptions.OptimizationLevel >= 1) and
+           TryMatchRotate(E, RotateValue, RotateCount, RotateLeft) then
+        begin
+          GenExpr(RotateValue);
+          if StorageSize(E.CType) = 8 then
+          begin
+            if RotateLeft then
+              FText.AddBytes([$48, $C1, $C0, RotateCount])
+            else
+              FText.AddBytes([$48, $C1, $C8, RotateCount]);
+          end
+          else
+          begin
+            if RotateLeft then
+              FText.AddBytes([$C1, $C0, RotateCount])
+            else
+              FText.AddBytes([$C1, $C8, RotateCount]);
+          end;
+          EmitNormalizeInteger(E.CType);
+          Exit;
+        end;
+
         if IsFloatingType(E.Left.CType) or IsFloatingType(E.Right.CType) then
         begin
           if IsFloatingType(E.Left.CType) and
@@ -6674,13 +7452,16 @@ begin
 
         if (FOptions.OptimizationLevel >= 1) and
           (E.Right <> nil) and (E.Right.Kind = ekInteger) and
-          not IsPointerDifference and
-          (not IsIntegerType(LocalType) or
-            ((StorageSize(E.Right.CType) = StorageSize(LocalType)) and
-             (E.Right.CType.IsUnsigned = LocalType.IsUnsigned))) then
+          not IsPointerDifference then
         begin
-          if IsPointerResult then ImmediateValue := E.Right.IntValue * Scale
-          else ImmediateValue := E.Right.IntValue;
+          if IsPointerResult then
+            ImmediateValue := E.Right.IntValue * Scale
+          else if E.BinaryOp in [boShiftLeft, boShiftRight] then
+            ImmediateValue := E.Right.IntValue
+          else if IsIntegerType(LocalType) then
+            ImmediateValue := ConvertIntegerValue(E.Right.IntValue, LocalType)
+          else
+            ImmediateValue := E.Right.IntValue;
           GenExpr(E.Left);
           if IsIntegerType(LocalType) then EmitNormalizeInteger(LocalType);
           EmitImmediateOperation(E.BinaryOp, ImmediateValue,
@@ -7408,11 +8189,82 @@ begin
 end;
 
 procedure TX64Backend.GenStmt(S: TStmt);
+type
+  TIntArray = array of LongInt;
 var
   I, Offset, ElseLabel, EndLabel, CondLabel, BodyLabel, ContinueLabel,
     NoMatchLabel, DefaultLabel, L: LongInt;
   SavedCount: LongInt;
   SwitchEntries: TSwitchEntryArray;
+  SwitchOrder: TIntArray;
+  SwitchUnsigned: Boolean;
+
+  function SwitchValueLess(A, B: Int64): Boolean;
+  begin
+    if SwitchUnsigned then Result := QWord(A) < QWord(B)
+    else Result := A < B;
+  end;
+
+  procedure SortSwitchOrder;
+  var
+    A, B, Key: LongInt;
+  begin
+    for A := 1 to High(SwitchOrder) do
+    begin
+      Key := SwitchOrder[A];
+      B := A - 1;
+      while B >= 0 do
+      begin
+        if not SwitchValueLess(SwitchEntries[Key].Value,
+          SwitchEntries[SwitchOrder[B]].Value) then Break;
+        SwitchOrder[B + 1] := SwitchOrder[B];
+        Dec(B);
+      end;
+      SwitchOrder[B + 1] := Key;
+    end;
+  end;
+
+  procedure EmitSwitchCompare(AValue: Int64);
+  begin
+    FText.AddBytes([$48, $8B, $04, $24]);
+    if (AValue >= Low(LongInt)) and (AValue <= High(LongInt)) then
+    begin
+      FText.AddBytes([$48, $3D]);
+      FText.AddI32(LongInt(AValue));
+    end
+    else
+    begin
+      EmitMovRcxImm(AValue);
+      FText.AddBytes([$48, $39, $C8]);
+    end;
+  end;
+
+  procedure EmitSwitchTree(AFirst, ALast, ADefaultLabel: LongInt);
+  var
+    Mid, EntryIndex, LessLabel: LongInt;
+  begin
+    if AFirst > ALast then
+    begin
+      EmitJump(ADefaultLabel);
+      Exit;
+    end;
+    Mid := AFirst + (ALast - AFirst) div 2;
+    EntryIndex := SwitchOrder[Mid];
+    EmitSwitchCompare(SwitchEntries[EntryIndex].Value);
+    EmitJcc($84, SwitchEntries[EntryIndex].MatchLabel);
+    if AFirst = ALast then
+    begin
+      EmitJump(ADefaultLabel);
+      Exit;
+    end;
+    LessLabel := NewLabel;
+    if SwitchUnsigned then EmitJcc($82, LessLabel)
+    else EmitJcc($8C, LessLabel);
+    EmitSwitchTree(Mid + 1, ALast, ADefaultLabel);
+    BindTextLabel(LessLabel);
+    EmitSwitchTree(AFirst, Mid - 1, ADefaultLabel);
+  end;
+
 begin
   if S = nil then Exit;
   case S.Kind of
@@ -7425,8 +8277,20 @@ begin
       if not S.IsStatic then
       begin
         FCurrentDeclPos := S.Pos;
-        AddLocal(S.Name, S.CType, False, Offset);
-        InitializeLocal(Offset, S.CType, S.Expr, S.Pos);
+        if FindRegisterPlan(S.Name, L) then
+        begin
+          AddRegisterLocal(S.Name, S.CType, L);
+          if S.Expr <> nil then
+          begin
+            GenExpr(S.Expr);
+            EmitStoreRaxToRegisterLocal(L, S.CType);
+          end;
+        end
+        else
+        begin
+          AddLocal(S.Name, S.CType, False, Offset);
+          InitializeLocal(Offset, S.CType, S.Expr, S.Pos);
+        end;
       end;
     skReturn:
       begin
@@ -7463,13 +8327,23 @@ begin
       end;
     skIf:
       begin
-        ElseLabel := NewLabel; EndLabel := NewLabel;
-        GenBranch(S.Expr, ElseLabel, False);
-        GenStmt(S.Body);
-        EmitJump(EndLabel);
-        BindTextLabel(ElseLabel);
-        GenStmt(S.ElseBody);
-        BindTextLabel(EndLabel);
+        if S.ElseBody = nil then
+        begin
+          EndLabel := NewLabel;
+          GenBranch(S.Expr, EndLabel, False);
+          GenStmt(S.Body);
+          BindTextLabel(EndLabel);
+        end
+        else
+        begin
+          ElseLabel := NewLabel; EndLabel := NewLabel;
+          GenBranch(S.Expr, ElseLabel, False);
+          GenStmt(S.Body);
+          EmitJump(EndLabel);
+          BindTextLabel(ElseLabel);
+          GenStmt(S.ElseBody);
+          BindTextLabel(EndLabel);
+        end;
       end;
     skWhile:
       begin
@@ -7527,17 +8401,31 @@ begin
 
         GenExpr(S.Expr);
         EmitPushRax;
+        NoMatchLabel := NewLabel;
+        SetLength(SwitchOrder, 0);
         for I := 0 to High(SwitchEntries) do
           if not SwitchEntries[I].IsDefault then
           begin
-            EmitMovRaxImm(SwitchEntries[I].Value);
-            FText.AddBytes([$48, $89, $C1]);
-            FText.AddBytes([$48, $8B, $04, $24]);
-            FText.AddBytes([$48, $39, $C8]);
-            EmitJcc($84, SwitchEntries[I].MatchLabel);
+            L := Length(SwitchOrder);
+            SetLength(SwitchOrder, L + 1);
+            SwitchOrder[L] := I;
           end;
-        NoMatchLabel := NewLabel;
-        EmitJump(NoMatchLabel);
+        SwitchUnsigned := S.Expr.CType.IsUnsigned;
+        if Length(SwitchOrder) >= 8 then
+        begin
+          SortSwitchOrder;
+          EmitSwitchTree(0, High(SwitchOrder), NoMatchLabel);
+        end
+        else
+        begin
+          for I := 0 to High(SwitchOrder) do
+          begin
+            L := SwitchOrder[I];
+            EmitSwitchCompare(SwitchEntries[L].Value);
+            EmitJcc($84, SwitchEntries[L].MatchLabel);
+          end;
+          EmitJump(NoMatchLabel);
+        end;
         for I := 0 to High(SwitchEntries) do
           if not SwitchEntries[I].IsDefault then
           begin
@@ -7597,6 +8485,8 @@ var
     FrameSize, StackOffset, J, RegisterOrdinal, FixedStackEnd,
     CandidateStackEnd: LongInt;
   ParameterTypes: TCTypeVector;
+  RegisterResident: array of Boolean;
+  CallFree, CanUseRegisterParameters: Boolean;
   Layout: TABIFunctionLayout;
   Location: TABIValueLocation;
   DoubleType: TCType;
@@ -7620,6 +8510,27 @@ begin
   Layout := BuildFunctionABILayout(F.ReturnType, ParameterTypes,
     F.IsVariadic, FTarget);
   try
+  PlanRegisterLocals(F);
+  CallFree := not StmtContainsCallOrAsm(F.Body);
+  CanUseRegisterParameters := (FOptions.OptimizationLevel >= 1) and
+    not FOptions.DebugInfo and CallFree and not F.IsVariadic and
+    not Layout.UsesHiddenReturnPointer and
+    StmtSafeForRegisterParameters(F.Body);
+  SetLength(RegisterResident, Length(F.Params));
+  if CanUseRegisterParameters then
+    for I := 0 to High(F.Params) do
+    begin
+      Location := Layout.Parameters[I];
+      if (Location.Kind <> alkStack) and (Length(Location.Parts) = 1) and
+         (Location.Parts[0].ValueClass = ascInteger) and
+         (IsIntegerType(F.Params[I].CType) or IsPointerType(F.Params[I].CType)) and
+         not F.Params[I].CType.IsVolatile and
+         not StmtRequiresParameterStorage(F.Body, F.Params[I].Name) then
+      begin
+        RegisterOrdinal := GPRegisterOrdinal(Location.Parts[0].RegisterNumber);
+        RegisterResident[I] := RegisterOrdinal <= 1;
+      end;
+    end;
   FixedStackEnd := 0;
   for I := 0 to High(F.Params) do
   begin
@@ -7634,12 +8545,12 @@ begin
   end;
   BindTextLabel(ALabel);
   FListing.Add(F.Name + ':');
-  FText.AddBytes([$55, $48, $89, $E5]);
   ParameterBytes := 0;
   if Layout.UsesHiddenReturnPointer then Inc(ParameterBytes, 15);
   if F.IsVariadic then Inc(ParameterBytes, 191);
   for I := 0 to High(F.Params) do
   begin
+    if RegisterResident[I] then Continue;
     Location := Layout.Parameters[I];
     if IsAggregateType(F.Params[I].CType) and (Location.Kind = alkStack) then
     begin
@@ -7659,6 +8570,10 @@ begin
   end;
   LocalBytes := CountLocalBytes(F.Body);
   FrameSize := LongInt(AlignUp(QWord(ParameterBytes + LocalBytes), 16));
+  FCurrentFrameless := CanUseRegisterParameters and (FrameSize = 0) and
+    not FUsingCalleeSavedLocals;
+  if not FCurrentFrameless then
+    FText.AddBytes([$55, $48, $89, $E5]);
   if FrameSize > 0 then
   begin
     if FrameSize <= 127 then
@@ -7669,7 +8584,19 @@ begin
       FText.AddI32(FrameSize);
     end;
   end;
+  if FUsingCalleeSavedLocals then
+  begin
+    { Save an even number of registers so the stack stays 16-byte aligned
+      at every call site without an additional dynamic alignment fixup. }
+    case FRegisterSaveCount of
+      2: FText.AddBytes([$41, $54, $41, $55]);
+      4: FText.AddBytes([$41, $54, $41, $55, $41, $56, $41, $57]);
+    else
+      raise ERCCError.Create('internal error: invalid register save count');
+    end;
+  end;
   SetLength(FLocals, 0);
+  SetLength(FRegisterLocals, 0);
   SetLength(FUserLabels, 0);
   SetLength(FStaticLocals, 0);
   ReserveStaticLocals(F.Body);
@@ -7706,6 +8633,12 @@ begin
     if F.Params[I].Name = '' then
       RaiseCompileError(F.Pos, 'parameter names are required in function definitions');
     Location := Layout.Parameters[I];
+    if RegisterResident[I] then
+    begin
+      RegisterOrdinal := GPRegisterOrdinal(Location.Parts[0].RegisterNumber);
+      AddRegisterLocal(F.Params[I].Name, F.Params[I].CType, RegisterOrdinal);
+      Continue;
+    end;
     if IsAggregateType(F.Params[I].CType) then
     begin
       if Location.Kind = alkStack then
@@ -7773,10 +8706,24 @@ begin
   GenStmt(F.Body);
   EmitMovRaxImm(0);
   BindTextLabel(FEpilogueLabel);
-  FText.AddBytes([$C9, $C3]);
+  if FUsingCalleeSavedLocals then
+    case FRegisterSaveCount of
+      2: FText.AddBytes([$41, $5D, $41, $5C]);
+      4: FText.AddBytes([$41, $5F, $41, $5E, $41, $5D, $41, $5C]);
+    else
+      raise ERCCError.Create('internal error: invalid register restore count');
+    end;
+  if FCurrentFrameless then
+  begin
+    FText.Add8($C3);
+    FListing.Add('  ret');
+  end
+  else
+  begin
+    FText.AddBytes([$C9, $C3]);
+    FListing.Add('  leave');
+  end;
   FListing.Add('  ; native x86-64 body: ' + IntToStr(FText.Size) + ' bytes so far');
-  FListing.Add('  leave');
-  FListing.Add('  ret');
   FListing.Add('');
   if FStackDepth <> 0 then
     raise ERCCError.Create('internal error: unbalanced expression stack in ' + F.Name);

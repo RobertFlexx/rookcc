@@ -3,6 +3,7 @@ FPCFLAGS ?= -Mobjfpc -Sh -O2 -XX -Xs -CX
 PREFIX ?= /usr/local
 DESTDIR ?=
 INSTALL_ROOKCC ?= 0
+# Optional compiler-host optimization build; normal releases use the reproducible default flags.
 OPTIMIZED_FPCFLAGS ?= -Mobjfpc -Sh -O3 -Si -XX -Xs -CX
 
 BUILD_DIR := build
@@ -14,13 +15,16 @@ NATIVE_DRIVER_TEST_BIN := $(BUILD_DIR)/rcc-native-driver-test
 SOURCES := $(wildcard src/*.pas)
 RESOURCE_DIR := $(DESTDIR)$(PREFIX)/share/rcc
 DOC_DIR := $(DESTDIR)$(PREFIX)/share/doc/rcc
+RELEASE_VERSION := $(shell tr -d '\r\n' < VERSION)
 
 .PHONY: all optimized test test-platform-support test-target-formats \
 	test-native-driver test-native-host test-c-differential \
 	test-cross-differential test-semantic-conversions test-release-hardening \
 	test-standard-modes test-parser-fuzz test-determinism test-examples \
-	test-source-integrity bench package \
-	package-check release-check release-gate \
+	test-optimizer-pipeline test-backend-source-contract test-backend-encoding-model \
+	test-backend-codegen test-scope-index test-elf-tooling test-scalability \
+	test-optimizer-policy-contract test-fast-fail test-posix-headers \
+	test-posix-abi-contract test-optimizer-latency test-source-integrity \
 	install install-rookcc uninstall clean
 
 all: $(BIN)
@@ -34,9 +38,13 @@ optimized:
 	@printf 'optimized rcc: %s (%s bytes)\n' "$(BIN)" \
 		"$$(wc -c < "$(BIN)")"
 
-test: test-source-integrity test-platform-support test-release-hardening \
-	test-standard-modes test-semantic-conversions test-c-differential \
-	test-cross-differential test-parser-fuzz test-determinism test-examples
+test: test-source-integrity test-backend-source-contract test-backend-encoding-model \
+	test-optimizer-policy-contract \
+	test-platform-support test-release-hardening test-standard-modes \
+	test-semantic-conversions test-c-differential test-cross-differential \
+	test-parser-fuzz test-determinism test-examples test-optimizer-pipeline \
+	test-backend-codegen test-scope-index test-elf-tooling test-scalability \
+	test-fast-fail test-posix-headers test-posix-abi-contract test-optimizer-latency
 
 test-platform-support: test-target-formats test-native-driver test-native-host
 
@@ -68,20 +76,42 @@ test-determinism: $(BIN)
 test-examples: $(BIN)
 	python3 tests/examples_smoke.py "$(abspath $(BIN))"
 
-bench: $(BIN)
-	python3 bench/compare.py --rcc "$(abspath $(BIN))" \
-	  --json-out "$(abspath $(BUILD_DIR))/benchmark.json"
 
-release-check: test package-check
+test-optimizer-pipeline: $(BIN)
+	python3 tests/optimizer_pipeline.py "$(abspath $(BIN))"
 
-release-gate:
-	./scripts/release_gate.sh
+test-backend-source-contract:
+	python3 tests/backend_source_contract.py
 
-package:
-	./scripts/package.sh
+test-optimizer-policy-contract:
+	python3 tests/optimizer_policy_contract.py
 
-package-check:
-	./scripts/package_test.sh
+test-fast-fail: $(BIN)
+	python3 tests/fast_fail.py "$(abspath $(BIN))"
+
+test-posix-headers: $(BIN)
+	python3 tests/posix_headers.py "$(abspath $(BIN))"
+
+test-posix-abi-contract:
+	python3 tests/posix_abi_contract.py
+
+test-optimizer-latency: $(BIN)
+	python3 tests/optimizer_latency.py "$(abspath $(BIN))"
+
+test-backend-encoding-model:
+	python3 tests/backend_encoding_model.py
+
+test-backend-codegen: $(BIN)
+	python3 tests/backend_codegen.py "$(abspath $(BIN))"
+
+test-scope-index: $(BIN)
+	python3 tests/scope_index.py "$(abspath $(BIN))"
+
+test-elf-tooling: $(BIN)
+	python3 tests/elf_tooling.py "$(abspath $(BIN))"
+
+test-scalability: $(BIN)
+	python3 tests/scalability.py "$(abspath $(BIN))"
 
 test-target-formats: $(BIN)
 	python3 tests/target_format_matrix.py "$(abspath $(BIN))" \
@@ -122,7 +152,12 @@ install: $(BIN)
 	install -d "$(DESTDIR)$(PREFIX)/share/fish/vendor_completions.d"
 	install -m644 completions/rcc.fish "$(DESTDIR)$(PREFIX)/share/fish/vendor_completions.d/rcc.fish"
 	install -d "$(DOC_DIR)"
-	install -m644 README.md LICENSE "$(DOC_DIR)/"
+	@for doc in README.md LICENSE RELEASE_HARDENING.md \
+	  "RELEASE_NOTES_$(RELEASE_VERSION).md" \
+	  "VERIFICATION_$(RELEASE_VERSION).md" \
+	  "COMPATIBILITY_$(RELEASE_VERSION).md"; do \
+	  if [ -f "$$doc" ]; then install -m644 "$$doc" "$(DOC_DIR)/"; fi; \
+	done
 	@if [ "$(INSTALL_ROOKCC)" = "1" ]; then \
 	  $(MAKE) --no-print-directory install-rookcc; \
 	fi

@@ -13,6 +13,7 @@ type
     LoopsUnrolled: QWord;
     StrengthReductions: QWord;
     ExpressionsHoisted: QWord;
+    PropagationBudgetSkips: QWord;
   end;
 
 procedure RunASTPropagation(AProgram: TProgram; ALevel: LongInt;
@@ -61,7 +62,14 @@ begin
 end;
 
 procedure AppendName(var A: TNameArray; const N: string);
+var
+  I: LongInt;
 begin
+  { Modified-name sets feed loop and branch invalidation.  The 2.x pass kept
+    duplicates, making large compound blocks repeatedly poison the same
+    symbol and growing temporary arrays needlessly. }
+  for I := 0 to High(A) do
+    if A[I] = N then Exit;
   SetLength(A, Length(A) + 1);
   A[High(A)] := N;
 end;
@@ -79,11 +87,9 @@ procedure CombineNames(var Dest: TNameArray; const A, B: TNameArray);
 var
   I: LongInt;
 begin
-  SetLength(Dest, Length(A) + Length(B));
-  for I := 0 to High(A) do
-    Dest[I] := A[I];
-  for I := 0 to High(B) do
-    Dest[Length(A) + I] := B[I];
+  SetLength(Dest, 0);
+  for I := 0 to High(A) do AppendName(Dest, A[I]);
+  for I := 0 to High(B) do AppendName(Dest, B[I]);
 end;
 
 function WrappedAdd(A, B: Int64): Int64;
@@ -729,19 +735,56 @@ begin
   end;
 end;
 
+function PropExprNodeCount(E: TExpr): QWord;
+var
+  I: LongInt;
+begin
+  if E = nil then Exit(0);
+  Result := 1 + PropExprNodeCount(E.Left) + PropExprNodeCount(E.Right) +
+    PropExprNodeCount(E.Third);
+  for I := 0 to High(E.Args) do Inc(Result, PropExprNodeCount(E.Args[I]));
+end;
+
+function PropStmtNodeCount(S: TStmt): QWord;
+var
+  I: LongInt;
+begin
+  if S = nil then Exit(0);
+  Result := 1 + PropExprNodeCount(S.Expr) + PropExprNodeCount(S.Expr2) +
+    PropStmtNodeCount(S.InitStmt) + PropStmtNodeCount(S.Body) +
+    PropStmtNodeCount(S.ElseBody);
+  for I := 0 to High(S.Children) do
+    Inc(Result, PropStmtNodeCount(S.Children[I]));
+  for I := 0 to High(S.AsmOutputs) do
+    Inc(Result, PropExprNodeCount(S.AsmOutputs[I].Expr));
+  for I := 0 to High(S.AsmInputs) do
+    Inc(Result, PropExprNodeCount(S.AsmInputs[I].Expr));
+end;
+
 procedure RunASTPropagation(AProgram: TProgram; ALevel: LongInt;
   out AStats: TAdvancedASTOptStats);
 var
   I: LongInt;
+  FunctionNodes: QWord;
   Map: TPropMap;
   EmptyNames: TNameArray;
 begin
   FillChar(AStats, SizeOf(AStats), 0);
-  if ALevel < 2 then Exit;
+  if ALevel < 1 then Exit;
   SetLength(EmptyNames, 0);
   for I := 0 to High(AProgram.Functions) do
   begin
     if AProgram.Functions[I].IsPrototype then Continue;
+    { Constant propagation uses a versioned scope map.  Bound it on giant
+      generated functions so -O1 remains a low-latency mode and -O2/-O3 do
+      not become quadratic on pathological single-function inputs. }
+    FunctionNodes := PropStmtNodeCount(AProgram.Functions[I].Body);
+    if ((ALevel = 1) and (FunctionNodes > 24000)) or
+       ((ALevel >= 2) and (FunctionNodes > 120000)) then
+    begin
+      Inc(AStats.PropagationBudgetSkips);
+      Continue;
+    end;
     SetLength(Map, 0);
     PropStmt(AProgram.Functions[I].Body, Map, 0, EmptyNames, AStats);
   end;

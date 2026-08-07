@@ -20,16 +20,26 @@ type
     LoopsUnrolled: QWord;
     StrengthReductions: QWord;
     ExpressionsHoisted: QWord;
+    CallsInlined: QWord;
+    InlineCandidatesRejected: QWord;
+    FunctionsRemoved: QWord;
+    GlobalsRemoved: QWord;
+    InputNodes: QWord;
+    FunctionsOptimized: QWord;
+    CleanupIterations: QWord;
+    BudgetLimitedFunctions: QWord;
+    PropagationBudgetSkips: QWord;
+    ReachabilityDisabledByAsm: Boolean;
   end;
 
-procedure OptimizeProgram(AProgram: TProgram; ALevel: LongInt;
-  AOptimizeSize: Boolean; out AStats: TOptimizationStats);
+procedure OptimizeProgram(AProgram: TProgram; ALevel, ASizeLevel: LongInt;
+  AOptimizeDebug: Boolean; out AStats: TOptimizationStats);
 function DumpProgramIR(AProgram: TProgram): string;
 
 implementation
 
 uses
-  rcc_typeops, rcc_ast_opt2;
+  rcc_typeops, rcc_ast_opt2, rcc_ast_inline, rcc_ast_reachability;
 
 function IsInteger(E: TExpr; out V: Int64): Boolean;
 begin
@@ -462,6 +472,12 @@ begin
   Inc(ATotal.LoopsUnrolled, APass.LoopsUnrolled);
   Inc(ATotal.StrengthReductions, APass.StrengthReductions);
   Inc(ATotal.ExpressionsHoisted, APass.ExpressionsHoisted);
+  Inc(ATotal.CallsInlined, APass.CallsInlined);
+  Inc(ATotal.InlineCandidatesRejected, APass.InlineCandidatesRejected);
+  Inc(ATotal.FunctionsRemoved, APass.FunctionsRemoved);
+  Inc(ATotal.GlobalsRemoved, APass.GlobalsRemoved);
+  if APass.ReachabilityDisabledByAsm then
+    ATotal.ReachabilityDisabledByAsm := True;
 end;
 
 function PassChanged(const AStats: TOptimizationStats): Boolean;
@@ -472,37 +488,204 @@ begin
     (AStats.DeadStatementsRemoved <> 0);
 end;
 
-procedure OptimizeProgram(AProgram: TProgram; ALevel: LongInt;
-  AOptimizeSize: Boolean; out AStats: TOptimizationStats);
+function ExprNodeCount(E: TExpr): QWord;
 var
-  I, Pass, MaximumPasses: LongInt;
+  I: LongInt;
+begin
+  if E = nil then Exit(0);
+  Result := 1 + ExprNodeCount(E.Left) + ExprNodeCount(E.Right) +
+    ExprNodeCount(E.Third);
+  for I := 0 to High(E.Args) do Inc(Result, ExprNodeCount(E.Args[I]));
+end;
+
+function StmtNodeCount(S: TStmt): QWord;
+var
+  I: LongInt;
+begin
+  if S = nil then Exit(0);
+  Result := 1 + ExprNodeCount(S.Expr) + ExprNodeCount(S.Expr2) +
+    StmtNodeCount(S.InitStmt) + StmtNodeCount(S.Body) +
+    StmtNodeCount(S.ElseBody);
+  for I := 0 to High(S.Children) do Inc(Result, StmtNodeCount(S.Children[I]));
+  for I := 0 to High(S.AsmOutputs) do
+    Inc(Result, ExprNodeCount(S.AsmOutputs[I].Expr));
+  for I := 0 to High(S.AsmInputs) do
+    Inc(Result, ExprNodeCount(S.AsmInputs[I].Expr));
+end;
+
+function ProgramNodeCount(AProgram: TProgram): QWord;
+var
+  I: LongInt;
+begin
+  Result := 0;
+  if AProgram = nil then Exit;
+  for I := 0 to High(AProgram.Functions) do
+    if not AProgram.Functions[I].IsPrototype then
+      Inc(Result, StmtNodeCount(AProgram.Functions[I].Body));
+  for I := 0 to High(AProgram.Globals) do
+    Inc(Result, ExprNodeCount(AProgram.Globals[I].Initializer));
+end;
+
+function CleanupPassBudget(ANodes: QWord; ARequested: LongInt): LongInt;
+begin
+  Result := ARequested;
+  { A fixed-point cleanup is useful on small functions, but repeatedly walking
+    a huge function has poor compile-time return.  Per-function budgets keep
+    optimization latency proportional to the code that actually changed. }
+  if ANodes > 16384 then Result := 1
+  else if (ANodes > 4096) and (Result > 2) then Result := 2
+  else if (ANodes > 1024) and (Result > 3) then Result := 3;
+  if Result < 1 then Result := 1;
+end;
+
+procedure RunLocalCleanup(AProgram: TProgram; ALevel, AMaximumPasses: LongInt;
+  var AStats: TOptimizationStats);
+var
+  I, Pass, PassBudget: LongInt;
+  FunctionNodes: QWord;
   PassStats: TOptimizationStats;
+begin
+  if (AProgram = nil) or (ALevel <= 0) then Exit;
+  { Work to a local fixed point one function at a time.  The 2.x scheduler
+    rescanned every already-stable function whenever any function changed. }
+  for I := 0 to High(AProgram.Functions) do
+  begin
+    if AProgram.Functions[I].IsPrototype then Continue;
+    FunctionNodes := StmtNodeCount(AProgram.Functions[I].Body);
+    PassBudget := CleanupPassBudget(FunctionNodes, AMaximumPasses);
+    if PassBudget < AMaximumPasses then Inc(AStats.BudgetLimitedFunctions);
+    Inc(AStats.FunctionsOptimized);
+    for Pass := 1 to PassBudget do
+    begin
+      FillChar(PassStats, SizeOf(PassStats), 0);
+      OptimizeStmt(AProgram.Functions[I].Body, ALevel, PassStats);
+      AddPassStats(AStats, PassStats);
+      Inc(AStats.PassesRun);
+      Inc(AStats.CleanupIterations);
+      if not PassChanged(PassStats) then Break;
+    end;
+  end;
+end;
+
+procedure AddAdvancedStats(var ATotal: TOptimizationStats;
+  const APass: TAdvancedASTOptStats);
+begin
+  Inc(ATotal.ConstantsPropagated, APass.ConstantsPropagated);
+  Inc(ATotal.LoopsUnrolled, APass.LoopsUnrolled);
+  Inc(ATotal.StrengthReductions, APass.StrengthReductions);
+  Inc(ATotal.ExpressionsHoisted, APass.ExpressionsHoisted);
+  Inc(ATotal.PropagationBudgetSkips, APass.PropagationBudgetSkips);
+end;
+
+procedure AddReachabilityStats(var ATotal: TOptimizationStats;
+  const APass: TReachabilityStats);
+begin
+  Inc(ATotal.FunctionsRemoved, APass.FunctionsRemoved);
+  Inc(ATotal.GlobalsRemoved, APass.GlobalsRemoved);
+  if APass.DisabledByInlineAsm then ATotal.ReachabilityDisabledByAsm := True;
+end;
+
+procedure OptimizeProgram(AProgram: TProgram; ALevel, ASizeLevel: LongInt;
+  AOptimizeDebug: Boolean; out AStats: TOptimizationStats);
+var
   AdvancedStats: TAdvancedASTOptStats;
+  InlineStats: TASTInlineStats;
+  ReachabilityStats: TReachabilityStats;
+  CleanupLevel: LongInt;
+  InitialNodes, CurrentNodes: QWord;
+  ExtraInlineAllowed: Boolean;
 begin
   FillChar(AStats, SizeOf(AStats), 0);
-  if AOptimizeSize and (ALevel < 2) then ALevel := 2;
-  if ALevel <= 1 then MaximumPasses := 1
-  else if ALevel = 2 then MaximumPasses := 3
-  else MaximumPasses := 6;
+  if AProgram = nil then Exit;
+  if ASizeLevel < 0 then ASizeLevel := 0;
+  if ASizeLevel > 2 then ASizeLevel := 2;
+  if (ASizeLevel > 0) and (ALevel < 2) then ALevel := 2;
+  InitialNodes := ProgramNodeCount(AProgram);
+  AStats.InputNodes := InitialNodes;
 
-  for Pass := 1 to MaximumPasses do
+  { -O0 deliberately leaves the typed AST alone.  -Og performs only the cheap
+    local canonicalization that keeps source-level structure recognizable. }
+  if (ALevel <= 0) and not AOptimizeDebug then Exit;
+  if AOptimizeDebug then
   begin
-    FillChar(PassStats, SizeOf(PassStats), 0);
-    for I := 0 to High(AProgram.Functions) do
-      if not AProgram.Functions[I].IsPrototype then
-        OptimizeStmt(AProgram.Functions[I].Body, ALevel, PassStats);
-    AddPassStats(AStats, PassStats);
-    Inc(AStats.PassesRun);
-    if not PassChanged(PassStats) then Break;
+    RunLocalCleanup(AProgram, 1, 2, AStats);
+    Exit;
   end;
 
+  { Prune unreachable internal code before expensive transforms.  Besides
+    shrinking output this avoids optimizing helpers that cannot be emitted. }
+  FillChar(ReachabilityStats, SizeOf(ReachabilityStats), 0);
+  RunStaticReachability(AProgram, True, ReachabilityStats);
+  AddReachabilityStats(AStats, ReachabilityStats);
+
+  if ALevel = 1 then
+    RunLocalCleanup(AProgram, 1, 2, AStats)
+  else
+    RunLocalCleanup(AProgram, 2, 4, AStats);
+
+  { Inline deliberately small, scalar, side-effect-safe helpers. }
+  FillChar(InlineStats, SizeOf(InlineStats), 0);
+  RunASTInlining(AProgram, ALevel, ASizeLevel, InlineStats);
+  Inc(AStats.CallsInlined, InlineStats.CallsInlined);
+  Inc(AStats.InlineCandidatesRejected, InlineStats.CandidatesRejected);
+  Inc(AStats.PassesRun, InlineStats.PassesRun);
+
+  { Constant propagation is a cheap linear pass and now belongs to -O1 too.
+    This makes -O1 a useful lightweight optimization mode instead of an
+    almost-unoptimized compatibility setting. }
   FillChar(AdvancedStats, SizeOf(AdvancedStats), 0);
-  if ALevel >= 2 then RunASTPropagation(AProgram, ALevel, AdvancedStats);
-  if ALevel >= 3 then RunASTLoopOptimization(AProgram, ALevel, AdvancedStats);
-  AStats.ConstantsPropagated := AdvancedStats.ConstantsPropagated;
-  AStats.LoopsUnrolled := AdvancedStats.LoopsUnrolled;
-  AStats.StrengthReductions := AdvancedStats.StrengthReductions;
-  AStats.ExpressionsHoisted := AdvancedStats.ExpressionsHoisted;
+  RunASTPropagation(AProgram, ALevel, AdvancedStats);
+  AddAdvancedStats(AStats, AdvancedStats);
+
+  if ALevel = 1 then
+    RunLocalCleanup(AProgram, 1, 2, AStats)
+  else
+    RunLocalCleanup(AProgram, 2, 4, AStats);
+
+  if ALevel >= 2 then
+  begin
+    { A second inlining round at -O3 can expose specialization created by
+      propagation.  It is capped for large translation units to keep compile
+      time predictable and light. }
+    CurrentNodes := ProgramNodeCount(AProgram);
+    ExtraInlineAllowed := (ALevel >= 3) and (ASizeLevel = 0) and
+      (CurrentNodes <= 250000) and (AStats.CallsInlined <> 0);
+    if ExtraInlineAllowed then
+    begin
+      FillChar(InlineStats, SizeOf(InlineStats), 0);
+      RunASTInlining(AProgram, ALevel, ASizeLevel, InlineStats);
+      Inc(AStats.CallsInlined, InlineStats.CallsInlined);
+      Inc(AStats.InlineCandidatesRejected, InlineStats.CandidatesRejected);
+      Inc(AStats.PassesRun, InlineStats.PassesRun);
+      if InlineStats.CallsInlined <> 0 then
+      begin
+        FillChar(AdvancedStats, SizeOf(AdvancedStats), 0);
+        RunASTPropagation(AProgram, ALevel, AdvancedStats);
+        AddAdvancedStats(AStats, AdvancedStats);
+        RunLocalCleanup(AProgram, 2, 3, AStats);
+      end;
+    end;
+
+    { Loop growth is a speed-only -O3 choice.  Size modes skip transformations
+      that can lengthen code. }
+    if (ALevel >= 3) and (ASizeLevel = 0) then
+    begin
+      FillChar(AdvancedStats, SizeOf(AdvancedStats), 0);
+      RunASTLoopOptimization(AProgram, ALevel, AdvancedStats);
+      AddAdvancedStats(AStats, AdvancedStats);
+      RunLocalCleanup(AProgram, 2, 3, AStats);
+    end;
+  end
+  else if AStats.CallsInlined <> 0 then
+  begin
+    CleanupLevel := 1;
+    RunLocalCleanup(AProgram, CleanupLevel, 2, AStats);
+  end;
+
+  { Inlining and simplification can make more internal symbols unreachable. }
+  FillChar(ReachabilityStats, SizeOf(ReachabilityStats), 0);
+  RunStaticReachability(AProgram, True, ReachabilityStats);
+  AddReachabilityStats(AStats, ReachabilityStats);
 end;
 
 function ExprText(E: TExpr): string;

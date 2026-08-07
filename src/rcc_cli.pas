@@ -198,8 +198,10 @@ begin
   AOptions.TargetTriple := NativeTargetDescriptor.Triple;
   AOptions.TargetCPU := 'generic';
   AOptions.TargetFeatures := '';
-  AOptions.OptimizationLevel := 1;
+  { Match conventional C compiler behaviour: no -O flag means -O0. }
+  AOptions.OptimizationLevel := 0;
   AOptions.OptimizeSize := False;
+  AOptions.SizeOptimizationLevel := 0;
   AOptions.OptimizeDebug := False;
   AOptions.Standard := csGNU17;
   AOptions.WarningLevel := wlDefault;
@@ -590,21 +592,62 @@ begin
     else if A = '--emit-ir' then AOptions.EmitMode := emIR
     else if A = '--emit-tokens' then AOptions.EmitMode := emTokens
     else if A = '-c' then AOptions.EmitMode := emObject
-    else if (A = '-O0') then AOptions.OptimizationLevel := 0
-    else if (A = '-O') or (A = '-O1') then AOptions.OptimizationLevel := 1
-    else if A = '-O2' then AOptions.OptimizationLevel := 2
-    else if A = '-O3' then AOptions.OptimizationLevel := 3
+    else if (A = '-O0') then
+    begin
+      AOptions.OptimizationLevel := 0;
+      AOptions.OptimizeSize := False;
+      AOptions.SizeOptimizationLevel := 0;
+      AOptions.OptimizeDebug := False;
+    end
+    else if (A = '-O') or (A = '-O1') then
+    begin
+      AOptions.OptimizationLevel := 1;
+      AOptions.OptimizeSize := False;
+      AOptions.SizeOptimizationLevel := 0;
+      AOptions.OptimizeDebug := False;
+    end
+    else if A = '-O2' then
+    begin
+      AOptions.OptimizationLevel := 2;
+      AOptions.OptimizeSize := False;
+      AOptions.SizeOptimizationLevel := 0;
+      AOptions.OptimizeDebug := False;
+    end
+    else if A = '-O3' then
+    begin
+      AOptions.OptimizationLevel := 3;
+      AOptions.OptimizeSize := False;
+      AOptions.SizeOptimizationLevel := 0;
+      AOptions.OptimizeDebug := False;
+    end
     else if A = '-Og' then
     begin
       AOptions.OptimizationLevel := 1;
+      AOptions.OptimizeSize := False;
+      AOptions.SizeOptimizationLevel := 0;
       AOptions.OptimizeDebug := True;
     end
-    else if (A = '-Os') or (A = '-Oz') then
+    else if A = '-Os' then
     begin
       AOptions.OptimizationLevel := 2;
       AOptions.OptimizeSize := True;
+      AOptions.SizeOptimizationLevel := 1;
+      AOptions.OptimizeDebug := False;
     end
-    else if A = '-Ofast' then AOptions.OptimizationLevel := 3
+    else if A = '-Oz' then
+    begin
+      AOptions.OptimizationLevel := 2;
+      AOptions.OptimizeSize := True;
+      AOptions.SizeOptimizationLevel := 2;
+      AOptions.OptimizeDebug := False;
+    end
+    else if A = '-Ofast' then
+    begin
+      AOptions.OptimizationLevel := 3;
+      AOptions.OptimizeSize := False;
+      AOptions.SizeOptimizationLevel := 0;
+      AOptions.OptimizeDebug := False;
+    end
     else if (A = '-v') or (A = '--verbose') then AOptions.Verbose := True
     else if A = '--stats' then AOptions.ShowStats := True
     else if A = '-Werror' then AOptions.WarningsAsErrors := True

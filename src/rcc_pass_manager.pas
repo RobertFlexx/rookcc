@@ -31,12 +31,12 @@ type
   private
     FTarget: TTargetDescriptor;
     FOptimizationLevel: LongInt;
-    FOptimizeSize: Boolean;
+    FSizeOptimizationLevel: LongInt;
     FModule: TIRModule;
     FStats: TPassManagerStats;
   public
     constructor Create(const ATarget: TTargetDescriptor;
-      AOptimizationLevel: LongInt; AOptimizeSize: Boolean);
+      AOptimizationLevel, ASizeOptimizationLevel: LongInt);
     destructor Destroy; override;
     function Build(AProgram: TProgram): TIRModule;
     procedure RunAnalysis;
@@ -45,20 +45,15 @@ type
     property Stats: TPassManagerStats read FStats;
   end;
 
-function PipelineKind(AOptimizationLevel: LongInt;
-  AOptimizeSize: Boolean): TPassPipelineKind;
+function PipelineKind(AOptimizationLevel, ASizeOptimizationLevel: LongInt): TPassPipelineKind;
 function PipelineKindName(AKind: TPassPipelineKind): string;
 
 implementation
 
-function PipelineKind(AOptimizationLevel: LongInt;
-  AOptimizeSize: Boolean): TPassPipelineKind;
+function PipelineKind(AOptimizationLevel, ASizeOptimizationLevel: LongInt): TPassPipelineKind;
 begin
-  if AOptimizeSize then
-  begin
-    if AOptimizationLevel >= 3 then Result := ppkOz else Result := ppkOs;
-    Exit;
-  end;
+  if ASizeOptimizationLevel >= 2 then Exit(ppkOz);
+  if ASizeOptimizationLevel = 1 then Exit(ppkOs);
   case AOptimizationLevel of
     0: Result := ppkO0;
     1: Result := ppkO1;
@@ -83,12 +78,12 @@ begin
 end;
 
 constructor TPassManager.Create(const ATarget: TTargetDescriptor;
-  AOptimizationLevel: LongInt; AOptimizeSize: Boolean);
+  AOptimizationLevel, ASizeOptimizationLevel: LongInt);
 begin
   inherited Create;
   FTarget := ATarget;
   FOptimizationLevel := AOptimizationLevel;
-  FOptimizeSize := AOptimizeSize;
+  FSizeOptimizationLevel := ASizeOptimizationLevel;
   FModule := nil;
   FillChar(FStats, SizeOf(FStats), 0);
 end;
@@ -104,10 +99,10 @@ begin
   FModule.Free;
   FModule := LowerProgramToIR(AProgram, FTarget.Triple, FStats.Lowering);
   OptimizeIRModule(FModule, FOptimizationLevel,
-    FOptimizeSize, FStats.Optimization);
+    FSizeOptimizationLevel > 0, FStats.Optimization);
   if FOptimizationLevel >= 2 then
     RunAdvancedOptimizationPipeline(FModule, FOptimizationLevel,
-      FOptimizeSize, FStats.AdvancedOptimization);
+      FSizeOptimizationLevel > 0, FStats.AdvancedOptimization);
   Result := FModule;
 end;
 
@@ -148,7 +143,7 @@ end;
 function TPassManager.PipelineName: string;
 begin
   Result := PipelineKindName(PipelineKind(FOptimizationLevel,
-    FOptimizeSize));
+    FSizeOptimizationLevel));
 end;
 
 end.
