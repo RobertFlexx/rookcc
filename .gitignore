@@ -15,16 +15,6 @@
 /tests/
 /.github/
 
-# AI tooling and assistant artifacts
-/\.opencode/
-/\.cursor/
-/\.vscode/
-/\AGENTS\.md
-/\CLAUDE\.md
-/\COPILOT\.md
-/\.coderabbit\.yaml
-/\.github/copilot-instructions\.md
-
 /scripts/*
 !/scripts/build.sh
 !/scripts/install.sh
