@@ -75,6 +75,8 @@ type
     function FindMacro(const AName: string): LongInt;
     procedure RebuildMacroIndex;
     procedure MarkMacroIndexDirty;
+    procedure InsertMacroIndex(AProtoMacroIndex: LongInt);
+    procedure RemoveMacroIndex(AMacroIndex: LongInt);
     procedure DefineMacro(const AName, AValue: string);
     procedure DefineFunctionMacro(const AName, AValue: string;
       const AParamNames: array of string; AVariadic: Boolean);
@@ -506,6 +508,46 @@ begin
   Result := -1;
 end;
 
+procedure TPreprocessor.InsertMacroIndex(AProtoMacroIndex: LongInt);
+var
+  Lo, Hi, Mid, Position: LongInt;
+begin
+  { Keep FMacroIndex sorted by macro name so lookups stay a binary search without
+    re-sorting the whole index once per definition. }
+  Lo := 0;
+  Hi := High(FMacroIndex);
+  while Lo <= Hi do
+  begin
+    Mid := (Lo + Hi) shr 1;
+    if FMacros[FMacroIndex[Mid]].Name < FMacros[AProtoMacroIndex].Name then
+      Lo := Mid + 1
+    else
+      Hi := Mid - 1;
+  end;
+  Position := Lo;
+  SetLength(FMacroIndex, Length(FMacroIndex) + 1);
+  for Mid := Length(FMacroIndex) - 1 downto Position + 1 do
+    FMacroIndex[Mid] := FMacroIndex[Mid - 1];
+  FMacroIndex[Position] := AProtoMacroIndex;
+end;
+
+procedure TPreprocessor.RemoveMacroIndex(AMacroIndex: LongInt);
+var
+  I, Pos: LongInt;
+begin
+  Pos := -1;
+  for I := 0 to High(FMacroIndex) do
+    if FMacroIndex[I] = AMacroIndex then
+    begin
+      Pos := I;
+      Break;
+    end;
+  if Pos < 0 then Exit;
+  for I := Pos to High(FMacroIndex) - 1 do
+    FMacroIndex[I] := FMacroIndex[I + 1];
+  SetLength(FMacroIndex, Length(FMacroIndex) - 1);
+end;
+
 procedure TPreprocessor.DefineMacro(const AName, AValue: string);
 var
   I, N: LongInt;
@@ -527,7 +569,7 @@ begin
   FMacros[N].IsFunctionLike := False;
   SetLength(FMacros[N].ParamNames, 0);
   FMacros[N].HasVariadic := False;
-  MarkMacroIndexDirty;
+  InsertMacroIndex(N);
 end;
 
 procedure TPreprocessor.DefineFunctionMacro(const AName, AValue: string;
@@ -543,7 +585,7 @@ begin
     SetLength(FMacros, N + 1);
     MacroIndex := N;
     FMacros[MacroIndex].Name := AName;
-    MarkMacroIndexDirty;
+    InsertMacroIndex(MacroIndex);
   end;
   FMacros[MacroIndex].Value := AValue;
   FMacros[MacroIndex].IsFunctionLike := True;
@@ -560,10 +602,14 @@ var
 begin
   I := FindMacro(AName);
   if I < 0 then Exit;
+  RemoveMacroIndex(I);
   for J := I to High(FMacros) - 1 do
     FMacros[J] := FMacros[J + 1];
   SetLength(FMacros, Length(FMacros) - 1);
-  MarkMacroIndexDirty;
+  { Removing FMacros[I] shifts every later macro down by one, so retarget any
+    index entry that pointed past the removed slot. }
+  for J := 0 to High(FMacroIndex) do
+    if FMacroIndex[J] > I then Dec(FMacroIndex[J]);
 end;
 
 function TPreprocessor.ExpandMacrosOnce(const ALine: string): string;

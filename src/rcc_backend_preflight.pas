@@ -72,6 +72,35 @@ begin
       ' uses long double, which is not supported by the x86-64 backend');
 end;
 
+function FunctionSignatureUsesLongDouble(F: TFunction): Boolean;
+var
+  J: LongInt;
+begin
+  Result := False;
+  if F = nil then Exit;
+  if TypeContainsUnsupportedScalar(F.ReturnType, False) then Exit(True);
+  for J := 0 to High(F.Params) do
+    if TypeContainsUnsupportedScalar(F.Params[J].CType, False) then Exit(True);
+  Result := False;
+end;
+
+function FunctionTypeUsesLongDouble(const AType: TCType): Boolean;
+var
+  J: LongInt;
+  Params: PFunctionParameterList;
+begin
+  Result := False;
+  if (AType.ReturnType = nil) or
+    TypeContainsUnsupportedScalar(PCType(AType.ReturnType)^, False) then Exit(True);
+  if AType.ParamTypes <> nil then
+  begin
+    Params := PFunctionParameterList(AType.ParamTypes);
+    for J := 0 to High(Params^.Items) do
+      if TypeContainsUnsupportedScalar(Params^.Items[J], False) then Exit(True);
+  end;
+  Result := False;
+end;
+
 procedure RejectUnsupportedCallABI(E: TExpr; AProgram: TProgram);
 var
   I, GPCount, FPCount: LongInt;
@@ -90,6 +119,9 @@ begin
   begin
     Callee := AProgram.FindFunction(E.Text);
     HasKnownSignature := Callee <> nil;
+    if HasKnownSignature and FunctionSignatureUsesLongDouble(Callee) then
+      RaiseCompileError(E.Pos, 'call to function ''' + E.Text +
+        ''' uses long double, which is not supported by the x86-64 backend');
   end
   else if E.Left <> nil then
   begin
@@ -97,6 +129,10 @@ begin
     if IsPointerType(FunctionType) then FunctionType := PointeeType(FunctionType);
     HasKnownSignature := (FunctionType.Kind = ctFunction) and
       HasFunctionSignature(FunctionType);
+    if HasKnownSignature and FunctionTypeUsesLongDouble(FunctionType) then
+      RaiseCompileError(E.Pos,
+        'call through function pointer uses long double, which is not supported ' +
+        'by the x86-64 backend');
   end;
   if HasKnownSignature then Exit;
 
@@ -170,13 +206,19 @@ begin
   for I := 0 to High(AProgram.Functions) do
   begin
     F := AProgram.Functions[I];
-    RejectType(F.ReturnType, F.Pos, RejectAllFloating,
-      'return type of function ''' + F.Name + '''');
-    for J := 0 to High(F.Params) do
-      RejectType(F.Params[J].CType, F.Pos, RejectAllFloating,
-        'parameter ''' + F.Params[J].Name + ''' of function ''' + F.Name + '''');
+    { Prototypes from system headers (e.g. `strtold`) are only checked when the
+      function is actually used; a bare declaration must not fail a program
+      that never touches long double. Defined functions are checked directly. }
     if not F.IsPrototype then
+    begin
+      RejectType(F.ReturnType, F.Pos, RejectAllFloating,
+        'return type of function ''' + F.Name + '''');
+      for J := 0 to High(F.Params) do
+        RejectType(F.Params[J].CType, F.Pos, RejectAllFloating,
+          'parameter ''' + F.Params[J].Name + ''' of function ''' + F.Name +
+          '''');
       ScanStmt(F.Body, AProgram, RejectAllFloating);
+    end;
   end;
 
   for I := 0 to High(AProgram.Globals) do

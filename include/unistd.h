@@ -60,6 +60,7 @@ void sync(void);
 int syncfs(int descriptor);
 #endif
 int posix_fadvise(int fd, off_t offset, off_t length, int advice);
+int setpgid(pid_t process, pid_t process_group);
 extern char *optarg;
 extern int optind;
 extern int opterr;
@@ -68,5 +69,6 @@ int getopt(int argc, char *const argv[], const char *short_options);
 #endif
 #ifdef __RCC_USE_GNU
 int getpagesize(void);
+long syscall(long number, ...);
 #endif
 #endif

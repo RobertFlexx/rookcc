@@ -530,9 +530,9 @@ procedure TSemanticAnalyzer.AnalyzeInitializer(E: TExpr;
   const AExpectedType: TCType);
 var
   I, J, NextIndex, MemberIndex: LongInt;
-  ElementType: TCType;
+  ElementType, MemberType: TCType;
   Reordered: TExprArray;
-  Item: TExpr;
+  Item, Group: TExpr;
   Designator: string;
 begin
   if E = nil then Exit;
@@ -640,9 +640,27 @@ begin
         RaiseCompileError(Item.Pos, 'too many values in aggregate initializer');
       if Reordered[MemberIndex] <> nil then
         RaiseCompileError(Item.Pos, 'aggregate member initialized twice');
-      Reordered[MemberIndex] := Item;
-      AnalyzeInitializer(Item,
-        PCType(AExpectedType.StructInfo^.Members[MemberIndex].CType)^);
+      MemberType := PCType(
+        AExpectedType.StructInfo^.Members[MemberIndex].CType)^;
+      if IsAggregateType(MemberType) and
+        (not InitializesWholeSubObject(Item, MemberType)) then
+      begin
+        { Brace elision into a nested aggregate member: a single scalar entry
+          such as `{0}` fills that sub-object's first scalar leaf and the rest
+          are zero-initialized. Regroup it into a braced sub-object so the
+          backends only ever see fully braced initializers. }
+        Group := TExpr.Create(ekCompoundLit, Item.Pos);
+        Group.CType := MemberType;
+        SetLength(Group.Args, 1);
+        Group.Args[0] := Item;
+        Reordered[MemberIndex] := Group;
+        AnalyzeInitializer(Group, MemberType);
+      end
+      else
+      begin
+        Reordered[MemberIndex] := Item;
+        AnalyzeInitializer(Item, MemberType);
+      end;
       if AExpectedType.Kind = ctUnion then Break;
     end;
     E.Args := Reordered;
@@ -1405,6 +1423,11 @@ begin
     ekCast:
       begin
         TempType := E.CType;
+        { A compound literal `(T){...}` denotes an object of type T; seed the
+          operand's type before analysis so its initializer list is typed as T,
+          not as the parser's default scalar. }
+        if (E.Left <> nil) and (E.Left.Kind = ekCompoundLit) then
+          E.Left.CType := E.CType;
         AnalyzeExpr(E.Left);
         E.CType := TempType;
       end;

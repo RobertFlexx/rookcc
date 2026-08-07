@@ -71,7 +71,20 @@ function IsNullPointerConstant(E: TExpr): Boolean;
 var
   V: Int64;
 begin
-  Result := (E <> nil) and EvaluateIntegerConstantExpression(E, V) and (V = 0);
+  Result := False;
+  if E = nil then Exit;
+  if E.Kind = ekCast then
+  begin
+    { `(void *)0` (and casts of a zero integer constant to any pointer type)
+      is a null pointer constant. The integer constant-expression evaluator
+      only folds integer-typed casts, so peel the pointer cast explicitly. }
+    if IsPointerType(E.CType) then
+    begin
+      Result := EvaluateIntegerConstantExpression(E.Left, V) and (V = 0);
+      Exit;
+    end;
+  end;
+  Result := EvaluateIntegerConstantExpression(E, V) and (V = 0);
 end;
 
 function TypeCarriesQualifiersOf(const ADestination, ASource: TCType): Boolean;
@@ -141,10 +154,12 @@ begin
   SourceVoidObject := (SourcePointee.Kind = ctVoid) and
     (SourcePointee.PointerDepth = 0);
 
-  if DestVoidObject and (not IsPointerType(SourcePointee)) then
+  if DestVoidObject then
   begin
-    { `void *` converts to and from object pointers (function pointers were
-      already rejected above); only qualifier preservation matters. }
+    { `void *` converts to and from any object pointer, regardless of pointer
+      nesting depth (e.g. `char **` to `void *`), since `void *` may hold any
+      object pointer. Function pointers were already rejected above; only
+      qualifier preservation matters. }
     if ARequireQualifiers and
       (not TypeCarriesQualifiersOf(DestPointee, SourcePointee)) then
     begin
@@ -153,7 +168,7 @@ begin
     end;
     Exit(ccValid);
   end;
-  if SourceVoidObject and (not IsPointerType(DestPointee)) then
+  if SourceVoidObject then
   begin
     if ARequireQualifiers and
       (not TypeCarriesQualifiersOf(DestPointee, SourcePointee)) then
@@ -240,8 +255,14 @@ begin
   end;
 
   if DestIsPointer and SourceIsPointer then
+  begin
+    { A null pointer constant (e.g. `((void*)0)` for NULL) converts to any
+      pointer type, including function pointer types, so it must not fall
+      through to the function/object pointer separation below. }
+    if AIsNullPointerConstant then Exit(ccValid);
     Exit(ClassifyPointerToPointer(DestType, SourceType,
       ARequireQualifiers, AProblem));
+  end;
 
   if DestIsPointer then
   begin
