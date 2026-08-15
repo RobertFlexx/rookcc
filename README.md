@@ -33,6 +33,9 @@ three architectures and executed (under qemu-user for the non-host ones) on
 every `make test`, so the shared column below is verified, not claimed. this compiler is bullshit.
 please enjoy the source code i found and debugged (im not gonna write this all in one night, i found ts lost from time, i just ruled out bugs and fixed them so they compile so i can confidently commit)
 
+
+## THIS TABLE BELOW IS YET TO BE UPDATED. DO NOT TAKE IT AS INFORMATION RELEVANT TO THIS CURRENT VERSION.
+
 | feature | x86-64 | aarch64 / riscv64 |
 | --- | --- | --- |
 | integers, pointers, casts, all operators | yes | yes |
@@ -49,6 +52,8 @@ please enjoy the source code i found and debugged (im not gonna write this all i
 | variadic function definitions | yes | not implemented |
 | inline assembly | yes | not implemented |
 | hosted libc linking | yes | freestanding only |
+
+-------------
 
 anything in the "not implemented" rows is rejected with a diagnostic naming
 the feature. the cross backends never silently emit wrong code for something
