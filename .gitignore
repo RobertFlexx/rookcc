@@ -6,15 +6,21 @@
 *.or
 *.rst
 *.pyc
+*.core
 /a.out
 /mud
 /repl
 /repltxt
 /examples/*.out
-/bench/
-/tests/
-/.github/
+/bench/__pycache__/
+/bench/*.json
+/bench/*.csv
+/tests/tmp/
+/bench/*
 
 /scripts/*
 !/scripts/build.sh
 !/scripts/install.sh
+!/scripts/package.sh
+!/scripts/package_test.sh
+!/scripts/release_gate.sh

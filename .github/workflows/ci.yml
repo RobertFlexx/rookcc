@@ -1,0 +1,61 @@
+name: RCC 4.0 verification
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-release-gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Free Pascal and test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            fp-compiler fp-units-base fp-units-fcl \
+            binutils gcc clang lld qemu-user make python3 zip unzip
+      - name: Clean source build
+        run: make clean all
+      - name: Full correctness and optimizer suite
+        run: make test
+      - name: Optimized compiler rebuild
+        run: make optimized
+      - name: Re-test optimized compiler
+        run: make test
+      - name: GCC and Clang benchmark report
+        run: make bench
+      - name: Reproducible package check
+        run: make package-check
+      - name: Build release archives
+        run: make package
+      - name: Upload exact source packages
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rcc-4.0.0-linux-release-evidence
+          path: |
+            dist/rcc-4.0.0.tar.gz
+            dist/rcc-4.0.0.zip
+            dist/rcc-4.0.0.SHA256SUMS
+            dist/benchmarks/rcc-4.0.0.json
+            dist/benchmarks/rcc-4.0.0.csv
+            dist/benchmarks/rcc-4.0.0.md
+          if-no-files-found: ignore
+
+  macos-native:
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Free Pascal
+        run: brew install fpc
+      - name: Clean native Apple-arm64 build
+        run: make clean all
+      - name: Native macOS and cross-format suite
+        run: make test

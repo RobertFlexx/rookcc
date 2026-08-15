@@ -6,7 +6,14 @@ the compiler is written in free pascal and builds into one native program. once 
 
 when the selected target exactly matches the host architecture and operating system rcc also behaves as a normal compiler driver. on macos bsd and non x86 linux hosts it invokes the platform compiler driver only for the final sdk startup file and system library link. it never sends c source to that driver
 
-**version 3.0.0**
+**version 4.0.0**
+
+***basically the "i can trust it to compile my software efficiently"*** 
+**update.**
+
+
+> But remember, it isnt perfect and it is prone to bugs. dont hesitate to make a *PR.*
+
 
 ---------------------------
 

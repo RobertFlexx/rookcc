@@ -1,7 +1,7 @@
 #ifndef _RCC_FEATURES_H
 #define _RCC_FEATURES_H 1
 
-#define __RCC_HEADER_VERSION__ 300000
+#define __RCC_HEADER_VERSION__ 400000
 #ifdef _GNU_SOURCE
 # define __RCC_USE_GNU 1
 # define __RCC_USE_MISC 1

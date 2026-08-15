@@ -19,12 +19,10 @@ RELEASE_VERSION := $(shell tr -d '\r\n' < VERSION)
 
 .PHONY: all optimized test test-platform-support test-target-formats \
 	test-native-driver test-native-host test-c-differential \
-	test-cross-differential test-semantic-conversions test-release-hardening \
-	test-standard-modes test-parser-fuzz test-determinism test-examples \
-	test-optimizer-pipeline test-backend-source-contract test-backend-encoding-model \
-	test-backend-codegen test-scope-index test-elf-tooling test-scalability \
-	test-optimizer-policy-contract test-fast-fail test-posix-headers \
-	test-posix-abi-contract test-optimizer-latency test-source-integrity \
+	test-cross-differential test-cross-execution test-cross-abi-interop \
+	test-semantic-conversions test-release-hardening test-standard-modes \
+	test-parser-fuzz test-determinism test-examples test-posix-headers \
+	test-source-integrity bench bench-quick package package-check release-gate \
 	install install-rookcc uninstall clean
 
 all: $(BIN)
@@ -38,13 +36,11 @@ optimized:
 	@printf 'optimized rcc: %s (%s bytes)\n' "$(BIN)" \
 		"$$(wc -c < "$(BIN)")"
 
-test: test-source-integrity test-backend-source-contract test-backend-encoding-model \
-	test-optimizer-policy-contract \
-	test-platform-support test-release-hardening test-standard-modes \
+test: test-source-integrity test-platform-support \
+	test-release-hardening test-standard-modes \
 	test-semantic-conversions test-c-differential test-cross-differential \
-	test-parser-fuzz test-determinism test-examples test-optimizer-pipeline \
-	test-backend-codegen test-scope-index test-elf-tooling test-scalability \
-	test-fast-fail test-posix-headers test-posix-abi-contract test-optimizer-latency
+	test-cross-execution test-cross-abi-interop test-parser-fuzz \
+	test-determinism test-examples test-posix-headers
 
 test-platform-support: test-target-formats test-native-driver test-native-host
 
@@ -54,6 +50,12 @@ test-c-differential: $(BIN)
 
 test-cross-differential: $(BIN)
 	python3 tests/cross_differential.py "$(abspath $(BIN))"
+
+test-cross-execution: $(BIN)
+	python3 tests/cross_execution.py "$(abspath $(BIN))"
+
+test-cross-abi-interop: $(BIN)
+	python3 tests/cross_abi_interop.py "$(abspath $(BIN))"
 
 test-semantic-conversions: $(BIN)
 	python3 tests/semantic_conversions.py "$(abspath $(BIN))"
@@ -77,41 +79,8 @@ test-examples: $(BIN)
 	python3 tests/examples_smoke.py "$(abspath $(BIN))"
 
 
-test-optimizer-pipeline: $(BIN)
-	python3 tests/optimizer_pipeline.py "$(abspath $(BIN))"
-
-test-backend-source-contract:
-	python3 tests/backend_source_contract.py
-
-test-optimizer-policy-contract:
-	python3 tests/optimizer_policy_contract.py
-
-test-fast-fail: $(BIN)
-	python3 tests/fast_fail.py "$(abspath $(BIN))"
-
 test-posix-headers: $(BIN)
 	python3 tests/posix_headers.py "$(abspath $(BIN))"
-
-test-posix-abi-contract:
-	python3 tests/posix_abi_contract.py
-
-test-optimizer-latency: $(BIN)
-	python3 tests/optimizer_latency.py "$(abspath $(BIN))"
-
-test-backend-encoding-model:
-	python3 tests/backend_encoding_model.py
-
-test-backend-codegen: $(BIN)
-	python3 tests/backend_codegen.py "$(abspath $(BIN))"
-
-test-scope-index: $(BIN)
-	python3 tests/scope_index.py "$(abspath $(BIN))"
-
-test-elf-tooling: $(BIN)
-	python3 tests/elf_tooling.py "$(abspath $(BIN))"
-
-test-scalability: $(BIN)
-	python3 tests/scalability.py "$(abspath $(BIN))"
 
 test-target-formats: $(BIN)
 	python3 tests/target_format_matrix.py "$(abspath $(BIN))" \
@@ -134,6 +103,29 @@ $(BIN): $(SOURCES) VERSION
 	@mkdir -p "$(BUILD_DIR)" "$(UNIT_DIR)"
 	$(FPC) $(FPCFLAGS) -Fu./src -FU"$(UNIT_DIR)" -FE"$(BUILD_DIR)" \
 		-o"$(abspath $(BIN))" src/rcc.pas
+
+bench: $(BIN)
+	@mkdir -p dist/benchmarks
+	python3 bench/compare.py --rcc "$(abspath $(BIN))" \
+		--json-out "dist/benchmarks/rcc-$(RELEASE_VERSION).json" \
+		--csv-out "dist/benchmarks/rcc-$(RELEASE_VERSION).csv" \
+		--markdown-out "dist/benchmarks/rcc-$(RELEASE_VERSION).md"
+
+bench-quick: $(BIN)
+	@mkdir -p dist/benchmarks
+	python3 bench/compare.py --rcc "$(abspath $(BIN))" \
+		--compile-runs 1 --runtime-runs 1 \
+		--json-out "dist/benchmarks/rcc-$(RELEASE_VERSION)-quick.json" \
+		--markdown-out "dist/benchmarks/rcc-$(RELEASE_VERSION)-quick.md"
+
+package:
+	./scripts/package.sh
+
+package-check:
+	./scripts/package_test.sh
+
+release-gate:
+	./scripts/release_gate.sh
 
 install: $(BIN)
 	install -d "$(DESTDIR)$(PREFIX)/bin"

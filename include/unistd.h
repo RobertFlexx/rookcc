@@ -61,6 +61,7 @@ int syncfs(int descriptor);
 #endif
 int posix_fadvise(int fd, off_t offset, off_t length, int advice);
 int setpgid(pid_t process, pid_t process_group);
+pid_t setsid(void);
 extern char *optarg;
 extern int optind;
 extern int opterr;

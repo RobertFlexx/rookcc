@@ -147,6 +147,9 @@ type
       FRaxStateOffset: LongInt;
       FRaxStateType: TCType;
       FRaxStateIsZero: Boolean;
+      FRaxRegisterLocalValid: Boolean;
+      FRaxRegisterLocalOffset: LongInt;
+      FRaxRegisterLocalOrdinal: LongInt;
       FBlockStart: LongInt;
       FLoopHeads: array of LongInt;
       FLoopHeadCount: LongInt;
@@ -439,7 +442,8 @@ type
     function TryGenVariadicBuiltin(E: TExpr): Boolean;
     procedure GenCall(E: TExpr);
     procedure GenAssignment(E: TExpr);
-    procedure GenIncDec(E: TExpr; ADelta: LongInt; APost: Boolean);
+    procedure GenIncDec(E: TExpr; ADelta: LongInt; APost: Boolean;
+      ADiscardResult: Boolean = False);
     procedure GenInlineAsm(S: TStmt);
     procedure GenStmt(S: TStmt);
     procedure GenFunction(F: TFunction; ALabel: LongInt);
@@ -800,12 +804,14 @@ begin
     what the preceding instruction left in rax. }
   FBlockStart := FText.Size;
   FRaxStateValid := False;
+  FRaxRegisterLocalValid := False;
 end;
 
 procedure TX64Backend.InvalidateRaxState;
 begin
   FRaxStateValid := False;
   FRaxStateIsZero := False;
+  FRaxRegisterLocalValid := False;
 end;
 
 procedure TX64Backend.NoteRaxNormalized(const AType: TCType);
@@ -2295,11 +2301,30 @@ var
   TargetOffset, TargetLabel, RegisterOrdinal: LongInt;
   RegisterType, ExistingType: TCType;
   ImmediateValue: Int64;
+  ShiftCount: Byte;
   IndirectLocal: Boolean;
 begin
   Result := False;
   if FOptions.OptimizationLevel < 1 then Exit;
   if E = nil then Exit;
+  if (E.Kind = ekBinary) and
+     (E.BinaryOp in [boShiftLeft, boShiftRight]) and
+     (E.Right <> nil) and (E.Right.Kind = ekInteger) and
+     (StorageSize(E.CType) = 8) and
+     (StorageSize(E.Left.CType) = 8) and
+     (StorageSize(ALocalType) = 8) and
+     TryLoadOperandToRcx(E.Left, ALocalType) then
+  begin
+    ShiftCount := Byte(QWord(E.Right.IntValue) and 63);
+    if E.BinaryOp = boShiftLeft then
+      FText.AddBytes([$48, $C1, $E1, ShiftCount])
+    else if E.OperationType.IsUnsigned then
+      FText.AddBytes([$48, $C1, $E9, ShiftCount])
+    else
+      FText.AddBytes([$48, $C1, $F9, ShiftCount]);
+    InvalidateRaxState;
+    Exit(True);
+  end;
   if (E.Kind = ekInteger) and IsIntegerType(ALocalType) then
   begin
     ImmediateValue := ConvertIntegerValue(E.IntValue, ALocalType);
@@ -5133,6 +5158,14 @@ end;
 procedure TX64Backend.EmitLoadRegisterLocalToRax(ARegisterOrdinal: LongInt;
   const AType: TCType);
 begin
+  if FRaxRegisterLocalValid and
+     (FRaxRegisterLocalOffset = FText.Size) and
+     (FRaxRegisterLocalOffset >= FBlockStart) and
+     (FRaxRegisterLocalOrdinal = ARegisterOrdinal) then
+  begin
+    NoteRaxNormalized(AType);
+    Exit;
+  end;
   case ARegisterOrdinal of
     0: FText.AddBytes([$48, $89, $F8]); { mov rax,rdi }
     1: FText.AddBytes([$48, $89, $F0]); { mov rax,rsi }
@@ -5178,6 +5211,10 @@ begin
     raise ERCCError.Create('internal error: unsupported resident register');
   end;
   { The assignment expression still yields the normalized value in rax. }
+  FRaxRegisterLocalValid := True;
+  FRaxRegisterLocalOffset := FText.Size;
+  FRaxRegisterLocalOrdinal := ARegisterOrdinal;
+  NoteRaxNormalized(AType);
 end;
 
 function TX64Backend.FindLocal(const AName: string; out AOffset: LongInt;
@@ -5559,18 +5596,34 @@ begin
         end
         else
         begin
-          GenExpr(E.Left);
-          if TryLoadOperandToRcx(E.Right, E.Right.CType) then
-            EmitAddScaledRcxToRax(Scale)
+          if (FOptions.OptimizationLevel >= 1) and
+             (E.Left <> nil) and (E.Left.Kind = ekVariable) then
+          begin
+            { A plain base variable cannot clobber rcx. Evaluate the dynamic
+              subscript first and retain it there, avoiding the push/pop pair
+              otherwise needed to preserve the base address. C leaves the
+              evaluation order of the two subscript operands unspecified. }
+            GenExpr(E.Right);
+            EmitNormalizeInteger(E.Right.CType);
+            FText.AddBytes([$48, $89, $C1]);
+            GenExpr(E.Left);
+            EmitAddScaledRcxToRax(Scale);
+          end
           else
           begin
-            EmitPushRax;
-            GenExpr(E.Right);
-            EmitScaleRax(Scale);
-            FText.AddBytes([$48, $89, $C1]);
-            FText.Add8($58);
-            Dec(FStackDepth, 8);
-            FText.AddBytes([$48, $01, $C8]);
+            GenExpr(E.Left);
+            if TryLoadOperandToRcx(E.Right, E.Right.CType) then
+              EmitAddScaledRcxToRax(Scale)
+            else
+            begin
+              EmitPushRax;
+              GenExpr(E.Right);
+              EmitScaleRax(Scale);
+              FText.AddBytes([$48, $89, $C1]);
+              FText.Add8($58);
+              Dec(FStackDepth, 8);
+              FText.AddBytes([$48, $01, $C8]);
+            end;
           end;
         end;
       end;
@@ -5628,7 +5681,9 @@ end;
 function TX64Backend.TryEmitComparisonFlags(E: TExpr;
   out AJccOpcode: Byte): Boolean;
 var
-  LocalType: TCType;
+  LocalType, RegisterType, ExistingType: TCType;
+  RegisterOrdinal, LocalOffset: LongInt;
+  IndirectLocal: Boolean;
   Unsigned: Boolean;
   Value: Int64;
 begin
@@ -5662,6 +5717,44 @@ begin
       Value := ConvertIntegerValue(E.Right.IntValue, LocalType)
     else
       Value := E.Right.IntValue;
+    if (E.Left.Kind = ekVariable) and
+       (StorageSize(LocalType) = 8) and
+       (Value >= Low(LongInt)) and (Value <= High(LongInt)) and
+       not FindLocal(E.Left.Text, LocalOffset, ExistingType, IndirectLocal) and
+       FindRegisterLocal(E.Left.Text, RegisterOrdinal, RegisterType) and
+       (StorageSize(RegisterType) = 8) then
+    begin
+      if (Value >= -128) and (Value <= 127) then
+      begin
+        case RegisterOrdinal of
+          0: FText.AddBytes([$48, $83, $FF]);
+          1: FText.AddBytes([$48, $83, $FE]);
+          2: FText.AddBytes([$49, $83, $FC]);
+          3: FText.AddBytes([$49, $83, $FD]);
+          4: FText.AddBytes([$49, $83, $FE]);
+          5: FText.AddBytes([$49, $83, $FF]);
+        else
+          Exit(False);
+        end;
+        FText.Add8(Byte(LongWord(Value) and $FF));
+      end
+      else
+      begin
+        case RegisterOrdinal of
+          0: FText.AddBytes([$48, $81, $FF]);
+          1: FText.AddBytes([$48, $81, $FE]);
+          2: FText.AddBytes([$49, $81, $FC]);
+          3: FText.AddBytes([$49, $81, $FD]);
+          4: FText.AddBytes([$49, $81, $FE]);
+          5: FText.AddBytes([$49, $81, $FF]);
+        else
+          Exit(False);
+        end;
+        FText.AddI32(LongInt(Value));
+      end;
+      InvalidateRaxState;
+      Exit(True);
+    end;
     if (Value >= Low(LongInt)) and (Value <= High(LongInt)) then
     begin
       GenExpr(E.Left);
@@ -6028,7 +6121,8 @@ begin
   end;
 end;
 
-procedure TX64Backend.GenIncDec(E: TExpr; ADelta: LongInt; APost: Boolean);
+procedure TX64Backend.GenIncDec(E: TExpr; ADelta: LongInt; APost: Boolean;
+  ADiscardResult: Boolean);
 var
   Delta, TargetOffset, TargetLabel, RegisterOrdinal, LocalOffset: LongInt;
   OneType, LocalType, RegisterType: TCType;
@@ -6040,6 +6134,44 @@ begin
   begin
     Delta := ADelta;
     if E.IntValue > 1 then Delta := Delta * LongInt(E.IntValue);
+    if (FOptions.OptimizationLevel >= 1) and
+       (StorageSize(RegisterType) = 8) then
+    begin
+      if APost and not ADiscardResult then
+        EmitLoadRegisterLocalToRax(RegisterOrdinal, RegisterType);
+      if (Delta >= -128) and (Delta <= 127) then
+      begin
+        case RegisterOrdinal of
+          0: FText.AddBytes([$48, $83, $C7]);
+          1: FText.AddBytes([$48, $83, $C6]);
+          2: FText.AddBytes([$49, $83, $C4]);
+          3: FText.AddBytes([$49, $83, $C5]);
+          4: FText.AddBytes([$49, $83, $C6]);
+          5: FText.AddBytes([$49, $83, $C7]);
+        else
+          raise ERCCError.Create('internal error: unsupported resident register');
+        end;
+        FText.Add8(Byte(LongWord(Delta) and $FF));
+      end
+      else
+      begin
+        case RegisterOrdinal of
+          0: FText.AddBytes([$48, $81, $C7]);
+          1: FText.AddBytes([$48, $81, $C6]);
+          2: FText.AddBytes([$49, $81, $C4]);
+          3: FText.AddBytes([$49, $81, $C5]);
+          4: FText.AddBytes([$49, $81, $C6]);
+          5: FText.AddBytes([$49, $81, $C7]);
+        else
+          raise ERCCError.Create('internal error: unsupported resident register');
+        end;
+        FText.AddI32(Delta);
+      end;
+      InvalidateRaxState;
+      if not ADiscardResult and not APost then
+        EmitLoadRegisterLocalToRax(RegisterOrdinal, RegisterType);
+      Exit;
+    end;
     EmitLoadRegisterLocalToRax(RegisterOrdinal, RegisterType);
     if APost then FText.AddBytes([$48, $89, $C2]); { mov rdx,rax }
     EmitAddRaxImmediate(Delta);
@@ -6500,7 +6632,7 @@ begin
       ParameterTypes[I] := MakeType(ctDouble);
   end;
   Layout := BuildFunctionABILayout(ReturnType, ParameterTypes,
-    Variadic, FTarget);
+    Variadic, FTarget, FixedParameterCount);
   try
     DirectSingleGP := False;
     if (Length(E.Args) = 1) and not Variadic and
@@ -6662,14 +6794,20 @@ begin
         FText.AddBytes([$4C, $8B, $9D]);
         FText.AddI32(-CalleeOffset);
       end;
-      FText.Add8($B8);
-      FText.Add32(LongWord(Layout.FloatingRegistersUsed));
+      if Variadic then
+      begin
+        FText.Add8($B8);
+        FText.Add32(LongWord(Layout.FloatingRegistersUsed));
+      end;
       FText.AddBytes([$41, $FF, $D3]);
     end
     else
     begin
-      FText.Add8($B8);
-      FText.Add32(LongWord(Layout.FloatingRegistersUsed));
+      if Variadic then
+      begin
+        FText.Add8($B8);
+        FText.Add32(LongWord(Layout.FloatingRegistersUsed));
+      end;
       L := ResolveCallable(ACallee.Name, E.Pos, Indirect);
       if Indirect then EmitIndirectCall(L) else EmitCall(L);
     end;
@@ -8269,7 +8407,18 @@ begin
   if S = nil then Exit;
   case S.Kind of
     skEmpty: ;
-    skExpr: GenExpr(S.Expr);
+    skExpr:
+      if (FOptions.OptimizationLevel >= 1) and (S.Expr <> nil) then
+        case S.Expr.Kind of
+          ekPreInc: GenIncDec(S.Expr, 1, False, True);
+          ekPreDec: GenIncDec(S.Expr, -1, False, True);
+          ekPostInc: GenIncDec(S.Expr, 1, True, True);
+          ekPostDec: GenIncDec(S.Expr, -1, True, True);
+        else
+          GenExpr(S.Expr);
+        end
+      else
+        GenExpr(S.Expr);
     skAsm: GenInlineAsm(S);
     skDecl:
       { A static local was laid out and initialized before the body was
@@ -8382,7 +8531,15 @@ begin
         GenStmt(S.Body);
         PopLoop;
         BindTextLabel(ContinueLabel);
-        if S.Expr2 <> nil then GenExpr(S.Expr2);
+        if S.Expr2 <> nil then
+          case S.Expr2.Kind of
+            ekPreInc: GenIncDec(S.Expr2, 1, False, True);
+            ekPreDec: GenIncDec(S.Expr2, -1, False, True);
+            ekPostInc: GenIncDec(S.Expr2, 1, True, True);
+            ekPostDec: GenIncDec(S.Expr2, -1, True, True);
+          else
+            GenExpr(S.Expr2);
+          end;
         EmitJump(CondLabel);
         BindTextLabel(EndLabel);
         LeaveScope(SavedCount);

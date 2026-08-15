@@ -96,7 +96,6 @@ var
   Kind: TTokenKind;
   Token: TToken;
 begin
-  if not IsGNUStandard(AStandard) then Exit;
   SetLength(ResultTokens, 0);
   Count := 0;
   Capacity := 0;
@@ -136,7 +135,8 @@ begin
       Continue;
     end;
 
-    if (Token.Kind = tkIdentifier) and
+    if IsGNUStandard(AStandard) and
+       (Token.Kind = tkIdentifier) and
        IsGNUAlternateKeyword(Token.Text, Canonical) and
        CanonicalKeywordKind(Canonical, Kind) then
     begin

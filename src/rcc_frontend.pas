@@ -67,6 +67,7 @@ type
     FPragmaOnceFiles: rcc_types.TStringArray;
     FLinkLibraries: rcc_types.TStringArray;
     FMacroNeedsContinuation: Boolean;
+    FStandard: TCStandard;
     procedure AddDependency(const AFileName: string);
     function IsPragmaOnceFile(const AFileName: string): Boolean;
     procedure AddPragmaOnceFile(const AFileName: string);
@@ -239,10 +240,12 @@ begin
 end;
 
 function StripPreprocessingComments(const ALine: string;
-  var AInBlockComment: Boolean): string;
+  var AInBlockComment: Boolean; AAllowLineComments: Boolean;
+  const AFileName: string; ALineNumber: LongInt): string;
 var
   I: LongInt;
   C, Quote: Char;
+  CommentPos: TSourcePos;
 begin
   Result := '';
   I := 1;
@@ -283,7 +286,17 @@ begin
     end;
     if (C = '/') and (I < Length(ALine)) then
     begin
-      if ALine[I + 1] = '/' then Break;
+      if ALine[I + 1] = '/' then
+      begin
+        if not AAllowLineComments then
+        begin
+          CommentPos.FileName := AFileName;
+          CommentPos.Line := ALineNumber;
+          CommentPos.Column := I;
+          RaiseCompileError(CommentPos, '// comments require C99 or newer');
+        end;
+        Break;
+      end;
       if ALine[I + 1] = '*' then
       begin
         if (Result = '') or not (Result[Length(Result)] in [' ', #9]) then
@@ -307,6 +320,7 @@ var
   Name, Value: string;
 begin
   inherited Create;
+  FStandard := AStandard;
   SetLength(FIncludePaths, Length(AIncludePaths));
   for I := 0 to High(AIncludePaths) do
     FIncludePaths[I] := AIncludePaths[I];
@@ -1456,7 +1470,9 @@ begin
       end;
       Inc(I);
       SourceLine := I;
-      Line := StripPreprocessingComments(Line, InBlockComment);
+      Line := StripPreprocessingComments(Line, InBlockComment,
+        CStandardAtLeast(FStandard, 1999) or IsGNUStandard(FStandard),
+        NormalizedFileName, SourceLine);
       DefineMacro('__FILE__', '"' +
         StringReplace(NormalizedFileName, '"', '\"', [rfReplaceAll]) + '"');
       DefineMacro('__LINE__', IntToStr(I));
@@ -1706,7 +1722,8 @@ if IsActive then
               end;
               Inc(I);
               ContinuedLine := StripPreprocessingComments(ContinuedLine,
-                InBlockComment);
+                InBlockComment, CStandardAtLeast(FStandard, 1999) or
+                IsGNUStandard(FStandard), NormalizedFileName, I);
               Rest := TrimLeft(ContinuedLine);
               if (Rest <> '') and (Rest[1] = '#') then
                 raise ERCCError.CreateFmt(
@@ -5401,6 +5418,8 @@ begin
   begin
     if Current.Kind = kwStatic then IsStatic := True;
     if Current.Kind = kwExtern then IsExtern := True;
+    if Current.Kind = kwInline then
+      RequireCStandard(1999, 'inline', Current.Pos);
     Inc(FIndex);
   end;
 

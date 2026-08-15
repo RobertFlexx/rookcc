@@ -18,9 +18,13 @@ implementation
 uses
   SysUtils, rcc_typeops;
 
+var
+  AllowDoubleWidthLongDouble: Boolean = False;
+
 function DirectLongDouble(const AType: TCType): Boolean;
 begin
-  Result := (AType.PointerDepth = 0) and (AType.Kind = ctLongDouble);
+  Result := not AllowDoubleWidthLongDouble and
+    (AType.PointerDepth = 0) and (AType.Kind = ctLongDouble);
 end;
 
 function TypeContainsUnsupportedScalar(const AType: TCType;
@@ -69,7 +73,7 @@ begin
       ' uses floating-point data outside the current cross-target integer backend')
   else
     RaiseCompileError(APos, AContext +
-      ' uses long double, which is not supported by the x86-64 backend');
+      ' uses long double, which is not supported by this backend');
 end;
 
 function FunctionSignatureUsesLongDouble(F: TFunction): Boolean;
@@ -201,7 +205,11 @@ var
   RejectAllFloating: Boolean;
 begin
   if AProgram = nil then Exit;
-  RejectAllFloating := ATarget.Architecture <> archX86_64;
+  AllowDoubleWidthLongDouble := ATarget.DataLayout.LongDoubleBits = 64;
+  { All production backends implement float and double. Long double remains a
+    separately diagnosed target limitation rather than disabling an entire
+    architecture's ordinary floating-point surface. }
+  RejectAllFloating := False;
 
   for I := 0 to High(AProgram.Functions) do
   begin

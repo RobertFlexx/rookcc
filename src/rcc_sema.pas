@@ -776,9 +776,10 @@ var
 begin
   if FCurrentFunction = nil then Exit;
   ReturnType := FCurrentFunction.ReturnType;
-  if ReturnType.Kind = ctVoid then
+  if (ReturnType.Kind = ctVoid) and (ReturnType.PointerDepth = 0) then
   begin
-    if (S.Expr <> nil) and (S.Expr.CType.Kind <> ctVoid) then
+    if (S.Expr <> nil) and not ((S.Expr.CType.Kind = ctVoid) and
+      (S.Expr.CType.PointerDepth = 0)) then
       RaiseCompileError(S.Pos, 'void function should not return a value');
     Exit;
   end;
@@ -1427,7 +1428,13 @@ begin
           operand's type before analysis so its initializer list is typed as T,
           not as the parser's default scalar. }
         if (E.Left <> nil) and (E.Left.Kind = ekCompoundLit) then
+        begin
           E.Left.CType := E.CType;
+          AnalyzeExpr(E.Left);
+          E.Left.IsLValue := True;
+          AdoptExpression(E, E.Left);
+          Exit;
+        end;
         AnalyzeExpr(E.Left);
         E.CType := TempType;
       end;
