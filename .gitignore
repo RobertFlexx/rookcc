@@ -21,6 +21,3 @@
 /scripts/*
 !/scripts/build.sh
 !/scripts/install.sh
-!/scripts/package.sh
-!/scripts/package_test.sh
-!/scripts/release_gate.sh
