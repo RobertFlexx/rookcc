@@ -8,7 +8,7 @@ when the selected target exactly matches the host architecture and operating sys
 
 **version 4.0.0**
 
-***basically the "i can trust it to compile my software efficiently"*** 
+**basically the *"i can trust it to compile my software efficiently"*** 
 **update.**
 
 
