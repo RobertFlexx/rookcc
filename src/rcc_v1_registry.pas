@@ -66,10 +66,7 @@ var
   Catalog: TConformanceCaseArray;
 begin
   Catalog := BuildConformanceCatalog;
-  Result := ConformanceSummary(Catalog, 'c17') + LineEnding +
-    ConformanceSummary(Catalog, 'gnu17') + LineEnding +
-    ConformanceSummary(Catalog, 'posix.1-2008') + LineEnding +
-    ConformanceSummary(Catalog, 'rcc1') + LineEnding;
+  Result := ConformanceCatalogSummary(Catalog) + LineEnding;
 end;
 
 function TargetFeatureCatalogText: string;
