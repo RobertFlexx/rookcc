@@ -8,6 +8,11 @@
 typedef unsigned long size_t;
 #endif
 
+#ifndef __RCC_WCHAR_T_DEFINED
+#define __RCC_WCHAR_T_DEFINED 1
+typedef int wchar_t;
+#endif
+
 #ifndef __RCC_SSIZE_T_DEFINED
 #define __RCC_SSIZE_T_DEFINED 1
 typedef long ssize_t;

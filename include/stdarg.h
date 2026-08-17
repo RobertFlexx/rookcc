@@ -11,9 +11,11 @@ typedef struct {
     int __vr_offs;
 } __rcc_va_state;
 typedef __rcc_va_state va_list[1];
+typedef __rcc_va_state __gnuc_va_list[1];
 #elif defined(__riscv) || (defined(__aarch64__) && defined(__APPLE__))
 /* The RISC-V and Darwin AArch64 ABIs represent va_list as a cursor. */
 typedef void *va_list;
+typedef void *__gnuc_va_list;
 #else
 typedef struct {
     unsigned int gp_offset;
@@ -22,9 +24,11 @@ typedef struct {
     void *reg_save_area;
 } __rcc_va_state;
 typedef __rcc_va_state va_list[1];
+typedef __rcc_va_state __gnuc_va_list[1];
 #endif
 #else
 typedef __builtin_va_list va_list;
+typedef __builtin_va_list __gnuc_va_list;
 #endif
 
 #define va_start(list, last) __builtin_va_start(list, last)
